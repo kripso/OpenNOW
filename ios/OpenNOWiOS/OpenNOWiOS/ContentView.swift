@@ -500,6 +500,9 @@ struct MainTabView: View {
         .onChangeCompat(of: selectedTab) { _ in
             synchronizeCatalogControllerShortcuts()
         }
+        .onChangeCompat(of: store.sessionManagementPresented) { _ in
+            synchronizeCatalogControllerShortcuts()
+        }
         .onChangeCompat(of: store.queueOverlayVisible) { isVisible in
             if isVisible {
                 Self.dismissFocusedInput()
@@ -607,6 +610,13 @@ struct MainTabView: View {
             }
             .environmentObject(store)
             .onAppear { bugReportPresented = true }
+        }
+        .sheet(isPresented: $store.sessionManagementPresented) {
+            SessionView()
+                .environmentObject(store)
+                .task {
+                    if store.resumableSessions.isEmpty { await store.refreshRemoteSessions() }
+                }
         }
     }
 
@@ -772,6 +782,7 @@ struct MainTabView: View {
         let catalogTabSelected = selectedTab == .home || selectedTab == .browse || selectedTab == .library
         catalogControllerShortcuts.setEnabled(
             catalogTabSelected && presentedStreamerSession == nil && !store.queueOverlayVisible
+                && !store.sessionManagementPresented
         )
     }
 
