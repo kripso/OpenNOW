@@ -462,6 +462,15 @@ final class NativeStreamInputEncoder {
     }
 }
 
+/// What iOS currently exposes to the app as hardware input, for the in-stream readout. A mouse
+/// reaches the game only if it is listed here; on iPhone the system may withhold it.
+struct NativeStreamHardwareInputStatus: Equatable {
+    var mouseNames: [String] = []
+    var keyboardConnected = false
+    var mouseEventCount = 0
+    var lastMouseEventAt: Date?
+}
+
 #if canImport(GameController)
 enum NativeStreamPhysicalInput {
     static var keyboardOrMouseConnected: Bool {
@@ -686,6 +695,26 @@ final class NativeStreamInputBridge {
     private let encoder = NativeStreamInputEncoder()
     private var keyboard: GCKeyboard?
     private var mice: [GCMouse] = []
+    private var hardwareMouseEventCount = 0
+    private var lastHardwareMouseEventAt: Date?
+
+    /// Read live from the system, not from the cached handlers, so the readout also shows a
+    /// mouse that connected without posting a notification.
+    var hardwareInputStatus: NativeStreamHardwareInputStatus {
+        NativeStreamHardwareInputStatus(
+            mouseNames: GCMouse.mice().enumerated().map { index, mouse in
+                mouse.vendorName ?? "Mouse \(index + 1)"
+            },
+            keyboardConnected: GCKeyboard.coalesced != nil,
+            mouseEventCount: hardwareMouseEventCount,
+            lastMouseEventAt: lastHardwareMouseEventAt
+        )
+    }
+
+    private func noteHardwareMouseEvent() {
+        hardwareMouseEventCount += 1
+        lastHardwareMouseEventAt = Date()
+    }
     private var controllersBySlot: [Int: GCController] = [:]
     private var controllerSlots: [ObjectIdentifier: Int] = [:]
     private var lastGamepadStates: [Int: NativeStreamGamepadState] = [:]
@@ -1250,24 +1279,30 @@ final class NativeStreamInputBridge {
                     deltaX: deltaX,
                     deltaY: deltaY
                 )
+                self?.noteHardwareMouseEvent()
                 self?.coalesceMouse(dx: delta.x, dy: delta.y)
             }
             input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
+                self?.noteHardwareMouseEvent()
                 self?.sendMouseButton(1, pressed: pressed)
             }
             input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in
+                self?.noteHardwareMouseEvent()
                 self?.sendMouseButton(2, pressed: pressed)
             }
             input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
+                self?.noteHardwareMouseEvent()
                 self?.sendMouseButton(3, pressed: pressed)
             }
             input.scroll.valueChangedHandler = { [weak self] _, _, yValue in
+                self?.noteHardwareMouseEvent()
                 let delta = Int((CGFloat(yValue) * 120).rounded())
                 guard delta != 0 else { return }
                 self?.sendMouseWheel(delta: delta)
             }
             input.auxiliaryButtons?.enumerated().forEach { offset, button in
                 button.pressedChangedHandler = { [weak self] _, _, pressed in
+                    self?.noteHardwareMouseEvent()
                     self?.sendMouseButton(4 + offset, pressed: pressed)
                 }
             }
@@ -1857,6 +1892,7 @@ final class NativeStreamInputBridge {
 }
 #else
 final class NativeStreamInputBridge {
+    var hardwareInputStatus: NativeStreamHardwareInputStatus { NativeStreamHardwareInputStatus() }
     weak var sink: NativeStreamInputSink?
     var onPhysicalControllerAvailabilityChanged: ((Bool) -> Void)?
     var onPhysicalKeyboardMouseAvailabilityChanged: ((Bool) -> Void)?

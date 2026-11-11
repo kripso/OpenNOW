@@ -2291,6 +2291,28 @@ private struct NativeStreamControlsPanel: View {
                 )
             }
 
+            // Refreshed every second while open: whether a mouse works here depends on what iOS
+            // reports, and that is the first thing to check when one does nothing.
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                let status = coordinator.inputBridge.hardwareInputStatus
+                NativeStreamPanelSection(title: "Hardware mouse and keyboard") {
+                    NativeStreamInfoRow(
+                        title: "Mouse",
+                        value: status.mouseNames.isEmpty ? "Not reported by iOS" : status.mouseNames.joined(separator: ", ")
+                    )
+                    NativeStreamInfoRow(
+                        title: "Mouse events",
+                        value: Self.mouseEventSummary(status, now: timeline.date)
+                    )
+                    NativeStreamInfoRow(title: "Keyboard", value: status.keyboardConnected ? "Connected" : "Not reported by iOS")
+                    NativeStreamInfoRow(
+                        title: "AssistiveTouch",
+                        value: UIAccessibility.isAssistiveTouchRunning ? "On" : "Off"
+                    )
+                    NativeStreamPanelNote("A mouse reaches the game only when iOS lists it here. If it is paired but not listed, iOS is keeping it from apps on this device.")
+                }
+            }
+
             NativeStreamPanelSection(title: "Clipboard") {
                 NativeStreamToggleRow(
                     title: "Paste into games",
@@ -2362,6 +2384,12 @@ private struct NativeStreamControlsPanel: View {
                 }
             }
         }
+    }
+
+    private static func mouseEventSummary(_ status: NativeStreamHardwareInputStatus, now: Date) -> String {
+        guard status.mouseEventCount > 0, let last = status.lastMouseEventAt else { return "None received" }
+        let seconds = max(0, Int(now.timeIntervalSince(last)))
+        return "\(status.mouseEventCount) · last \(seconds < 1 ? "just now" : "\(seconds)s ago")"
     }
 
     private func metricToggle(
