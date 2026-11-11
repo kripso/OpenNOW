@@ -3241,6 +3241,72 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testInStreamQualityChangeIsSavedWithoutTouchingAllocationSettings() {
+        let defaults = UserDefaults.standard
+        let keys = ["OpenNOW.iOS.settings", "OpenNOW.iOS.activeSession", "OpenNOW.iOS.activeStreamSettings"]
+        let previous = keys.map { defaults.object(forKey: $0) }
+        keys.forEach { defaults.removeObject(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, previous) {
+                if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+        }
+        let store = OpenNOWStore()
+        store.settings.maxBitrateMbps = 50
+        store.settings.preferredCodec = "H265"
+        store.settings.preferredFPS = 60
+        store.settings.preferredResolution = "1920x1080"
+        var live = store.settings
+        live.maxBitrateMbps = 20
+        live.preferredCodec = "AV1"
+        live.mouseAcceleration = 2
+        live.preferredFPS = 30
+        live.preferredResolution = "1280x720"
+
+        store.applyStreamerSettings(live)
+
+        XCTAssertEqual(store.settings.maxBitrateMbps, 20)
+        XCTAssertEqual(store.settings.preferredCodec, "AV1")
+        XCTAssertEqual(store.settings.streamPreset, .custom)
+        XCTAssertEqual(store.settings.mouseAcceleration, 2)
+        XCTAssertEqual(store.settings.preferredFPS, 60)
+        XCTAssertEqual(store.settings.preferredResolution, "1920x1080")
+    }
+
+    func testAllocationSignatureIgnoresPerConnectionBitrateAndCodecOnWebRTCOnly() {
+        var settings = AppSettings.default
+        settings.preferredCodec = "H265"
+        settings.maxBitrateMbps = 75
+        let original = StreamSettingsResolver.sessionSignature(for: settings)
+
+        var retuned = settings
+        retuned.preferredCodec = "AV1"
+        retuned.maxBitrateMbps = 20
+        let changed = StreamSettingsResolver.sessionSignature(for: retuned)
+        XCTAssertNotEqual(original, changed)
+        XCTAssertEqual(
+            StreamSettingsResolver.allocationSignature(original),
+            StreamSettingsResolver.allocationSignature(changed)
+        )
+
+        var otherFrameRate = settings
+        otherFrameRate.preferredFPS = settings.preferredFPS == 30 ? 60 : 30
+        XCTAssertNotEqual(
+            StreamSettingsResolver.allocationSignature(original),
+            StreamSettingsResolver.allocationSignature(StreamSettingsResolver.sessionSignature(for: otherFrameRate))
+        )
+
+        settings.experimentalNativeNVSTEnabled = true
+        retuned.experimentalNativeNVSTEnabled = true
+        let native = StreamSettingsResolver.sessionSignature(for: settings)
+        XCTAssertEqual(StreamSettingsResolver.allocationSignature(native), native)
+        XCTAssertNotEqual(
+            StreamSettingsResolver.allocationSignature(native),
+            StreamSettingsResolver.allocationSignature(StreamSettingsResolver.sessionSignature(for: retuned))
+        )
+    }
+
     func testNvstRequestUsesDesktopBitrateRangeAndAndroidPacingContract() {
         var settings = AppSettings.default
         settings.preferredCodec = "H264"
@@ -4548,6 +4614,32 @@ final class OpenNOWiOSParityTests: XCTestCase {
         coordinator.stop()
         coordinator.handleNativeStreamTermination(.init(result: 0x8003_0014, payload: Data()))
         XCTAssertTrue(events.isEmpty)
+    }
+
+    @MainActor
+    func testInStreamQualityOffersOnlyCodecsTheSessionColourAllowsAndIgnoresApplyWhileDisconnected() {
+        var settings = AppSettings.default
+        settings.preferredCodec = "Auto"
+        settings.maxBitrateMbps = 50
+        let sdr = makeTouchControlsCoordinator(settings: settings)
+        XCTAssertTrue(sdr.liveStreamQualityAvailable)
+        XCTAssertEqual(sdr.liveCodecPreference, "Auto")
+        XCTAssertEqual(sdr.liveCodecChoices.first, "Auto")
+        XCTAssertTrue(sdr.liveCodecChoices.contains("H264"))
+        XCTAssertEqual(sdr.liveBitrateMbps(for: 50), 50)
+        XCTAssertEqual(sdr.liveBitrateMbps(for: 48), 50)
+        XCTAssertGreaterThanOrEqual(sdr.liveBitrateMbps(for: 0), 5)
+
+        // No media transport yet: nothing to reconnect, so nothing may change.
+        sdr.applyLiveStreamQuality(maxBitrateMbps: 20, codec: "H264")
+        XCTAssertEqual(sdr.liveCodecPreference, "Auto")
+        XCTAssertTrue(sdr.streamQualitySummary.contains("50 Mbps"))
+
+        settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
+        let tenBit = makeTouchControlsCoordinator(settings: settings)
+        XCTAssertFalse(tenBit.liveCodecChoices.contains("H264"))
+        XCTAssertEqual(tenBit.liveCodecChoices.first, "Auto")
+        XCTAssertTrue(tenBit.sessionColorLabel.hasSuffix("SDR"))
     }
 
     @MainActor

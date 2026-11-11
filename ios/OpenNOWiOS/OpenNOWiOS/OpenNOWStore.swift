@@ -2174,6 +2174,17 @@ enum StreamSettingsResolver {
         sessionSignature(for: settings, profile: profile(for: settings, membershipTier: nil))
     }
 
+    /// The part of a signature that describes the cloud allocation. A WebRTC session negotiates
+    /// bitrate and codec on every connection, so a session that differs only in those is still
+    /// the same seat and must be resumed, not stopped and replaced.
+    static func allocationSignature(_ signature: String) -> String {
+        let fields = signature.split(separator: ";")
+        guard fields.contains("transport=webrtc") else { return signature }
+        return fields
+            .filter { !$0.hasPrefix("bitrate=") && !$0.hasPrefix("codec=") }
+            .joined(separator: ";")
+    }
+
     static func sessionSignature(for settings: AppSettings, profile: StreamVideoProfile) -> String {
         let color = colorQuality(for: settings).rawValue
         var signature = [
@@ -8752,6 +8763,20 @@ final class OpenNOWStore: ObservableObject {
         next.mouseScrollSensitivity = updated.mouseScrollSensitivity
         next.controllerMouseEmulation = updated.controllerMouseEmulation
         next.streamKeyboardClearConfirmationDisabled = updated.streamKeyboardClearConfirmationDisabled
+        next.mouseAcceleration = updated.mouseAcceleration
+        next.showAntiAfkIndicator = updated.showAntiAfkIndicator
+        next.clipboardPasteEnabled = updated.clipboardPasteEnabled
+        // Bitrate and codec are copied only when the in-stream panel moved them away from the
+        // session's own snapshot, so an unrelated in-stream change cannot revert Settings.
+        let snapshot = currentStreamerSettings
+        if snapshot.maxBitrateMbps != updated.maxBitrateMbps || snapshot.preferredCodec != updated.preferredCodec {
+            next.maxBitrateMbps = updated.maxBitrateMbps
+            next.preferredCodec = updated.preferredCodec
+            next.streamPreset = .custom
+            activeStreamSettings?.maxBitrateMbps = updated.maxBitrateMbps
+            activeStreamSettings?.preferredCodec = updated.preferredCodec
+            activeStreamSettings?.streamPreset = .custom
+        }
         if let active = activeStreamSettings,
            active.controllerRumbleStrength != next.controllerRumbleStrength || active.controllerShortcuts != next.controllerShortcuts {
             activeStreamSettings?.controllerRumbleStrength = next.controllerRumbleStrength
@@ -9404,7 +9429,9 @@ final class OpenNOWStore: ObservableObject {
         )
         let expectedSignature = StreamSettingsResolver.sessionSignature(for: settings, profile: profile)
         let expectedResolution = "\(profile.width)x\(profile.height)"
-        guard candidate.streamSettingsSignature?.trimmingCharacters(in: .whitespacesAndNewlines) == expectedSignature else {
+        guard let remoteSignature = candidate.streamSettingsSignature?.trimmingCharacters(in: .whitespacesAndNewlines),
+              StreamSettingsResolver.allocationSignature(remoteSignature)
+                == StreamSettingsResolver.allocationSignature(expectedSignature) else {
             return false
         }
         guard candidate.resolution?.trimmingCharacters(in: .whitespacesAndNewlines) == expectedResolution else {

@@ -1598,6 +1598,8 @@ private struct NativeStreamControlsPanel: View {
     @State private var keyboardPresented = false
     @State private var bugReportDeck: BugReportPreflightDeck?
     @State private var controllerMappingsPresented = false
+    @State private var draftBitrateMbps: Int?
+    @State private var draftCodec: String?
     @StateObject private var controllerNavigator = NativeStreamControllerHUDNavigator()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -1606,6 +1608,7 @@ private struct NativeStreamControlsPanel: View {
         case statsHUD
         case touchControls
         case mouseMode
+        case streamQuality
 
         var title: String {
             switch self {
@@ -1613,6 +1616,7 @@ private struct NativeStreamControlsPanel: View {
             case .statsHUD: return "Status Bar"
             case .touchControls: return "Touch Controls"
             case .mouseMode: return "Mouse Mode"
+            case .streamQuality: return "Stream Quality"
             }
         }
 
@@ -1624,6 +1628,7 @@ private struct NativeStreamControlsPanel: View {
             case .statsHUD: return "Choose what the overlay shows"
             case .touchControls: return "Size, style and placement"
             case .mouseMode: return "How touch and sticks reach the game"
+            case .streamQuality: return "Bitrate and codec for this session"
             }
         }
 
@@ -1633,6 +1638,7 @@ private struct NativeStreamControlsPanel: View {
             case .statsHUD: return 1
             case .touchControls: return 2
             case .mouseMode: return 3
+            case .streamQuality: return 4
             }
         }
     }
@@ -1649,6 +1655,7 @@ private struct NativeStreamControlsPanel: View {
                     case .statsHUD: statsPage
                     case .touchControls: touchPage
                     case .mouseMode: mousePage
+                    case .streamQuality: streamQualityPage
                     }
                 }
                 .padding(.horizontal, 12)
@@ -1845,6 +1852,22 @@ private struct NativeStreamControlsPanel: View {
                         set: { value in coordinator.updateLiveSettings { $0.hideStreamButtons = value } }
                     )
                 )
+                NativeStreamToggleRow(
+                    title: "Keep session awake",
+                    value: coordinator.liveSettings.showAntiAfkIndicator ? "Nudges the cursor after two idle minutes" : "Off",
+                    isOn: Binding(
+                        get: { coordinator.liveSettings.showAntiAfkIndicator },
+                        set: { value in coordinator.updateLiveSettings { $0.showAntiAfkIndicator = value } }
+                    )
+                )
+                NativeStreamToggleRow(
+                    title: "Paste into games",
+                    value: coordinator.liveSettings.clipboardPasteEnabled ? "On" : "Off",
+                    isOn: Binding(
+                        get: { coordinator.liveSettings.clipboardPasteEnabled },
+                        set: { value in coordinator.updateLiveSettings { $0.clipboardPasteEnabled = value } }
+                    )
+                )
                 NativeStreamActionRow(title: "Stats & HUD", value: "\(coordinator.statsMetrics.enabledCount) metrics", actionLabel: "Open") {
                     page = .statsHUD
                 }
@@ -1900,10 +1923,78 @@ private struct NativeStreamControlsPanel: View {
                         set: { coordinator.setStretchStreamToFill($0) }
                     )
                 )
-                NativeStreamInfoRow(title: "Codec", value: coordinator.selectedCodecLabel)
-                NativeStreamInfoRow(title: "Resolution", value: coordinator.profileLabel)
+                NativeStreamActionRow(title: "Stream quality", value: coordinator.streamQualitySummary, actionLabel: "Open") {
+                    draftBitrateMbps = nil
+                    draftCodec = nil
+                    page = .streamQuality
+                }
             }
 
+        }
+    }
+
+    // MARK: Stream quality
+
+    private var streamQualityPage: some View {
+        let options = StreamSettingsResolver.bitrateOptionsMbps
+        let bitrate = draftBitrateMbps ?? coordinator.liveSettings.maxBitrateMbps
+        let codec = draftCodec ?? coordinator.liveCodecPreference
+        let codecs = coordinator.liveCodecChoices
+        let changed = bitrate != coordinator.liveSettings.maxBitrateMbps || codec != coordinator.liveCodecPreference
+        return Group {
+            NativeStreamPanelSection(title: "Applied with a short reconnect") {
+                if coordinator.liveStreamQualityAvailable {
+                    NativeStreamSliderRow(
+                        title: "Max bitrate",
+                        value: Binding(
+                            get: { Double(options.firstIndex(of: bitrate) ?? 0) },
+                            set: { index in
+                                draftBitrateMbps = options[min(max(Int(index.rounded()), 0), options.count - 1)]
+                            }
+                        ),
+                        range: 0...Double(options.count - 1),
+                        step: 1,
+                        format: { index in
+                            let value = options[min(max(Int(index.rounded()), 0), options.count - 1)]
+                            return value == 0 ? "Auto (\(coordinator.liveBitrateMbps(for: 0)) Mbps)" : "\(value) Mbps"
+                        }
+                    )
+                    NativeStreamActionRow(title: "Codec", value: codec, actionLabel: codecs.count > 1 ? "Change" : "") {
+                        guard codecs.count > 1 else { return }
+                        let index = codecs.firstIndex(of: codec) ?? -1
+                        draftCodec = codecs[(index + 1) % codecs.count]
+                    }
+                    NativeStreamActionRow(
+                        title: changed ? "Apply changes" : "No changes to apply",
+                        value: changed
+                            ? "Reconnects the stream for a few seconds. Your game keeps running."
+                            : "Now: \(coordinator.selectedCodecLabel), up to \(coordinator.liveBitrateMbps(for: coordinator.liveSettings.maxBitrateMbps)) Mbps",
+                        actionLabel: changed ? "Apply" : ""
+                    ) {
+                        guard changed else { return }
+                        coordinator.applyLiveStreamQuality(maxBitrateMbps: bitrate, codec: codec)
+                        draftBitrateMbps = nil
+                        draftCodec = nil
+                    }
+                    Text("GeForce NOW negotiates bitrate and codec each time the stream connects, so these can change during a session. They are saved for future sessions too.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    NativeStreamInfoRow(title: "Codec", value: coordinator.selectedCodecLabel)
+                    NativeStreamInfoRow(title: "Max bitrate", value: "\(coordinator.liveBitrateMbps(for: coordinator.liveSettings.maxBitrateMbps)) Mbps")
+                    Text("Changing these during a session is only available with the standard WebRTC connection.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            NativeStreamPanelSection(title: "Fixed for this session") {
+                NativeStreamInfoRow(title: "Resolution", value: coordinator.profileLabel)
+                NativeStreamInfoRow(title: "Color", value: coordinator.sessionColorLabel)
+                Text("GeForce NOW sets resolution, frame rate, color, HDR, L4S, keyboard layout, language and server when it starts the session. Change them in Settings for your next session.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -2211,6 +2302,12 @@ private struct NativeStreamControlsPanel: View {
                     ),
                     range: 0.25...3
                 )
+                NativeStreamActionRow(
+                    title: "Mouse acceleration",
+                    value: ["Off", "Standard", "High"][min(max(coordinator.liveSettings.mouseAcceleration, 0), 2)]
+                ) {
+                    coordinator.updateLiveSettings { $0.mouseAcceleration = ($0.mouseAcceleration + 1) % 3 }
+                }
                 NativeStreamSliderRow(
                     title: "Scroll sensitivity",
                     value: Binding(
@@ -2712,6 +2809,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var batteryMonitoringWasEnabled: Bool?
     private let onRuntimeSample: (StreamRuntimeSample) -> Void
     private let onSettingsChange: (AppSettings) -> Void
+    private let membershipTier: String?
     private let onBuildBugReportDeck: () -> BugReportPreflightDeck
     private let onSubmitBugReport: (BugReportDraft, BugReportPreflightDeck) async -> Result<String, Error>
     private let onClose: () -> Void
@@ -2898,6 +2996,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         self.liveSettings = settings
         self.onClose = onClose
         self.onRetry = onRetry
+        self.membershipTier = membershipTier
         self.streamProfile = Self.effectiveProfile(for: session, settings: settings, membershipTier: membershipTier)
         self.requestedProfile = StreamSettingsResolver.profile(for: settings, membershipTier: membershipTier)
         self.showStatsOverlay = settings.showStatsOverlay
@@ -3212,6 +3311,78 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         "\(streamProfile.resolutionString) @ \(streamProfile.fps) fps"
     }
 
+    var sessionColorLabel: String {
+        "\(StreamSettingsResolver.colorQuality(for: settings).label) \(settings.hdrEnabled ? "HDR" : "SDR")"
+    }
+
+    var streamQualitySummary: String {
+        "\(selectedCodecLabel) · up to \(streamProfile.maxBitrateKbps / 1_000) Mbps · \(profileLabel)"
+    }
+
+    // MARK: - In-stream quality
+    //
+    // GeForce NOW fixes resolution, frame rate and colour when it allocates the session. The
+    // bitrate range and the codec are negotiated again on every connection, so they can change
+    // by rebuilding the local transport — the same path a stalled stream already recovers through.
+
+    var liveStreamQualityAvailable: Bool {
+        !stopped && nativeNVST == nil && !session.usesNativeTransport(settings: settings)
+    }
+
+    /// "Auto" or a codec name, as stored in `AppSettings.preferredCodec`.
+    var liveCodecPreference: String {
+        NativeStreamVideoCodec.normalized(liveSettings.preferredCodec)?.rawValue ?? "Auto"
+    }
+
+    /// The session's colour depth was fixed at allocation; H.264 cannot carry a 10-bit one.
+    var liveCodecChoices: [String] {
+        let tenBit = settings.hdrEnabled || settings.preferredColorQuality.hasPrefix("10bit")
+        let codecs = NativeStreamVideoCodec.allCases.filter { codec in
+            codecReport.capability(for: codec)?.launchSafe == true && !(tenBit && codec == .h264)
+        }
+        return ["Auto"] + codecs.map(\.rawValue)
+    }
+
+    /// The ceiling a bitrate setting resolves to for this session; 0 means automatic.
+    func liveBitrateMbps(for preset: Int) -> Int {
+        var quality = settings
+        quality.maxBitrateMbps = StreamSettingsResolver.normalizedBitratePreset(preset)
+        return Self.effectiveProfile(for: session, settings: quality, membershipTier: membershipTier).maxBitrateKbps / 1_000
+    }
+
+    func applyLiveStreamQuality(maxBitrateMbps: Int, codec: String) {
+        guard liveStreamQualityAvailable, mediaTransportConnected, liveCodecChoices.contains(codec) else { return }
+        let bitrate = StreamSettingsResolver.normalizedBitratePreset(maxBitrateMbps)
+        guard bitrate != liveSettings.maxBitrateMbps || codec != liveCodecPreference else { return }
+        updateLiveSettings {
+            $0.maxBitrateMbps = bitrate
+            $0.preferredCodec = codec
+            $0.streamPreset = .custom
+        }
+        streamProfile = StreamVideoProfile(
+            width: streamProfile.width,
+            height: streamProfile.height,
+            fps: streamProfile.fps,
+            maxBitrateKbps: liveBitrateMbps(for: bitrate) * 1_000
+        )
+        selectedCodec = codecReport.launchSafeCodec(preferred: codec)
+        log(
+            "In-stream quality change codec=\(selectedCodec.rawValue) "
+                + "bitrate=\(streamProfile.maxBitrateKbps) resolution=\(streamProfile.resolutionString) fps=\(streamProfile.fps)"
+        )
+        updateStatus(
+            "Applying stream quality",
+            detail: "Reconnecting with \(selectedCodecLabel) at up to \(streamProfile.maxBitrateKbps / 1_000) Mbps"
+        )
+        closeLocalTransportForRetry()
+        workQueue.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.stopped else { return }
+                self.connectSignaling()
+            }
+        }
+    }
+
     var shouldShowVirtualController: Bool {
         streamerPreferences.touchControllerVisible &&
             (!physicalControllerConnected || showTouchControlsWithPhysicalController || touchLayoutEditing)
@@ -3419,6 +3590,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             controllerRumbleStrength: next.controllerRumbleStrength
         )
         inputBridge.setControllerShortcuts(next.controllerShortcuts)
+        if mediaTransportConnected, (antiAfkTimer != nil) != next.showAntiAfkIndicator {
+            setAntiAfkEnabled(next.showAntiAfkIndicator)
+        }
         onSettingsChange(next)
     }
 
