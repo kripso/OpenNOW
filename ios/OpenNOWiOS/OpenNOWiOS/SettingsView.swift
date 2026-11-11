@@ -148,6 +148,8 @@ struct SettingsView: View {
     @State private var selectedCategory: SettingsCategory = .stream
     /// The tab last opened in each category, so switching categories does not lose your place.
     @State private var selectedPages: [SettingsCategory: SettingsPage] = [:]
+    /// The column at the leading edge of the wide layout's row, by its id.
+    @State private var wideLeadingColumn: String?
     @State private var bugReportDeck: BugReportPreflightDeck?
     @State private var searchText = ""
     @State private var showingResetConfirmation = false
@@ -184,10 +186,10 @@ struct SettingsView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            // Wide enough for two panes: categories stay visible beside what they contain, so
-            // moving between them never needs a trip back up the stack.
-            if proxy.size.width >= Self.splitLayoutMinimumWidth {
-                splitLayout
+            // Wide enough for columns: categories are tabs along the top and every page of the
+            // open one is on screen at once, so nothing sits behind a second tap.
+            if proxy.size.width >= Self.wideLayoutMinimumWidth {
+                wideLayout
             } else {
                 stackLayout
             }
@@ -311,7 +313,7 @@ struct SettingsView: View {
         }
     }
 
-    private static let splitLayoutMinimumWidth: CGFloat = 700
+    private static let wideLayoutMinimumWidth: CGFloat = 700
 
     private var stackLayout: some View {
         NavigationStack(path: $path) {
@@ -337,23 +339,20 @@ struct SettingsView: View {
         }
     }
 
-    /// One navigation stack around both panes. On iPad this view is the detail column of the
-    /// app's split view, which adopts a root stack as its own; a second stack nested beside the
-    /// category list instead drew its bar over half the column and its title across all of it.
-    private var splitLayout: some View {
+    /// One navigation stack for the whole screen. On iPad this view is the detail column of the
+    /// app's split view, which adopts a root stack as its own; a second stack nested inside it
+    /// draws its bar over part of the column and its title across all of it.
+    private var wideLayout: some View {
         NavigationStack {
-            HStack(spacing: 0) {
-                settingsSidebar
-                    .frame(width: 300)
-                Divider()
-                    .ignoresSafeArea(edges: .bottom)
-                categoryDetail(selectedCategory, showsHeading: true)
-                    // Fresh per category, so each one opens scrolled to its top.
-                    .id(selectedCategory)
+            VStack(spacing: 0) {
+                wideHeader
+                GeometryReader { proxy in
+                    wideColumns(in: proxy.size)
+                }
             }
             .background(Color(.systemGroupedBackground).ignoresSafeArea())
             // The stack's title stays the open category, which is what a pushed page goes back
-            // to; the bar spans both panes, so what it shows is the name of the whole screen.
+            // to; the bar itself names the screen, because the tabs below already name the category.
             .navigationTitle(selectedCategory.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -361,95 +360,233 @@ struct SettingsView: View {
                     Text("Settings").font(.headline)
                 }
             }
+            .searchable(text: $searchText, prompt: "Search settings")
         }
     }
 
-    /// Pinned above the category list, level with the heading of the pane beside it.
-    private var settingsSearchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Search settings", text: $searchText)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-            if isSearching {
-                Button {
-                    searchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear search")
-            }
-        }
-        .padding(.horizontal, 14)
-        .frame(minHeight: 44)
-        .background(Color(.secondarySystemGroupedBackground), in: Capsule())
-        .padding(.horizontal, 20)
-        .padding(.top, 12)
-        .padding(.bottom, 4)
-        .background(Color(.systemGroupedBackground))
-    }
+    private static let wideGutter: CGFloat = 24
+    private static let wideColumnMinimumWidth: CGFloat = 330
+    private static let wideColumnMaximumWidth: CGFloat = 520
 
-    private var settingsSidebar: some View {
-        List {
-            if accountLandingVisible {
-                Section {
-                    sidebarRow(selected: selectedCategory == .account) {
-                        selectedCategory = .account
-                    } label: {
-                        accountLandingLabel(avatarSize: 40)
-                    }
-                }
-            }
-
-            Section {
-                if isSearching {
-                    ForEach(matchingPages) { page in
-                        sidebarRow(selected: selectedCategory == page.category && selectedPage(in: page.category) == page) {
-                            select(page)
-                        } label: {
-                            settingsPageLabel(page)
-                        }
-                    }
-                    if SettingsCategory.about.matches(searchText) {
-                        sidebarRow(selected: selectedCategory == .about) {
-                            selectedCategory = .about
-                        } label: {
-                            SettingsCategoryLabel(category: .about, compact: true)
-                        }
-                    }
-                } else {
+    private var wideHeader: some View {
+        HStack(spacing: 12) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
                     ForEach(landingCategories) { category in
-                        sidebarRow(selected: selectedCategory == category) {
-                            selectedCategory = category
-                        } label: {
-                            SettingsCategoryLabel(category: category, compact: true)
-                        }
+                        wideCategoryTab(category)
                     }
                 }
+                .padding(.vertical, 2)
+                .padding(.trailing, 20)
             }
+            // Tabs that do not fit fade out instead of being cut mid-word.
+            .mask(
+                LinearGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.93),
+                                       .init(color: .clear, location: 1)], startPoint: .leading, endPoint: .trailing)
+            )
+            wideAccountButton
         }
-        .listStyle(.insetGrouped)
-        .settingsSidebarTopMargin()
-        .overlay { noSearchResultsOverlay }
-        .safeAreaInset(edge: .top, spacing: 0) { settingsSearchField }
+        .padding(.horizontal, Self.wideGutter)
+        .padding(.top, 10)
+        .padding(.bottom, 14)
     }
 
-    private func sidebarRow<Label: View>(
-        selected: Bool,
-        action: @escaping () -> Void,
-        @ViewBuilder label: () -> Label
-    ) -> some View {
-        Button(action: action) {
-            label()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+    /// Picking a category is leaving search: clear the query and put the keyboard away.
+    private func endWideSearch() {
+        searchText = ""
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    private func wideCategoryTab(_ category: SettingsCategory) -> some View {
+        // While searching, the columns are results from every category, so none is "open".
+        let isSelected = !isSearching && selectedCategory == category
+        return Button {
+            endWideSearch()
+            selectedCategory = category
+        } label: {
+            Label(category.title, systemImage: category.symbolName)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .padding(.horizontal, 16)
+                .frame(minHeight: 44)
+                // The accent is dark in light mode and light in dark mode; the page background
+                // colour is the one that reads on both.
+                .foregroundStyle(isSelected ? Color(.systemBackground) : Color.primary)
+                .background(
+                    isSelected ? Color.accentColor : Color(.secondarySystemGroupedBackground),
+                    in: Capsule()
+                )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .listRowBackground(selected ? Color.accentColor.opacity(0.18) : nil)
-        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityHint(category.summary)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var wideAccountButton: some View {
+        let isSelected = !isSearching && selectedCategory == .account
+        return Button {
+            endWideSearch()
+            selectedCategory = .account
+        } label: {
+            SettingsAccountAvatar(initial: accountLandingInitial, size: 44, selected: isSelected)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Account, \(accountLandingTitle)")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    /// What one column holds: a page of the open category, or a category that has no pages.
+    private enum WideColumn: Hashable, Identifiable {
+        case page(SettingsPage)
+        case category(SettingsCategory)
+
+        var id: String {
+            switch self {
+            case .page(let page): return "page-\(page.id)"
+            case .category(let category): return "category-\(category.id)"
+            }
+        }
+    }
+
+    private var wideColumnList: [WideColumn] {
+        if isSearching {
+            var columns = matchingPages.map(WideColumn.page)
+            for category in [SettingsCategory.account, .about] where category.matches(searchText) {
+                columns.append(.category(category))
+            }
+            return columns
+        }
+        let pages = selectedCategory.pages
+        return pages.isEmpty ? [.category(selectedCategory)] : pages.map(WideColumn.page)
+    }
+
+    /// Pages sit side by side at an even width. When a category has more than fit, the row
+    /// scrolls sideways a column at a time and a strip of page names jumps straight to one.
+    private func wideColumns(in size: CGSize) -> some View {
+        let columns = wideColumnList
+        let usable = max(1, size.width - Self.wideGutter)
+        let fitting = max(1, Int(usable / Self.wideColumnMinimumWidth))
+        let overflowing = columns.count > fitting
+        let width = min(usable / CGFloat(min(max(columns.count, 1), fitting)), Self.wideColumnMaximumWidth)
+        return ScrollViewReader { proxy in
+            VStack(alignment: .leading, spacing: 0) {
+                if overflowing {
+                    wideJumpStrip(columns) { column in
+                        withAnimation {
+                            wideLeadingColumn = column.id
+                            proxy.scrollTo(column.id, anchor: .leading)
+                        }
+                    }
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 0) {
+                        ForEach(columns) { column in
+                            wideColumn(column)
+                                .frame(width: width)
+                        }
+                    }
+                    // Directly on the row: the columns are what the scroll view snaps to.
+                    .settingsColumnSnapTargets()
+                    .padding(.horizontal, Self.wideGutter / 2)
+                }
+                .settingsColumnSnapping(position: $wideLeadingColumn)
+                .scrollDisabled(!overflowing)
+            }
+        }
+        .overlay { noSearchResultsOverlay }
+        // Fresh per category or query, so every column opens scrolled to its top.
+        .id(isSearching ? "search" : selectedCategory.id)
+    }
+
+    private func wideJumpStrip(_ columns: [WideColumn], onSelect: @escaping (WideColumn) -> Void) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Text("Jump to")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(.trailing, 2)
+                // Identified by value, not by the id the columns use: a scroll request goes to
+                // the first view with a matching id, and it must find the column, not its chip.
+                ForEach(columns, id: \.self) { column in
+                    // Marks the column at the leading edge, so the strip also shows where the
+                    // row has been swiped to.
+                    let isLeading = (wideLeadingColumn ?? columns.first?.id) == column.id
+                    Button {
+                        onSelect(column)
+                    } label: {
+                        Text(wideColumnShortTitle(column))
+                            .font(.footnote.weight(.medium))
+                            .lineLimit(1)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 30)
+                            .foregroundStyle(isLeading ? Color.accentColor : Color.primary)
+                            .background(Color(.secondarySystemGroupedBackground), in: Capsule())
+                            .overlay(Capsule().strokeBorder(Color.accentColor.opacity(isLeading ? 0.7 : 0), lineWidth: 1))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(isLeading ? .isSelected : [])
+                }
+            }
+            .padding(.horizontal, Self.wideGutter)
+            .padding(.bottom, 10)
+        }
+    }
+
+    private func wideColumnShortTitle(_ column: WideColumn) -> String {
+        switch column {
+        case .page(let page): return isSearching ? page.title : page.tabTitle
+        case .category(let category): return category.title
+        }
+    }
+
+    private func wideColumn(_ column: WideColumn) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(wideColumnTitle(column))
+                    .font(.title3.weight(.bold))
+                    .lineLimit(1)
+                    .accessibilityAddTraits(.isHeader)
+                Text(wideColumnSummary(column))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2, reservesSpace: true)
+            }
+            // Level with the text inside the cards below, not with their rounded edge.
+            .padding(.horizontal, Self.wideGutter / 2 + 16)
+            .padding(.bottom, 4)
+
+            Form {
+                switch column {
+                case .page(let page):
+                    settingsPageContent(for: page)
+                    // Category-wide extras ride with the first page rather than repeating.
+                    if page == page.category.pages.first {
+                        settingsDetailContent(for: page.category)
+                    }
+                case .category(let category):
+                    settingsDetailContent(for: category)
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .settingsColumnMargins(Self.wideGutter / 2)
+            .environment(\.settingsHidesPageHeaders, true)
+        }
+    }
+
+    private func wideColumnTitle(_ column: WideColumn) -> String {
+        switch column {
+        case .page(let page): return page.title
+        case .category(let category): return category.title
+        }
+    }
+
+    private func wideColumnSummary(_ column: WideColumn) -> String {
+        switch column {
+        case .page(let page): return isSearching ? "\(page.category.title) · \(page.summary)" : page.summary
+        case .category(let category): return category.summary
+        }
     }
 
     @ViewBuilder
@@ -466,14 +603,9 @@ struct SettingsView: View {
         return category.pages.first
     }
 
-    private func select(_ page: SettingsPage) {
-        selectedPages[page.category] = page
-        selectedCategory = page.category
-    }
-
     /// Everything in a category on one screen: its pages are tabs along the top instead of a
     /// second list to drill through.
-    private func categoryDetail(_ category: SettingsCategory, showsHeading: Bool = false) -> some View {
+    private func categoryDetail(_ category: SettingsCategory) -> some View {
         let page = selectedPage(in: category)
         return Form {
             if let page {
@@ -482,22 +614,11 @@ struct SettingsView: View {
             settingsDetailContent(for: category)
         }
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                // Beside the category list the bar says "Settings", so the pane names itself.
-                if showsHeading {
-                    Text(category.title)
-                        .font(.title2.weight(.bold))
-                        .padding(.horizontal, 20)
-                        .padding(.top, 14)
-                        .padding(.bottom, category.pages.count > 1 ? 2 : 10)
-                        .accessibilityAddTraits(.isHeader)
-                }
-                if category.pages.count > 1, let page {
-                    settingsPageTabs(category.pages, selected: page) { selectedPages[category] = $0 }
-                }
+            if category.pages.count > 1, let page {
+                settingsPageTabs(category.pages, selected: page) { selectedPages[category] = $0 }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.bar)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(showsHeading ? AnyShapeStyle(Color(.systemGroupedBackground)) : AnyShapeStyle(.bar))
         }
     }
 
@@ -934,7 +1055,7 @@ struct SettingsView: View {
 
             Toggle("Stretch to Fill", isOn: $store.settings.streamerPreferences.stretchStreamToFill)
         } header: {
-            Text("Quality")
+            SettingsPageHeader("Quality")
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 Text(store.settings.streamPreset.detail)
@@ -1013,7 +1134,7 @@ struct SettingsView: View {
                 Text("Native").foregroundStyle(.secondary)
             }
         } header: {
-            Text("Video")
+            SettingsPageHeader("Video")
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 if !hdrAvailable {
@@ -1066,7 +1187,7 @@ struct SettingsView: View {
                     .accessibilityLabel("Session proxy address")
             }
         } header: {
-            Text("Connection")
+            SettingsPageHeader("Connection")
         } footer: {
             Text("A session proxy routes launch requests through a server you control. Leave it off unless you know you need it — a wrong address stops games from starting.")
         }
@@ -1174,7 +1295,7 @@ struct SettingsView: View {
 
             Toggle("Controller Mouse Mode", isOn: $store.settings.controllerMouseEmulation)
         } header: {
-            Text("Pointer")
+            SettingsPageHeader("Pointer")
         } footer: {
             Text("Controller mouse mode maps the left stick to the cursor, the right stick to scrolling, A to click and B to right-click. You can also switch it on for a single session from the stream controls.")
         }
@@ -1215,7 +1336,7 @@ struct SettingsView: View {
             }
             #endif
         } header: {
-            Text("Native Touch")
+            SettingsPageHeader("Native Touch")
         } footer: {
             Text("Automatic sends native touch only to games that advertise touchscreen support. Other games use the finger mouse or on-screen controller you enable. Always requests native touch for every game. Session provisioning can require starting a new session.")
         }
@@ -1334,7 +1455,7 @@ struct SettingsView: View {
 
             #endif
         } header: {
-            Text("On-Screen Controller")
+            SettingsPageHeader("On-Screen Controller")
         } footer: {
             Text("Size and position controls adjust the default layout. Game-specific layouts are kept. To move individual controls while playing, choose Edit Layout in stream controls. Native touch can take priority over the on-screen controller in supported games.")
         }
@@ -1462,7 +1583,7 @@ struct SettingsView: View {
             Toggle("Expressive Surfaces", isOn: $store.settings.expressiveUI)
             Toggle("Animated Selection", isOn: $store.settings.liveSelectedOutlines)
         } header: {
-            Text("Appearance")
+            SettingsPageHeader("Appearance")
         } footer: {
             Text("Expressive surfaces add the gradient washes and softer cards. Turning both off gives a flatter interface that costs less to draw.")
         }
@@ -1534,7 +1655,7 @@ struct SettingsView: View {
             }
             #endif
         } header: {
-            Text("Catalog")
+            SettingsPageHeader("Catalog")
         } footer: {
             Text("Turning card titles off leaves the grid as pure box art. The favourite badge puts a heart on artwork you have starred.")
         }
@@ -1563,7 +1684,7 @@ struct SettingsView: View {
                 }
             }
         } header: {
-            Text("Stats HUD")
+            SettingsPageHeader("Stats HUD")
         } footer: {
             Text("Choose which numbers appear over the game. Immersive mode in Stream Controls can hide the HUD even when statistics are enabled.")
         }
@@ -1574,7 +1695,7 @@ struct SettingsView: View {
             Toggle("Immersive Mode", isOn: $store.settings.hideStreamButtons)
             Toggle("Keep Session Awake", isOn: $store.settings.showAntiAfkIndicator)
         } header: {
-            Text("Stream Controls")
+            SettingsPageHeader("Stream Controls")
         } footer: {
             Text("Immersive mode hides stream controls, stats, and the system status bar. Double tap near the top to show or hide them. Keeping the session awake nudges the cursor by a pixel after two idle minutes; a dot in the corner shows while it is doing that.")
         }
@@ -1589,7 +1710,7 @@ struct SettingsView: View {
             Toggle("Queue Live Activities", isOn: $store.settings.queueLiveActivitiesEnabled)
             #endif
         } header: {
-            Text("Sessions")
+            SettingsPageHeader("Sessions")
         } footer: {
             Text("The session report appears after a stream ends and scores how the connection held up. The chime plays once when a rig frees up, so you can put the phone down while you wait for a long queue.")
         }
@@ -1608,7 +1729,7 @@ struct SettingsView: View {
                 Label("Privacy Policy", systemImage: "hand.raised")
             }
         } header: {
-            Text("Privacy")
+            SettingsPageHeader("Privacy")
         } footer: {
             Text("OpenNOW does not run usage analytics. Diagnostics leave this device only when you choose to export, upload logs, or submit a problem report.")
         }
@@ -1618,7 +1739,7 @@ struct SettingsView: View {
         Section {
             Toggle("L4S Low Latency", isOn: $store.settings.enableL4S)
         } header: {
-            Text("Experimental")
+            SettingsPageHeader("Experimental")
         } footer: {
             Text("L4S is negotiated with the server and may be refused. If a game stops launching after you turn it on, turn it off again first.")
         }
@@ -2368,22 +2489,42 @@ private struct OpenNOWPrivacyPolicyView: View {
     }
 }
 
+private struct SettingsHidesPageHeadersKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+private extension EnvironmentValues {
+    var settingsHidesPageHeaders: Bool {
+        get { self[SettingsHidesPageHeadersKey.self] }
+        set { self[SettingsHidesPageHeadersKey.self] = newValue }
+    }
+}
+
+/// The header of a page's only section, which says the same thing as the page's name. A column
+/// already shows that name above it, so there the header is left out.
+private struct SettingsPageHeader: View {
+    @Environment(\.settingsHidesPageHeaders) private var hidden
+    let title: LocalizedStringKey
+
+    init(_ title: LocalizedStringKey) { self.title = title }
+
+    var body: some View {
+        if !hidden { Text(title) }
+    }
+}
+
 private struct SettingsCategoryLabel: View {
     let category: SettingsCategory
-    /// The sidebar shows the name alone: its detail pane is already on screen beside it.
-    var compact = false
 
     var body: some View {
         Label {
             VStack(alignment: .leading, spacing: 2) {
                 Text(category.title)
                     .font(.body.weight(.medium))
-                if !compact {
-                    Text(category.summary)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text(category.summary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         } icon: {
             Image(systemName: category.symbolName)
@@ -2457,12 +2598,28 @@ private extension String {
 }
 
 private extension View {
-    /// The grouped list's own top inset is sized for a screen edge, not for sitting under a
-    /// pinned search field.
+    /// A column is narrow, so its form gives up the wide default margins of a full-width list.
     @ViewBuilder
-    func settingsSidebarTopMargin() -> some View {
+    func settingsColumnMargins(_ horizontal: CGFloat) -> some View {
         if #available(iOS 17.0, *) {
-            contentMargins(.top, 12, for: .scrollContent)
+            contentMargins(.horizontal, horizontal, for: .scrollContent)
+                .contentMargins(.top, 4, for: .scrollContent)
+        } else {
+            self
+        }
+    }
+
+    @ViewBuilder
+    func settingsColumnSnapTargets() -> some View {
+        if #available(iOS 17.0, *) { scrollTargetLayout() } else { self }
+    }
+
+    /// Snaps to whole columns and lets a column be scrolled to by name. Before iOS 17 the row
+    /// still scrolls freely and the caller's `ScrollViewReader` does the jumping.
+    @ViewBuilder
+    func settingsColumnSnapping(position: Binding<String?>) -> some View {
+        if #available(iOS 17.0, *) {
+            scrollTargetBehavior(.viewAligned).scrollPosition(id: position, anchor: .leading)
         } else {
             self
         }
