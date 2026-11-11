@@ -103,6 +103,24 @@ enum NativeStreamMouseCoordinatePolicy {
     }
 }
 
+/// Turns UIKit scroll gestures into wheel deltas for the host, where 120 is one notch and
+/// positive scrolls up. The wheel is read from scroll gestures rather than `GCMouse`, which
+/// does not deliver a wheel's clicks on iPadOS.
+enum NativeStreamScrollWheelPolicy {
+    static let notch = 120
+
+    /// A wheel click is one notch in the direction of travel, whatever distance iOS gives it.
+    static func discreteDelta(travel: CGFloat) -> Int {
+        travel > 0 ? notch : (travel < 0 ? -notch : 0)
+    }
+
+    /// A trackpad scroll is proportional: the height of the surface is twenty notches.
+    static func continuousDelta(travel: CGFloat, surfaceHeight: CGFloat) -> Int {
+        guard surfaceHeight > 0 else { return 0 }
+        return Int((travel / surfaceHeight * CGFloat(notch * 20)).rounded(.towardZero))
+    }
+}
+
 enum NativeStreamGamepadMixer {
     static func merging(
         physical: NativeStreamGamepadState,
@@ -961,7 +979,6 @@ final class NativeStreamInputBridge {
             input.leftButton.pressedChangedHandler = nil
             input.rightButton?.pressedChangedHandler = nil
             input.middleButton?.pressedChangedHandler = nil
-            input.scroll.valueChangedHandler = nil
         }
         controllersBySlot.values.forEach {
             $0.extendedGamepad?.valueChangedHandler = nil
@@ -1033,6 +1050,13 @@ final class NativeStreamInputBridge {
 
     func sendMouseWheel(delta: Int) {
         sink?.sendReliableInput(encoder.encodeMouseWheel(delta: delta))
+    }
+
+    /// Wheel input from a hardware mouse or trackpad, as read by the stream surface.
+    func sendHardwareMouseWheel(delta: Int) {
+        noteHardwareMouseEvent()
+        guard delta != 0, hardwareMouseForwarding else { return }
+        sendMouseWheel(delta: delta)
     }
 
     @discardableResult
@@ -1298,7 +1322,6 @@ final class NativeStreamInputBridge {
             input.leftButton.pressedChangedHandler = nil
             input.rightButton?.pressedChangedHandler = nil
             input.middleButton?.pressedChangedHandler = nil
-            input.scroll.valueChangedHandler = nil
         }
         mice = GCMouse.mice()
         for mouse in mice {
@@ -1323,12 +1346,6 @@ final class NativeStreamInputBridge {
             input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
                 self?.noteHardwareMouseEvent()
                 self?.forwardHardwareMouseButton(3, pressed: pressed)
-            }
-            input.scroll.valueChangedHandler = { [weak self] _, _, yValue in
-                self?.noteHardwareMouseEvent()
-                let delta = Int((CGFloat(yValue) * 120).rounded())
-                guard delta != 0, self?.hardwareMouseForwarding == true else { return }
-                self?.sendMouseWheel(delta: delta)
             }
             input.auxiliaryButtons?.enumerated().forEach { offset, button in
                 button.pressedChangedHandler = { [weak self] _, _, pressed in
@@ -1943,6 +1960,7 @@ final class NativeStreamInputBridge {
     func sendKey(mapping: NativeStreamKeyboardMapping, pressed: Bool, modifiers: UInt16) {}
     func clearRemoteText() {}
     func sendMouseWheel(delta: Int) {}
+    func sendHardwareMouseWheel(delta: Int) {}
     func sendUnicodeText(_ text: String) -> Int { 0 }
     func advertiseHaptics(force: Bool = false, now: TimeInterval = 0) {}
     func applyRumble(controllerId: Int, weakMagnitude: Int, strongMagnitude: Int) {}
