@@ -312,6 +312,15 @@ struct SessionReportView: View {
                         secondary: report.frameDeliveryAfterReturn?.shown.map { "\($0.heldBack) after returning" },
                         level: .fair)
                 }
+                if let raised = report.frameDeliveryRaisedLatency, raised.cadenceSeconds > 0 {
+                    stutterRateRow("While latency was normal",
+                        shown: (delivery.shown?.longGaps ?? 0) - (raised.shown?.longGaps ?? 0),
+                        arrived: (delivery.arrived?.longGaps ?? 0) - (raised.arrived?.longGaps ?? 0),
+                        seconds: delivery.cadenceSeconds - raised.cadenceSeconds)
+                    stutterRateRow(raised.averagePingMs.map { "While latency was raised (\($0) ms)" } ?? "While latency was raised",
+                        shown: raised.shown?.longGaps ?? 0, arrived: raised.arrived?.longGaps ?? 0,
+                        seconds: raised.cadenceSeconds)
+                }
                 if delivery.pipFrames > 0 {
                     measurementRow("Picture in picture", primary: "\(delivery.pipFrames) frames",
                         secondary: String(format: "%.1f ms each · on in the app %d s",

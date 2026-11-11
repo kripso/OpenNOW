@@ -383,6 +383,8 @@ struct SessionReport: Identifiable, Equatable {
     /// The part of `frameDelivery` measured after the app was left and came back.
     var frameDeliveryAfterReturn: SessionFrameDelivery? = nil
     var timesAway = 0
+    /// The part of `frameDelivery` measured while latency sat well above the session's best.
+    var frameDeliveryRaisedLatency: SessionFrameDelivery? = nil
 
     /// The chart needs enough points to say something true. Four points is a lie.
     var showsTrendChart: Bool { trend.count >= 8 }
@@ -443,6 +445,14 @@ final class StreamSessionReportAccumulator {
     private var frameDeliveryAfterReturn = SessionFrameDelivery()
     private var timesAway = 0
     private var wasAway = false
+    /// Latency counts as raised once it sits this far above the lowest the session has seen.
+    /// The lowest is only trusted after a few readings, so a slow first second is not the bar.
+    static let raisedLatencyMarginMs = 30
+    private static let pingSamplesBeforeComparing = 10
+    private var frameDeliveryRaisedLatency = SessionFrameDelivery()
+    private var lowestPingMs: Int?
+    private var latestPingMs: Int?
+    private var pingSamplesSeen = 0
     private var decodeCount = 0
     private var decodeTotal = 0.0
     private var peakDecodeMs: Double?
@@ -513,6 +523,16 @@ final class StreamSessionReportAccumulator {
             frameDelivery.record(sample, targetFps: launchProfile.initialProfile.fps)
             if sample.interruption == .returned {
                 frameDeliveryAfterReturn.record(sample, targetFps: launchProfile.initialProfile.fps)
+            }
+            if let ping = sample.pingMs, ping >= 0 {
+                pingSamplesSeen += 1
+                latestPingMs = ping
+                lowestPingMs = min(lowestPingMs ?? ping, ping)
+            }
+            if let latest = latestPingMs, let lowest = lowestPingMs,
+               pingSamplesSeen >= Self.pingSamplesBeforeComparing,
+               latest >= lowest + Self.raisedLatencyMarginMs {
+                frameDeliveryRaisedLatency.record(sample, targetFps: launchProfile.initialProfile.fps)
             }
         }
         consecutiveDecoderOverloadSamples = Self.isDecoderOverloadSample(
@@ -657,7 +677,8 @@ final class StreamSessionReportAccumulator {
             ),
             frameDelivery: frameDelivery.hasReadings ? frameDelivery : nil,
             frameDeliveryAfterReturn: frameDeliveryAfterReturn.hasReadings ? frameDeliveryAfterReturn : nil,
-            timesAway: timesAway
+            timesAway: timesAway,
+            frameDeliveryRaisedLatency: frameDeliveryRaisedLatency.hasReadings ? frameDeliveryRaisedLatency : nil
         )
     }
 

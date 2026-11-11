@@ -5740,12 +5740,46 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(routedReport.frameDelivery?.shown?.ticks, 6)
         XCTAssertEqual(routedReport.frameDelivery?.shown?.longestDrawMs ?? 0, 6, accuracy: 0.001)
 
+        // Stutters are also split by latency, whatever set the latency off: once it sits 30 ms
+        // above the session's best, those seconds are counted apart.
+        let lagging = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        func pinged(_ ping: Int?, stutters: Int) -> StreamRuntimeSample {
+            StreamRuntimeSample(timestamp: 0, pingMs: ping,
+                arrivedCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 20, longGaps: stutters, replaced: 0),
+                shownCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 30, longGaps: stutters, replaced: 0))
+        }
+        // A slow first reading must not become "raised" before there is a baseline to compare.
+        lagging.record(pinged(80, stutters: 1))
+        for _ in 0..<12 { lagging.record(pinged(25, stutters: 0)) }
+        lagging.record(pinged(54, stutters: 0))
+        for _ in 0..<4 { lagging.record(pinged(95, stutters: 3)) }
+        // A second without a latency reading stays with the latest one.
+        lagging.record(pinged(nil, stutters: 3))
+        lagging.record(pinged(26, stutters: 0))
+        let laggingReport = try XCTUnwrap(lagging.finish())
+        let raised = try XCTUnwrap(laggingReport.frameDeliveryRaisedLatency)
+        XCTAssertEqual(raised.cadenceSeconds, 5)
+        XCTAssertEqual(raised.shown?.longGaps, 15)
+        XCTAssertEqual(raised.averagePingMs, 95)
+        XCTAssertEqual(laggingReport.frameDelivery?.cadenceSeconds, 20)
+        XCTAssertEqual(laggingReport.frameDelivery?.shown?.longGaps, 16)
+        XCTAssertNil(steadyLatencyReport().frameDeliveryRaisedLatency)
+
         // A session that never left the app has no "after returning" part.
         let steady = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
         steady.record(second(.none, stutters: 1))
         let steadyReport = try XCTUnwrap(steady.finish())
         XCTAssertNil(steadyReport.frameDeliveryAfterReturn)
         XCTAssertEqual(steadyReport.timesAway, 0)
+    }
+
+    private func steadyLatencyReport() -> SessionReport {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        for ping in [24, 26, 25, 30, 41, 25, 24, 27, 26, 25, 49, 25] {
+            accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: ping,
+                shownCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 20, longGaps: 0, replaced: 0)))
+        }
+        return accumulator.finish()!
     }
 
     func testShortSessionsAreMarkedAsLimitedData() {
