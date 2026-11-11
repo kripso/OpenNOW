@@ -1209,7 +1209,7 @@ struct SettingsView: View {
             subscription: store.subscription,
             fallbackMembershipTier: store.user?.membershipTier
         ) {
-            return "HDR needs a Performance or Ultimate membership."
+            return "HDR needs an Ultimate membership."
         }
         if NativeStreamCodecProbe.report().capability(for: .h265)?.launchSafe != true {
             return "HDR needs an H.265 stream, and this device cannot decode one safely."
