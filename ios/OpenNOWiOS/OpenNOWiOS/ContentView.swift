@@ -27,7 +27,9 @@ struct ContentView: View {
             } else if ProcessInfo.processInfo.arguments.contains("--opennow-stream-controls-preview") {
                 NativeStreamControlsPreview()
             } else if ProcessInfo.processInfo.arguments.contains("--opennow-settings-preview") {
-                SettingsView()
+                // Inside the real shell: Settings lays out differently beside the iPad sidebar
+                // than it does alone, and alone is not how anyone sees it.
+                MainTabView(initialPage: .store)
                     .task { store.installDebugStorePreview() }
             } else if ProcessInfo.processInfo.arguments.contains("--opennow-store-preview")
                         || ProcessInfo.processInfo.arguments.contains("--opennow-console-preview") {
@@ -413,6 +415,12 @@ struct MainTabView: View {
         case .library:
             initialTab = .library
         }
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--opennow-settings-preview") {
+            _selectedTab = State(initialValue: .settings)
+            return
+        }
+        #endif
         _selectedTab = State(initialValue: initialTab)
     }
 

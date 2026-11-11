@@ -337,43 +337,63 @@ struct SettingsView: View {
         }
     }
 
+    /// One navigation stack around both panes. On iPad this view is the detail column of the
+    /// app's split view, which adopts a root stack as its own; a second stack nested beside the
+    /// category list instead drew its bar over half the column and its title across all of it.
     private var splitLayout: some View {
-        HStack(spacing: 0) {
-            settingsSidebar
-                .frame(width: 280)
-            Divider()
-            NavigationStack {
-                categoryDetail(selectedCategory)
-                    .navigationTitle(selectedCategory.title)
-                    .navigationBarTitleDisplayMode(.inline)
+        NavigationStack {
+            HStack(spacing: 0) {
+                settingsSidebar
+                    .frame(width: 300)
+                Divider()
+                    .ignoresSafeArea(edges: .bottom)
+                categoryDetail(selectedCategory, showsHeading: true)
+                    // Fresh per category, so each one opens scrolled to its top.
+                    .id(selectedCategory)
             }
-            // A fresh stack per category: no stale pushed screen, and the list starts at the top.
-            .id(selectedCategory)
+            .background(Color(.systemGroupedBackground).ignoresSafeArea())
+            // The stack's title stays the open category, which is what a pushed page goes back
+            // to; the bar spans both panes, so what it shows is the name of the whole screen.
+            .navigationTitle(selectedCategory.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("Settings").font(.headline)
+                }
+            }
         }
+    }
+
+    /// Pinned above the category list, level with the heading of the pane beside it.
+    private var settingsSearchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search settings", text: $searchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            if isSearching {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 44)
+        .background(Color(.secondarySystemGroupedBackground), in: Capsule())
+        .padding(.horizontal, 20)
+        .padding(.top, 12)
+        .padding(.bottom, 4)
+        .background(Color(.systemGroupedBackground))
     }
 
     private var settingsSidebar: some View {
         List {
-            Section {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    TextField("Search settings", text: $searchText)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    if isSearching {
-                        Button {
-                            searchText = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Clear search")
-                    }
-                }
-            }
-
             if accountLandingVisible {
                 Section {
                     sidebarRow(selected: selectedCategory == .account) {
@@ -412,7 +432,9 @@ struct SettingsView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .settingsSidebarTopMargin()
         .overlay { noSearchResultsOverlay }
+        .safeAreaInset(edge: .top, spacing: 0) { settingsSearchField }
     }
 
     private func sidebarRow<Label: View>(
@@ -451,7 +473,7 @@ struct SettingsView: View {
 
     /// Everything in a category on one screen: its pages are tabs along the top instead of a
     /// second list to drill through.
-    private func categoryDetail(_ category: SettingsCategory) -> some View {
+    private func categoryDetail(_ category: SettingsCategory, showsHeading: Bool = false) -> some View {
         let page = selectedPage(in: category)
         return Form {
             if let page {
@@ -460,9 +482,22 @@ struct SettingsView: View {
             settingsDetailContent(for: category)
         }
         .safeAreaInset(edge: .top, spacing: 0) {
-            if category.pages.count > 1, let page {
-                settingsPageTabs(category.pages, selected: page) { selectedPages[category] = $0 }
+            VStack(alignment: .leading, spacing: 0) {
+                // Beside the category list the bar says "Settings", so the pane names itself.
+                if showsHeading {
+                    Text(category.title)
+                        .font(.title2.weight(.bold))
+                        .padding(.horizontal, 20)
+                        .padding(.top, 14)
+                        .padding(.bottom, category.pages.count > 1 ? 2 : 10)
+                        .accessibilityAddTraits(.isHeader)
+                }
+                if category.pages.count > 1, let page {
+                    settingsPageTabs(category.pages, selected: page) { selectedPages[category] = $0 }
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(showsHeading ? AnyShapeStyle(Color(.systemGroupedBackground)) : AnyShapeStyle(.bar))
         }
     }
 
@@ -484,7 +519,9 @@ struct SettingsView: View {
                                 .lineLimit(1)
                                 .padding(.horizontal, 14)
                                 .frame(minHeight: 36)
-                                .foregroundStyle(isSelected ? Color.white : Color.primary)
+                                // The accent is dark in light mode and light in dark mode; the
+                                // page background colour is the one that reads on both.
+                                .foregroundStyle(isSelected ? Color(.systemBackground) : Color.primary)
                                 .background(
                                     isSelected ? Color.accentColor : Color(.secondarySystemGroupedBackground),
                                     in: Capsule()
@@ -505,7 +542,6 @@ struct SettingsView: View {
                 withAnimation { proxy.scrollTo(page, anchor: .center) }
             }
         }
-        .background(.bar)
     }
 
     @ViewBuilder
@@ -2417,5 +2453,18 @@ private extension String {
     var nonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+private extension View {
+    /// The grouped list's own top inset is sized for a screen edge, not for sitting under a
+    /// pinned search field.
+    @ViewBuilder
+    func settingsSidebarTopMargin() -> some View {
+        if #available(iOS 17.0, *) {
+            contentMargins(.top, 12, for: .scrollContent)
+        } else {
+            self
+        }
     }
 }
