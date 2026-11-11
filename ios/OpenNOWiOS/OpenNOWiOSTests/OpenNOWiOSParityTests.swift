@@ -3287,30 +3287,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(store.settings.preferredCodec, "AV1")
     }
 
-    func testPointerEventsDriveTheMouseOnlyWhileRawMouseEventsAreAbsent() {
-        var source = NativeStreamMouseSourceArbiter()
-        // No raw event has ever arrived: iOS refused pointer lock, the pointer is all there is.
-        XCTAssertTrue(source.acceptPointerMove())
-        XCTAssertTrue(source.acceptsPointerButtons)
-
-        // Raw events are flowing: a pointer event for the same motion must not double it.
-        source.noteRawEvent()
-        XCTAssertFalse(source.acceptPointerMove())
-        XCTAssertFalse(source.acceptsPointerButtons)
-        source.noteRawEvent()
-
-        // Raw events stop (lock lost mid-session): sustained pointer movement takes over.
-        for _ in 0..<NativeStreamMouseSourceArbiter.pointerMovesBeforeTakeover {
-            XCTAssertFalse(source.acceptPointerMove())
-        }
-        XCTAssertTrue(source.acceptPointerMove())
-        XCTAssertTrue(source.acceptsPointerButtons)
-
-        // And hand straight back when raw events return.
-        source.noteRawEvent()
-        XCTAssertFalse(source.acceptPointerMove())
-    }
-
     func testAllocationSignatureIgnoresPerConnectionBitrateAndCodec() {
         var settings = AppSettings.default
         settings.preferredCodec = "H265"

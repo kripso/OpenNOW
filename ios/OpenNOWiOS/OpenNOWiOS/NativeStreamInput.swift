@@ -469,37 +469,6 @@ struct NativeStreamHardwareInputStatus: Equatable {
     var keyboardConnected = false
     var mouseEventCount = 0
     var lastMouseEventAt: Date?
-    var pointerEventCount = 0
-    var lastPointerEventAt: Date?
-}
-
-/// Decides which of the two ways iOS reports one mouse reaches the host.
-///
-/// GameController delivers raw deltas, UIKit delivers pointer movement, and depending on whether
-/// iOS granted pointer lock an app may get one, the other, or both. Raw events win whenever they
-/// arrive. Pointer events take over only after sustained movement with no raw event, which is
-/// what a refused pointer lock looks like.
-struct NativeStreamMouseSourceArbiter {
-    static let pointerMovesBeforeTakeover = 12
-    private(set) var rawLive = false
-    private var pointerMovesSinceRaw = 0
-
-    mutating func noteRawEvent() {
-        rawLive = true
-        pointerMovesSinceRaw = 0
-    }
-
-    /// Whether this pointer movement should be sent.
-    mutating func acceptPointerMove() -> Bool {
-        guard rawLive else { return true }
-        pointerMovesSinceRaw += 1
-        guard pointerMovesSinceRaw > Self.pointerMovesBeforeTakeover else { return false }
-        rawLive = false
-        return true
-    }
-
-    /// Clicks and scrolling follow whichever source currently owns movement.
-    var acceptsPointerButtons: Bool { !rawLive }
 }
 
 #if canImport(GameController)
@@ -728,13 +697,6 @@ final class NativeStreamInputBridge {
     private var mice: [GCMouse] = []
     private var hardwareMouseEventCount = 0
     private var lastHardwareMouseEventAt: Date?
-    private var pointerEventCount = 0
-    private var lastPointerEventAt: Date?
-    private var mouseSource = NativeStreamMouseSourceArbiter()
-    /// Buttons a hardware mouse holds down, so a click reported by both GameController and UIKit
-    /// reaches the host once.
-    private var hardwareHeldButtons: Set<Int> = []
-    private var pointerHeldButtons: Set<Int> = []
 
     /// Read live from the system, not from the cached handlers, so the readout also shows a
     /// mouse that connected without posting a notification.
@@ -745,60 +707,13 @@ final class NativeStreamInputBridge {
             },
             keyboardConnected: GCKeyboard.coalesced != nil,
             mouseEventCount: hardwareMouseEventCount,
-            lastMouseEventAt: lastHardwareMouseEventAt,
-            pointerEventCount: pointerEventCount,
-            lastPointerEventAt: lastPointerEventAt
+            lastMouseEventAt: lastHardwareMouseEventAt
         )
     }
 
     private func noteHardwareMouseEvent() {
         hardwareMouseEventCount += 1
         lastHardwareMouseEventAt = Date()
-        mouseSource.noteRawEvent()
-    }
-
-    private func notePointerEvent() {
-        pointerEventCount += 1
-        lastPointerEventAt = Date()
-    }
-
-    private func sendHardwareMouseButton(_ button: Int, pressed: Bool) {
-        if pressed {
-            guard hardwareHeldButtons.insert(button).inserted else { return }
-        } else {
-            guard hardwareHeldButtons.remove(button) != nil else { return }
-        }
-        sendMouseButton(button, pressed: pressed)
-    }
-
-    /// Movement of the iOS pointer, already scaled to host pixels. iOS has applied its own
-    /// pointer acceleration, so only the sensitivity setting is added.
-    func sendPointerMove(dx: CGFloat, dy: CGFloat) {
-        notePointerEvent()
-        guard mouseSource.acceptPointerMove() else { return }
-        coalesceMouse(dx: dx, dy: dy, accelerated: false)
-    }
-
-    /// The full set of buttons the iOS pointer holds; anything no longer in it is released.
-    func setPointerButtons(_ buttons: Set<Int>) {
-        notePointerEvent()
-        // Releases always go through, and only for buttons the pointer itself pressed: a press
-        // must never outlive its source, nor end one GameController is still holding.
-        for button in pointerHeldButtons.subtracting(buttons).sorted() {
-            pointerHeldButtons.remove(button)
-            sendHardwareMouseButton(button, pressed: false)
-        }
-        guard mouseSource.acceptsPointerButtons else { return }
-        for button in buttons.subtracting(pointerHeldButtons).sorted() {
-            pointerHeldButtons.insert(button)
-            sendHardwareMouseButton(button, pressed: true)
-        }
-    }
-
-    func sendPointerWheel(delta: Int) {
-        notePointerEvent()
-        guard mouseSource.acceptsPointerButtons, delta != 0 else { return }
-        sendMouseWheel(delta: delta)
     }
     private var controllersBySlot: [Int: GCController] = [:]
     private var controllerSlots: [ObjectIdentifier: Int] = [:]
@@ -1026,8 +941,6 @@ final class NativeStreamInputBridge {
         }
         keyboard = nil
         mice = []
-        hardwareHeldButtons.removeAll()
-        pointerHeldButtons.removeAll()
         controllersBySlot.removeAll(keepingCapacity: true)
         controllerSlots.removeAll(keepingCapacity: true)
         lastGamepadStates.removeAll(keepingCapacity: true)
@@ -1371,15 +1284,15 @@ final class NativeStreamInputBridge {
             }
             input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
                 self?.noteHardwareMouseEvent()
-                self?.sendHardwareMouseButton(1, pressed: pressed)
+                self?.sendMouseButton(1, pressed: pressed)
             }
             input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in
                 self?.noteHardwareMouseEvent()
-                self?.sendHardwareMouseButton(2, pressed: pressed)
+                self?.sendMouseButton(2, pressed: pressed)
             }
             input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
                 self?.noteHardwareMouseEvent()
-                self?.sendHardwareMouseButton(3, pressed: pressed)
+                self?.sendMouseButton(3, pressed: pressed)
             }
             input.scroll.valueChangedHandler = { [weak self] _, _, yValue in
                 self?.noteHardwareMouseEvent()
@@ -1390,7 +1303,7 @@ final class NativeStreamInputBridge {
             input.auxiliaryButtons?.enumerated().forEach { offset, button in
                 button.pressedChangedHandler = { [weak self] _, _, pressed in
                     self?.noteHardwareMouseEvent()
-                    self?.sendHardwareMouseButton(4 + offset, pressed: pressed)
+                    self?.sendMouseButton(4 + offset, pressed: pressed)
                 }
             }
         }
@@ -1490,10 +1403,8 @@ final class NativeStreamInputBridge {
         return (value < 0 ? -1 : 1) * scaled * scaled
     }
 
-    private func coalesceMouse(dx: CGFloat, dy: CGFloat, accelerated: Bool = true) {
-        let adjusted = accelerated
-            ? adjustedMouseDelta(dx: dx, dy: dy)
-            : CGPoint(x: dx * mouseSensitivity, y: dy * mouseSensitivity)
+    private func coalesceMouse(dx: CGFloat, dy: CGFloat) {
+        let adjusted = adjustedMouseDelta(dx: dx, dy: dy)
         mouseAccumulator.x += adjusted.x
         mouseAccumulator.y += adjusted.y
         guard !mouseFlushScheduled else { return }
@@ -2000,9 +1911,6 @@ final class NativeStreamInputBridge {
     func sendKey(mapping: NativeStreamKeyboardMapping, pressed: Bool, modifiers: UInt16) {}
     func clearRemoteText() {}
     func sendMouseWheel(delta: Int) {}
-    func sendPointerMove(dx: CGFloat, dy: CGFloat) {}
-    func setPointerButtons(_ buttons: Set<Int>) {}
-    func sendPointerWheel(delta: Int) {}
     func sendUnicodeText(_ text: String) -> Int { 0 }
     func advertiseHaptics(force: Bool = false, now: TimeInterval = 0) {}
     func applyRumble(controllerId: Int, weakMagnitude: Int, strongMagnitude: Int) {}
