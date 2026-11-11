@@ -56,6 +56,31 @@ func nativeStreamDisplayFrameRateRange(streamFPS: Int, displayMaximumFPS: Int) -
     return CAFrameRateRange(minimum: stream, maximum: display, preferred: display)
 }
 
+/// How many decoded frames may wait for a display tick.
+///
+/// Frames come off the network in bunches: one late, the next right behind it. When the screen
+/// ticks well faster than the stream, the second of two close frames can simply be shown on the
+/// following tick. Keeping only the newest throws the first away instead, so the picture skips
+/// a frame and holds the one before it for twice as long. When the screen is no faster than the
+/// stream a second waiting frame would never catch up, so only the newest is kept.
+func nativeStreamWaitingFrameCapacity(streamFPS: Int, displayMaximumFPS: Int) -> Int {
+    Double(displayMaximumFPS) >= Double(max(1, streamFPS)) * 1.5 ? 2 : 1
+}
+
+/// Picks the candidate pair the stream is actually using out of a statistics report.
+///
+/// A report lists every pair that ever succeeded, and more appear during a session as the device
+/// gathers new routes. Reading latency or the route from any succeeded pair reports whichever
+/// one happens to come last, which need not carry any media.
+enum NativeStreamSelectedCandidatePair {
+    static func choose(transportSelectedID: String?, succeeded: [String: [String: NSObject]]) -> [String: NSObject]? {
+        if let transportSelectedID, let pair = succeeded[transportSelectedID] { return pair }
+        func bytes(_ pair: [String: NSObject]) -> Int64 { (pair["bytesReceived"] as? NSNumber)?.int64Value ?? 0 }
+        // No transport entry: the pair that has carried the most is the one in use.
+        return succeeded.values.max { bytes($0) < bytes($1) }
+    }
+}
+
 enum NativeStreamTransportPolicy {
     static let offerTimeout: TimeInterval = 12
     static let iceDisconnectedGrace: TimeInterval = 3.5
@@ -5366,13 +5391,16 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         var decoderImplementation: String?
         var receiverCounters = NativeStreamReceiverCounters()
         var selectedPairValues: [String: NSObject]?
+        var selectedPairID: String?
+        var succeededPairs: [String: [String: NSObject]] = [:]
         var candidateStats: [String: [String: NSObject]] = [:]
 
         for stat in report.statistics.values {
             guard stat.type == "inbound-rtp"
                     || stat.type == "local-candidate"
                     || stat.type == "remote-candidate"
-                    || stat.type == "candidate-pair" else { continue }
+                    || stat.type == "candidate-pair"
+                    || stat.type == "transport" else { continue }
             if stat.type == "inbound-rtp" {
                 if let kind = stat.values["kind"] as? String, kind != "video" { continue }
 
@@ -5398,17 +5426,17 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 }
             } else if stat.type == "local-candidate" || stat.type == "remote-candidate" {
                 candidateStats[stat.id] = stat.values
+            } else if stat.type == "transport" {
+                selectedPairID = stat.values["selectedCandidatePairId"] as? String ?? selectedPairID
             } else if stat.type == "candidate-pair",
                       (stat.values["state"] as? String) == "succeeded" {
-                let nominated = (stat.values["nominated"] as? NSNumber)?.boolValue ?? false
-                let selected = (stat.values["selected"] as? NSNumber)?.boolValue ?? false
-                if selectedPairValues == nil || nominated || selected {
-                    selectedPairValues = stat.values
-                }
-                if let rtt = stat.values["currentRoundTripTime"] as? NSNumber {
-                    rttMs = rtt.doubleValue * 1000
-                }
+                succeededPairs[stat.id] = stat.values
             }
+        }
+        selectedPairValues = NativeStreamSelectedCandidatePair.choose(
+            transportSelectedID: selectedPairID, succeeded: succeededPairs)
+        if let rtt = selectedPairValues?["currentRoundTripTime"] as? NSNumber {
+            rttMs = rtt.doubleValue * 1000
         }
 
         let packetLossPercent: Double = {
@@ -7103,7 +7131,8 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
 
     private let lock = NSLock()
     private let maximumInFlight: Int
-    private var pending: Entry?
+    private var pending: [Entry] = []
+    private var capacity = 1
     private var inFlight = 0
 
     init(maximumInFlight: Int = 2) {
@@ -7111,28 +7140,38 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
         self.maximumInFlight = maximumInFlight
     }
 
-    /// Whether the frame replaced one that was still waiting to be shown.
+    /// How many frames may wait for a display tick. With one, a frame that arrives just behind
+    /// another replaces it and is the only one shown. With two, both are shown, a tick apart.
+    func setCapacity(_ capacity: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.capacity = max(1, capacity)
+        if pending.count > self.capacity { pending.removeFirst(pending.count - self.capacity) }
+    }
+
+    /// Whether the frame pushed out one that was still waiting to be shown.
     @discardableResult
     func offer(_ frame: Frame) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        let replaced = pending != nil
-        pending = Entry(frame: frame)
-        return replaced
+        pending.append(Entry(frame: frame))
+        guard pending.count > capacity else { return false }
+        pending.removeFirst(pending.count - capacity)
+        return true
     }
 
     var hasPending: Bool {
         lock.lock(); defer { lock.unlock() }
-        return pending != nil
+        return !pending.isEmpty
     }
 
+    /// The oldest waiting frame.
     func take() -> Entry? {
         lock.lock()
         defer { lock.unlock() }
-        guard inFlight < maximumInFlight, let entry = pending else { return nil }
-        pending = nil
+        guard inFlight < maximumInFlight, !pending.isEmpty else { return nil }
         inFlight += 1
-        return entry
+        return pending.removeFirst()
     }
 
     func complete() {
@@ -7318,7 +7357,14 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 
     private func displayTick(_ link: CADisplayLink) {
-        presentations.cadence.noteTick(time: CACurrentMediaTime(), interval: link.targetTimestamp - link.timestamp)
+        let interval = link.targetTimestamp - link.timestamp
+        presentations.cadence.noteTick(time: CACurrentMediaTime(), interval: interval)
+        if interval > 0 {
+            // From the rate the clock is really running at: the system can hold a 120 Hz panel
+            // to 60 Hz (Low Power Mode, heat), and a second waiting frame would then only add delay.
+            frames.setCapacity(nativeStreamWaitingFrameCapacity(
+                streamFPS: streamFPS, displayMaximumFPS: Int((1 / interval).rounded())))
+        }
         mtkView.draw()
     }
 

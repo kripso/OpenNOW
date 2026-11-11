@@ -2876,6 +2876,57 @@ final class OpenNOWiOSParityTests: XCTestCase {
         mailbox.complete()
     }
 
+    func testTwoFramesThatArriveTogetherAreBothShownWhenTheScreenOutpacesTheStream() throws {
+        // A 60 fps stream on a 120 Hz screen keeps two; on a 60 Hz screen, or at 120 fps, one.
+        XCTAssertEqual(nativeStreamWaitingFrameCapacity(streamFPS: 60, displayMaximumFPS: 120), 2)
+        XCTAssertEqual(nativeStreamWaitingFrameCapacity(streamFPS: 60, displayMaximumFPS: 60), 1)
+        XCTAssertEqual(nativeStreamWaitingFrameCapacity(streamFPS: 120, displayMaximumFPS: 120), 1)
+        XCTAssertEqual(nativeStreamWaitingFrameCapacity(streamFPS: 90, displayMaximumFPS: 120), 1)
+
+        let mailbox = NativeStreamLatestFrameMailbox<Int>(maximumInFlight: 3)
+        mailbox.setCapacity(2)
+        // Two frames land between the same pair of ticks: neither pushes the other out.
+        XCTAssertFalse(mailbox.offer(1))
+        XCTAssertFalse(mailbox.offer(2))
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 1, "The older frame is shown first")
+        mailbox.complete()
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 2, "The newer one follows on the next tick")
+        mailbox.complete()
+        XCTAssertNil(mailbox.take())
+
+        // A third in the same gap pushes out the oldest, so the wait never grows past two.
+        XCTAssertFalse(mailbox.offer(3))
+        XCTAssertFalse(mailbox.offer(4))
+        XCTAssertTrue(mailbox.offer(5))
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 4)
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 5)
+        mailbox.complete(); mailbox.complete()
+
+        // Going back to one keeps only the newest of what was waiting.
+        mailbox.offer(6); mailbox.offer(7)
+        mailbox.setCapacity(1)
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 7)
+        XCTAssertNil(mailbox.take())
+        mailbox.complete()
+    }
+
+    func testLatencyAndRouteComeFromThePairTheStreamIsUsing() {
+        func pair(rtt: Double, bytes: Int, nominated: Bool = true) -> [String: NSObject] {
+            ["currentRoundTripTime": NSNumber(value: rtt), "bytesReceived": NSNumber(value: bytes),
+             "nominated": NSNumber(value: nominated)]
+        }
+        let pairs = ["udp": pair(rtt: 0.025, bytes: 900_000_000), "tcp": pair(rtt: 0.095, bytes: 4_000)]
+        func rtt(_ chosen: [String: NSObject]?) -> Double? { (chosen?["currentRoundTripTime"] as? NSNumber)?.doubleValue }
+
+        // The transport names the pair in use, whatever else has succeeded alongside it.
+        XCTAssertEqual(rtt(NativeStreamSelectedCandidatePair.choose(transportSelectedID: "udp", succeeded: pairs)), 0.025)
+        XCTAssertEqual(rtt(NativeStreamSelectedCandidatePair.choose(transportSelectedID: "tcp", succeeded: pairs)), 0.095)
+        // Without one, or with one that names an unknown pair, the pair carrying the media wins.
+        XCTAssertEqual(rtt(NativeStreamSelectedCandidatePair.choose(transportSelectedID: nil, succeeded: pairs)), 0.025)
+        XCTAssertEqual(rtt(NativeStreamSelectedCandidatePair.choose(transportSelectedID: "gone", succeeded: pairs)), 0.025)
+        XCTAssertNil(NativeStreamSelectedCandidatePair.choose(transportSelectedID: "udp", succeeded: [:]))
+    }
+
     func testSoftwareI420BridgeCopiesPaddedPlanesAndInterleavesChroma() throws {
         let bridge = NativeStreamFramePixelBufferBridge()
         for (width, height) in [(6, 4), (8, 6)] {
