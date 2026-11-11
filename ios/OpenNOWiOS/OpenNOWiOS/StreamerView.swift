@@ -654,6 +654,16 @@ struct StreamerView: View {
         _ = onNativeFallbackRequiresFreshEndpoint
     }
 
+    /// True while the game owns hardware mouse input: playing, with nothing of ours on top.
+    private var pointerCaptureWanted: Bool {
+        NativeStreamPointerCapturePolicy.shouldCapture(
+            videoActive: coordinator.videoActive && !coordinator.showStatusOverlay,
+            sceneActive: scenePhase == .active, controlsVisible: coordinator.controlsPanelVisible,
+            editing: coordinator.touchLayoutEditing,
+            guidanceVisible: coordinator.presentedGuidanceSheet != nil || coordinator.inputModePrompt != nil,
+            pipActive: coordinator.isPictureInPictureActive)
+    }
+
     var body: some View {
         GeometryReader { proxy in
             ZStack {
@@ -667,6 +677,7 @@ struct StreamerView: View {
                     inputBridge: coordinator.inputBridge,
                     inputEnabled: coordinator.fingerMouseCaptureEnabled,
                     nativeTouchEnabled: coordinator.nativeTouchCaptureEnabled,
+                    pointerInputEnabled: pointerCaptureWanted,
                     geometry: { [weak coordinator] in
                         coordinator?.currentTouchGeometry() ?? NativeStreamTouchGeometry()
                     },
@@ -815,12 +826,7 @@ struct StreamerView: View {
                 coordinator.handleViewDisappear(scenePhase: scenePhase)
             }
         }
-        .background(NativeStreamPresentationPreferences(pointerCaptureRequested:
-            NativeStreamPointerCapturePolicy.shouldCapture(videoActive: coordinator.videoActive && !coordinator.showStatusOverlay,
-                sceneActive: scenePhase == .active, controlsVisible: coordinator.controlsPanelVisible,
-                editing: coordinator.touchLayoutEditing, guidanceVisible: coordinator.presentedGuidanceSheet != nil
-                    || coordinator.inputModePrompt != nil,
-                pipActive: coordinator.isPictureInPictureActive)))
+        .background(NativeStreamPresentationPreferences(pointerCaptureRequested: pointerCaptureWanted))
         .sheet(item: $coordinator.presentedGuidanceSheet) { destination in
             switch destination {
             case .streamTutorial:
@@ -2301,15 +2307,20 @@ private struct NativeStreamControlsPanel: View {
                         value: status.mouseNames.isEmpty ? "Not reported by iOS" : status.mouseNames.joined(separator: ", ")
                     )
                     NativeStreamInfoRow(
-                        title: "Mouse events",
-                        value: Self.mouseEventSummary(status, now: timeline.date)
+                        title: "Raw mouse events",
+                        value: Self.eventSummary(count: status.mouseEventCount, last: status.lastMouseEventAt, now: timeline.date)
                     )
+                    NativeStreamInfoRow(
+                        title: "Pointer events",
+                        value: Self.eventSummary(count: status.pointerEventCount, last: status.lastPointerEventAt, now: timeline.date)
+                    )
+                    NativeStreamInfoRow(title: "Pointer capture", value: NativeStreamPointerLockDiagnostics.lastOutcome.label)
                     NativeStreamInfoRow(title: "Keyboard", value: status.keyboardConnected ? "Connected" : "Not reported by iOS")
                     NativeStreamInfoRow(
                         title: "AssistiveTouch",
                         value: UIAccessibility.isAssistiveTouchRunning ? "On" : "Off"
                     )
-                    NativeStreamPanelNote("A mouse reaches the game only when iOS lists it here. If it is paired but not listed, iOS is keeping it from apps on this device.")
+                    NativeStreamPanelNote("iOS sends raw mouse events while it grants pointer capture and pointer events otherwise; the game follows whichever arrives. Counts are for this session, taken while playing.")
                 }
             }
 
@@ -2386,10 +2397,10 @@ private struct NativeStreamControlsPanel: View {
         }
     }
 
-    private static func mouseEventSummary(_ status: NativeStreamHardwareInputStatus, now: Date) -> String {
-        guard status.mouseEventCount > 0, let last = status.lastMouseEventAt else { return "None received" }
+    private static func eventSummary(count: Int, last: Date?, now: Date) -> String {
+        guard count > 0, let last else { return "None received" }
         let seconds = max(0, Int(now.timeIntervalSince(last)))
-        return "\(status.mouseEventCount) · last \(seconds < 1 ? "just now" : "\(seconds)s ago")"
+        return "\(count) · last \(seconds < 1 ? "just now" : "\(seconds)s ago")"
     }
 
     private func metricToggle(
@@ -8233,6 +8244,7 @@ private struct NativeStreamTouchCaptureView: UIViewRepresentable {
     let inputBridge: NativeStreamInputBridge
     let inputEnabled: Bool
     let nativeTouchEnabled: Bool
+    let pointerInputEnabled: Bool
     let geometry: () -> NativeStreamTouchGeometry
     let onZoomGesture: (CGFloat, CGSize) -> Void
 
@@ -8243,6 +8255,7 @@ private struct NativeStreamTouchCaptureView: UIViewRepresentable {
         view.onZoomGesture = onZoomGesture
         view.nativeTouchEnabled = nativeTouchEnabled
         view.inputEnabled = inputEnabled
+        view.pointerInputEnabled = pointerInputEnabled
         return view
     }
 
@@ -8252,10 +8265,23 @@ private struct NativeStreamTouchCaptureView: UIViewRepresentable {
         uiView.onZoomGesture = onZoomGesture
         uiView.nativeTouchEnabled = nativeTouchEnabled
         uiView.inputEnabled = inputEnabled
+        uiView.pointerInputEnabled = pointerInputEnabled
     }
 
     static func dismantleUIView(_ uiView: NativeStreamTouchView, coordinator: ()) {
         uiView.releaseAllNativeTouches()
+    }
+}
+
+extension NativeStreamTouchView: UIPointerInteractionDelegate {
+    func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest,
+                            defaultRegion: UIPointerRegion) -> UIPointerRegion? {
+        pointerInputEnabled ? defaultRegion : nil
+    }
+
+    /// The game draws its own cursor, so the iOS pointer is hidden over the picture.
+    func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
+        .hidden()
     }
 }
 
@@ -8291,8 +8317,23 @@ private final class NativeStreamTouchView: UIView {
         }
     }
 
+    /// A hardware mouse or trackpad that iOS reports as its pointer rather than through
+    /// GameController, which is what happens whenever iOS does not grant pointer lock. Separate
+    /// from the finger modes: the pointer drives the host mouse whichever of them is selected.
+    var pointerInputEnabled = false {
+        didSet {
+            guard pointerInputEnabled != oldValue else { return }
+            if !pointerInputEnabled { releasePointerButtons() }
+            pointerInteraction?.invalidate()
+        }
+    }
+
     var geometryProvider: (() -> NativeStreamTouchGeometry)?
     var onZoomGesture: ((CGFloat, CGSize) -> Void)?
+    private var pointerInteraction: UIPointerInteraction?
+    private var lastPointerLocation: CGPoint?
+    private var pointerButtonsHeld = false
+    private var lastPointerScrollTranslation: CGFloat = 0
     private static let tapMovementThreshold: CGFloat = 8
     private static let clickReleaseDelay: TimeInterval = 0.045
 
@@ -8318,6 +8359,7 @@ private final class NativeStreamTouchView: UIView {
         accessibilityLabel = "Stream input surface"
         accessibilityTraits = [.button, .allowsDirectInteraction]
         updateAccessibilityPresentation()
+        installPointerInput()
     }
 
     required init?(coder: NSCoder) {
@@ -8347,6 +8389,7 @@ private final class NativeStreamTouchView: UIView {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if handlePointerTouches(touches, event: event, ended: false) { return }
         if nativeTouchEnabled {
             becomeFirstResponder()
             dispatchNativeTouch(phase: NativeTouchPhase.down, touches: touches)
@@ -8375,6 +8418,7 @@ private final class NativeStreamTouchView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if handlePointerTouches(touches, event: event, ended: false) { return }
         if nativeTouchEnabled {
             dispatchNativeTouch(phase: NativeTouchPhase.move, touches: touches)
             return
@@ -8400,6 +8444,7 @@ private final class NativeStreamTouchView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if handlePointerTouches(touches, event: event, ended: true) { return }
         if nativeTouchEnabled {
             dispatchNativeTouch(phase: NativeTouchPhase.up, touches: touches)
             return
@@ -8429,6 +8474,7 @@ private final class NativeStreamTouchView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if handlePointerTouches(touches, event: event, ended: true) { return }
         if nativeTouchEnabled {
             dispatchNativeTouch(phase: NativeTouchPhase.cancel, touches: touches)
             return
@@ -8615,6 +8661,95 @@ private final class NativeStreamTouchView: UIView {
         touchStartPoint = nil
         lastPoint = nil
         movedBeyondTapThreshold = false
+    }
+
+    // MARK: Hardware pointer
+
+    private func installPointerInput() {
+        addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(handlePointerHover(_:))))
+
+        // Wheel and trackpad scrolling arrive as a pan with no touches.
+        let scroll = UIPanGestureRecognizer(target: self, action: #selector(handlePointerScroll(_:)))
+        scroll.allowedScrollTypesMask = .all
+        scroll.allowedTouchTypes = []
+        scroll.cancelsTouchesInView = false
+        addGestureRecognizer(scroll)
+
+        let interaction = UIPointerInteraction(delegate: self)
+        addInteraction(interaction)
+        pointerInteraction = interaction
+    }
+
+    /// Claims touches made by a mouse or trackpad button. Returns false for fingers.
+    private func handlePointerTouches(_ touches: Set<UITouch>, event: UIEvent?, ended: Bool) -> Bool {
+        guard let touch = touches.first(where: { $0.type == .indirectPointer }) else { return false }
+        guard pointerInputEnabled else { return true }
+        movePointer(to: touch.location(in: self))
+        pointerButtonsHeld = !ended
+        inputBridge?.setPointerButtons(ended ? [] : Self.hostButtons(for: event?.buttonMask ?? []))
+        return true
+    }
+
+    private static func hostButtons(for mask: UIEvent.ButtonMask) -> Set<Int> {
+        var buttons: Set<Int> = []
+        if mask.contains(.primary) { buttons.insert(1) }
+        if mask.contains(.button(3)) { buttons.insert(2) }
+        if mask.contains(.secondary) { buttons.insert(3) }
+        // A touch always means a button went down, even when iOS leaves the mask empty.
+        return buttons.isEmpty ? [1] : buttons
+    }
+
+    private func releasePointerButtons() {
+        guard pointerButtonsHeld else { return }
+        pointerButtonsHeld = false
+        inputBridge?.setPointerButtons([])
+    }
+
+    /// The host only takes relative movement, so the pointer's travel is converted to host
+    /// pixels one to one. The game cursor then follows the hidden iOS pointer, and pushing
+    /// against a screen edge lines the two up again if they drift.
+    private func movePointer(to point: CGPoint) {
+        defer { lastPointerLocation = point }
+        guard pointerInputEnabled, let last = lastPointerLocation else { return }
+        let scale = hostPixelsPerPoint()
+        let dx = (point.x - last.x) * scale.width
+        let dy = (point.y - last.y) * scale.height
+        guard dx != 0 || dy != 0 else { return }
+        inputBridge?.sendPointerMove(dx: dx, dy: dy)
+    }
+
+    private func hostPixelsPerPoint() -> CGSize {
+        let geometry = geometryProvider?() ?? NativeStreamTouchGeometry()
+        guard geometry.streamSize.width > 0, geometry.streamSize.height > 0,
+              bounds.width > 0, bounds.height > 0 else { return CGSize(width: 1, height: 1) }
+        let zoom = max(geometry.zoomScale, 0.01)
+        let x = geometry.streamSize.width / bounds.width / zoom
+        let y = geometry.streamSize.height / bounds.height / zoom
+        if geometry.stretchToFill { return CGSize(width: x, height: y) }
+        let fit = max(x, y)
+        return CGSize(width: fit, height: fit)
+    }
+
+    @objc private func handlePointerHover(_ recognizer: UIHoverGestureRecognizer) {
+        switch recognizer.state {
+        case .began, .changed: movePointer(to: recognizer.location(in: self))
+        default: break
+        }
+    }
+
+    @objc private func handlePointerScroll(_ recognizer: UIPanGestureRecognizer) {
+        switch recognizer.state {
+        case .began: lastPointerScrollTranslation = 0
+        case .changed, .ended: break
+        default: return
+        }
+        guard pointerInputEnabled, bounds.height > 0 else { return }
+        let translation = recognizer.translation(in: self).y
+        // One screen height of scrolling is twenty wheel notches, the scale Moonlight uses.
+        let delta = Int(((translation - lastPointerScrollTranslation) / bounds.height * 2400).rounded())
+        guard delta != 0 else { return }
+        lastPointerScrollTranslation = translation
+        inputBridge?.sendPointerWheel(delta: delta)
     }
 
     override func accessibilityActivate() -> Bool {
