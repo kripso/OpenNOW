@@ -2174,13 +2174,11 @@ enum StreamSettingsResolver {
         sessionSignature(for: settings, profile: profile(for: settings, membershipTier: nil))
     }
 
-    /// The part of a signature that describes the cloud allocation. A WebRTC session negotiates
-    /// bitrate and codec on every connection, so a session that differs only in those is still
-    /// the same seat and must be resumed, not stopped and replaced.
+    /// The part of a signature that describes the cloud allocation. Bitrate and codec are not
+    /// part of the session request; each connection negotiates them. A session that differs only
+    /// in those is still the same seat and must be resumed, not stopped and replaced.
     static func allocationSignature(_ signature: String) -> String {
-        let fields = signature.split(separator: ";")
-        guard fields.contains("transport=webrtc") else { return signature }
-        return fields
+        signature.split(separator: ";")
             .filter { !$0.hasPrefix("bitrate=") && !$0.hasPrefix("codec=") }
             .joined(separator: ";")
     }
@@ -8751,6 +8749,8 @@ final class OpenNOWStore: ObservableObject {
     /// Only the fields the control panel can actually reach are copied across. Taking the whole
     /// object would let a stale snapshot — the streamer holds one from when the session started —
     /// silently revert anything changed in Settings while the game was running.
+    private var streamQualityRollback: (maxBitrateMbps: Int, preferredCodec: String)?
+
     func applyStreamerSettings(_ updated: AppSettings) {
         var next = settings
         next.streamStatsMetrics = updated.streamStatsMetrics
@@ -8770,6 +8770,9 @@ final class OpenNOWStore: ObservableObject {
         // session's own snapshot, so an unrelated in-stream change cannot revert Settings.
         let snapshot = currentStreamerSettings
         if snapshot.maxBitrateMbps != updated.maxBitrateMbps || snapshot.preferredCodec != updated.preferredCodec {
+            if streamQualityRollback == nil {
+                streamQualityRollback = (snapshot.maxBitrateMbps, snapshot.preferredCodec)
+            }
             next.maxBitrateMbps = updated.maxBitrateMbps
             next.preferredCodec = updated.preferredCodec
             next.streamPreset = .custom
@@ -8785,6 +8788,26 @@ final class OpenNOWStore: ObservableObject {
         }
         guard next != settings else { return }
         settings = next
+        persistSettings()
+    }
+
+    /// The new stream held, so the in-stream bitrate or codec change stands.
+    func confirmInStreamQualityChange() {
+        streamQualityRollback = nil
+    }
+
+    /// Restores the bitrate and codec from before an in-stream change that never produced a
+    /// stable stream. A reopen reads the session's own snapshot, so without this a codec the
+    /// host rejects would keep failing until the session ended.
+    func rollBackUnconfirmedInStreamQualityChange() {
+        guard let previous = streamQualityRollback else { return }
+        streamQualityRollback = nil
+        activeStreamSettings?.maxBitrateMbps = previous.maxBitrateMbps
+        activeStreamSettings?.preferredCodec = previous.preferredCodec
+        guard settings.maxBitrateMbps != previous.maxBitrateMbps
+            || settings.preferredCodec != previous.preferredCodec else { return }
+        settings.maxBitrateMbps = previous.maxBitrateMbps
+        settings.preferredCodec = previous.preferredCodec
         persistSettings()
     }
 

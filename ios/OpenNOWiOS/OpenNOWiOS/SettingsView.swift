@@ -85,6 +85,10 @@ private enum SettingsCategory: String, CaseIterable, Hashable, Identifiable {
         }
     }
 
+    static func containing(_ page: SettingsPage) -> SettingsCategory {
+        allCases.first { $0.pages.contains(page) } ?? .general
+    }
+
     init(_ route: SettingsRouteTarget) {
         switch route {
         case .account: self = .account
@@ -106,6 +110,33 @@ private enum SettingsCategory: String, CaseIterable, Hashable, Identifiable {
     }
 }
 
+private extension SettingsPage {
+    var category: SettingsCategory { SettingsCategory.containing(self) }
+
+    /// The short name used on a category's tab strip, where the category already gives context.
+    var tabTitle: String {
+        switch self {
+        case .privacy: return String(localized: "Privacy")
+        case .appData: return String(localized: "App Data")
+        case .streamQuality: return String(localized: "Quality")
+        case .video: return String(localized: "Video")
+        case .connection: return String(localized: "Connection")
+        case .keyboard: return String(localized: "Audio & Keyboard")
+        case .pointer: return String(localized: "Mouse")
+        case .nativeTouch: return String(localized: "Touch")
+        case .touchController: return String(localized: "On-Screen Controller")
+        case .controller: return String(localized: "Controller")
+        case .appearance: return String(localized: "Appearance")
+        case .catalog: return String(localized: "Catalog")
+        case .stats: return String(localized: "Stats")
+        case .streamControls: return String(localized: "Stream Controls")
+        case .sessions: return String(localized: "Sessions")
+        case .experimental: return String(localized: "Experimental")
+        case .diagnostics: return String(localized: "Diagnostics")
+        }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var store: OpenNOWStore
     @AppStorage("OpenNOW.iOS.setupCompletedVersion") private var setupCompletedVersion = 0
@@ -113,6 +144,10 @@ struct SettingsView: View {
     // Use the same type-erased path storage as the surrounding tab/split-view
     // navigation. A typed array can trap when SwiftUI compares column paths.
     @State private var path = NavigationPath()
+    /// The category shown beside the sidebar on wide layouts.
+    @State private var selectedCategory: SettingsCategory = .stream
+    /// The tab last opened in each category, so switching categories does not lose your place.
+    @State private var selectedPages: [SettingsCategory: SettingsPage] = [:]
     @State private var bugReportDeck: BugReportPreflightDeck?
     @State private var searchText = ""
     @State private var showingResetConfirmation = false
@@ -148,42 +183,23 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            List {
-                accountLandingSection
-                settingsCategorySection
+        GeometryReader { proxy in
+            // Wide enough for two panes: categories stay visible beside what they contain, so
+            // moving between them never needs a trip back up the stack.
+            if proxy.size.width >= Self.splitLayoutMinimumWidth {
+                splitLayout
+            } else {
+                stackLayout
             }
-            .overlay {
-                if isSearching && matchingPages.isEmpty && !accountLandingVisible && !SettingsCategory.about.matches(searchText) {
-                    OpenNOWUnavailableView("No Settings Found", systemImage: "magnifyingglass") {
-                        Text("Try another search.")
-                    }
-                }
-            }
-            .navigationTitle("Settings")
-            .searchable(text: $searchText, prompt: "Search settings")
-            .onChangeCompat(of: store.pendingSettingsRoute) { route in
-                guard let route else { return }
-                // Search filters the category list, so an inbound route has to clear it or the
-                // destination the caller asked for may not be reachable.
-                searchText = ""
-                path = NavigationPath([SettingsCategory(route)])
-                store.pendingSettingsRoute = nil
-            }
-            .navigationDestination(for: SettingsCategory.self) { category in
-                Form {
-                    settingsDetailContent(for: category)
-                }
-                .navigationTitle(category.title)
-                .navigationBarTitleDisplayMode(.inline)
-            }
-            .navigationDestination(for: SettingsPage.self) { page in
-                Form {
-                    settingsPageContent(for: page)
-                }
-                .navigationTitle(page.title)
-                .navigationBarTitleDisplayMode(.inline)
-            }
+        }
+        .onChangeCompat(of: store.pendingSettingsRoute) { route in
+            guard let route else { return }
+            // Search filters the category list, so an inbound route has to clear it or the
+            // destination the caller asked for may not be reachable.
+            searchText = ""
+            selectedCategory = SettingsCategory(route)
+            path = NavigationPath([SettingsCategory(route)])
+            store.pendingSettingsRoute = nil
         }
         .confirmationDialog("Reset settings?", isPresented: $showingResetConfirmation, titleVisibility: .visible) {
             Button("Reset Settings", role: .destructive) {
@@ -295,32 +311,233 @@ struct SettingsView: View {
         }
     }
 
+    private static let splitLayoutMinimumWidth: CGFloat = 700
+
+    private var stackLayout: some View {
+        NavigationStack(path: $path) {
+            List {
+                accountLandingSection
+                settingsCategorySection
+            }
+            .overlay { noSearchResultsOverlay }
+            .navigationTitle("Settings")
+            .searchable(text: $searchText, prompt: "Search settings")
+            .navigationDestination(for: SettingsCategory.self) { category in
+                categoryDetail(category)
+                    .navigationTitle(category.title)
+                    .navigationBarTitleDisplayMode(.inline)
+            }
+            .navigationDestination(for: SettingsPage.self) { page in
+                Form {
+                    settingsPageContent(for: page)
+                }
+                .navigationTitle(page.title)
+                .navigationBarTitleDisplayMode(.inline)
+            }
+        }
+    }
+
+    private var splitLayout: some View {
+        HStack(spacing: 0) {
+            settingsSidebar
+                .frame(width: 280)
+            Divider()
+            NavigationStack {
+                categoryDetail(selectedCategory)
+                    .navigationTitle(selectedCategory.title)
+                    .navigationBarTitleDisplayMode(.inline)
+            }
+            // A fresh stack per category: no stale pushed screen, and the list starts at the top.
+            .id(selectedCategory)
+        }
+    }
+
+    private var settingsSidebar: some View {
+        List {
+            Section {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search settings", text: $searchText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if isSearching {
+                        Button {
+                            searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear search")
+                    }
+                }
+            }
+
+            if accountLandingVisible {
+                Section {
+                    sidebarRow(selected: selectedCategory == .account) {
+                        selectedCategory = .account
+                    } label: {
+                        accountLandingLabel(avatarSize: 40)
+                    }
+                }
+            }
+
+            Section {
+                if isSearching {
+                    ForEach(matchingPages) { page in
+                        sidebarRow(selected: selectedCategory == page.category && selectedPage(in: page.category) == page) {
+                            select(page)
+                        } label: {
+                            settingsPageLabel(page)
+                        }
+                    }
+                    if SettingsCategory.about.matches(searchText) {
+                        sidebarRow(selected: selectedCategory == .about) {
+                            selectedCategory = .about
+                        } label: {
+                            SettingsCategoryLabel(category: .about, compact: true)
+                        }
+                    }
+                } else {
+                    ForEach(landingCategories) { category in
+                        sidebarRow(selected: selectedCategory == category) {
+                            selectedCategory = category
+                        } label: {
+                            SettingsCategoryLabel(category: category, compact: true)
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .overlay { noSearchResultsOverlay }
+    }
+
+    private func sidebarRow<Label: View>(
+        selected: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        Button(action: action) {
+            label()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(selected ? Color.accentColor.opacity(0.18) : nil)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private var noSearchResultsOverlay: some View {
+        if isSearching && matchingPages.isEmpty && !accountLandingVisible && !SettingsCategory.about.matches(searchText) {
+            OpenNOWUnavailableView("No Settings Found", systemImage: "magnifyingglass") {
+                Text("Try another search.")
+            }
+        }
+    }
+
+    private func selectedPage(in category: SettingsCategory) -> SettingsPage? {
+        if let page = selectedPages[category], category.pages.contains(page) { return page }
+        return category.pages.first
+    }
+
+    private func select(_ page: SettingsPage) {
+        selectedPages[page.category] = page
+        selectedCategory = page.category
+    }
+
+    /// Everything in a category on one screen: its pages are tabs along the top instead of a
+    /// second list to drill through.
+    private func categoryDetail(_ category: SettingsCategory) -> some View {
+        let page = selectedPage(in: category)
+        return Form {
+            if let page {
+                settingsPageContent(for: page)
+            }
+            settingsDetailContent(for: category)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if category.pages.count > 1, let page {
+                settingsPageTabs(category.pages, selected: page) { selectedPages[category] = $0 }
+            }
+        }
+    }
+
+    private func settingsPageTabs(
+        _ pages: [SettingsPage],
+        selected: SettingsPage,
+        onSelect: @escaping (SettingsPage) -> Void
+    ) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(pages) { page in
+                        let isSelected = page == selected
+                        Button {
+                            onSelect(page)
+                        } label: {
+                            Text(page.tabTitle)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                                .padding(.horizontal, 14)
+                                .frame(minHeight: 36)
+                                .foregroundStyle(isSelected ? Color.white : Color.primary)
+                                .background(
+                                    isSelected ? Color.accentColor : Color(.secondarySystemGroupedBackground),
+                                    in: Capsule()
+                                )
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .id(page)
+                        .accessibilityLabel(page.title)
+                        .accessibilityHint(page.summary)
+                        .accessibilityAddTraits(isSelected ? .isSelected : [])
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+            }
+            .onChangeCompat(of: selected) { page in
+                withAnimation { proxy.scrollTo(page, anchor: .center) }
+            }
+        }
+        .background(.bar)
+    }
+
     @ViewBuilder
     private var accountLandingSection: some View {
         if accountLandingVisible {
             Section {
                 NavigationLink(value: SettingsCategory.account) {
-                    HStack(spacing: 14) {
-                        SettingsAccountAvatar(
-                            initial: accountLandingInitial,
-                            size: 52,
-                            selected: true
-                        )
-
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(accountLandingTitle)
-                                .font(.body.weight(.semibold))
-                                .fixedSize(horizontal: false, vertical: true)
-                            Text(accountLandingDetail)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(.vertical, 4)
+                    accountLandingLabel(avatarSize: 52)
                 }
             }
         }
+    }
+
+    private func accountLandingLabel(avatarSize: CGFloat) -> some View {
+        HStack(spacing: 14) {
+            SettingsAccountAvatar(
+                initial: accountLandingInitial,
+                size: avatarSize,
+                selected: true
+            )
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(accountLandingTitle)
+                    .font(.body.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(accountLandingDetail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 4)
     }
 
     private var settingsCategorySection: some View {
@@ -354,27 +571,24 @@ struct SettingsView: View {
 
     private func settingsPageLink(_ page: SettingsPage) -> some View {
         NavigationLink(value: page) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(page.title)
-                    .font(.body.weight(.medium))
-                Text(page.summary)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.vertical, 4)
+            settingsPageLabel(page)
         }
+    }
+
+    private func settingsPageLabel(_ page: SettingsPage) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(page.title)
+                .font(.body.weight(.medium))
+            Text(page.summary)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 4)
     }
 
     @ViewBuilder
     private func settingsDetailContent(for category: SettingsCategory) -> some View {
-        if !category.pages.isEmpty {
-            Section {
-                ForEach(category.pages) { page in
-                    settingsPageLink(page)
-                }
-            }
-        }
         switch category {
         case .input:
             inputTutorialSection
@@ -1346,7 +1560,7 @@ struct SettingsView: View {
     }
 
     private var landingCategories: [SettingsCategory] {
-        [.general, .stream, .input, .interface, .advanced, .about]
+        [.stream, .input, .interface, .general, .advanced, .about]
     }
 
     private var privacySection: some View {
@@ -2120,16 +2334,20 @@ private struct OpenNOWPrivacyPolicyView: View {
 
 private struct SettingsCategoryLabel: View {
     let category: SettingsCategory
+    /// The sidebar shows the name alone: its detail pane is already on screen beside it.
+    var compact = false
 
     var body: some View {
         Label {
             VStack(alignment: .leading, spacing: 2) {
                 Text(category.title)
                     .font(.body.weight(.medium))
-                Text(category.summary)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if !compact {
+                    Text(category.summary)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         } icon: {
             Image(systemName: category.symbolName)

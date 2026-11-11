@@ -24,6 +24,11 @@ struct ContentView: View {
                 IntroSetupView(onFinish: {})
             } else if ProcessInfo.processInfo.arguments.contains("--opennow-touch-layout-preview") {
                 NativeStreamTouchLayoutPreview()
+            } else if ProcessInfo.processInfo.arguments.contains("--opennow-stream-controls-preview") {
+                NativeStreamControlsPreview()
+            } else if ProcessInfo.processInfo.arguments.contains("--opennow-settings-preview") {
+                SettingsView()
+                    .task { store.installDebugStorePreview() }
             } else if ProcessInfo.processInfo.arguments.contains("--opennow-store-preview")
                         || ProcessInfo.processInfo.arguments.contains("--opennow-console-preview") {
                 HomeView()
@@ -52,6 +57,8 @@ struct ContentView: View {
             guard debugQueuePreviewPosition == nil,
                   !ProcessInfo.processInfo.arguments.contains("--opennow-intro-preview"),
                   !ProcessInfo.processInfo.arguments.contains("--opennow-store-preview"),
+                  !ProcessInfo.processInfo.arguments.contains("--opennow-stream-controls-preview"),
+                  !ProcessInfo.processInfo.arguments.contains("--opennow-settings-preview"),
                   !ProcessInfo.processInfo.arguments.contains("--opennow-details-preview"),
                   !ProcessInfo.processInfo.arguments.contains("--opennow-server-picker-preview") else { return }
             #endif
@@ -673,6 +680,7 @@ struct MainTabView: View {
             },
             onTransportStable: {
                 streamerAutoRetryCount = 0
+                store.confirmInStreamQualityChange()
             },
             onStreamTermination: { event in
                 guard presentedStreamerSession?.id == session.id, store.activeSession?.id == session.id else { return }
@@ -707,14 +715,21 @@ struct MainTabView: View {
             onClose: {
                 presentedStreamerSession = nil
                 streamerAutoRetryCount = 0
+                store.rollBackUnconfirmedInStreamQualityChange()
                 store.dismissStreamer()
             },
             onRetry: streamerAutoRetryCount < Self.maxStreamerAutoRetries ? {
                 presentedStreamerSession = nil
                 streamerAutoRetryCount += 1
+                store.rollBackUnconfirmedInStreamQualityChange()
                 store.dismissStreamer()
                 store.scheduleStreamerReopen()
-            } : nil
+            } : nil,
+            onReopen: {
+                presentedStreamerSession = nil
+                store.dismissStreamer()
+                store.scheduleStreamerReopen()
+            }
         )
         .ignoresSafeArea()
         .environmentObject(store)

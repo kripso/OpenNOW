@@ -3272,9 +3272,22 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(store.settings.mouseAcceleration, 2)
         XCTAssertEqual(store.settings.preferredFPS, 60)
         XCTAssertEqual(store.settings.preferredResolution, "1920x1080")
+
+        // The stream never became stable with the new values: Retry or Exit puts them back.
+        store.rollBackUnconfirmedInStreamQualityChange()
+        XCTAssertEqual(store.settings.maxBitrateMbps, 50)
+        XCTAssertEqual(store.settings.preferredCodec, "H265")
+        XCTAssertEqual(store.settings.mouseAcceleration, 2)
+
+        // Once the new stream is stable the change stands and there is nothing to restore.
+        store.applyStreamerSettings(live)
+        store.confirmInStreamQualityChange()
+        store.rollBackUnconfirmedInStreamQualityChange()
+        XCTAssertEqual(store.settings.maxBitrateMbps, 20)
+        XCTAssertEqual(store.settings.preferredCodec, "AV1")
     }
 
-    func testAllocationSignatureIgnoresPerConnectionBitrateAndCodecOnWebRTCOnly() {
+    func testAllocationSignatureIgnoresPerConnectionBitrateAndCodec() {
         var settings = AppSettings.default
         settings.preferredCodec = "H265"
         settings.maxBitrateMbps = 75
@@ -3297,13 +3310,18 @@ final class OpenNOWiOSParityTests: XCTestCase {
             StreamSettingsResolver.allocationSignature(StreamSettingsResolver.sessionSignature(for: otherFrameRate))
         )
 
+        // The native receiver negotiates both in its own handshake, so the same holds there,
+        // while the connection type itself still identifies a different allocation.
         settings.experimentalNativeNVSTEnabled = true
         retuned.experimentalNativeNVSTEnabled = true
         let native = StreamSettingsResolver.sessionSignature(for: settings)
-        XCTAssertEqual(StreamSettingsResolver.allocationSignature(native), native)
-        XCTAssertNotEqual(
+        XCTAssertEqual(
             StreamSettingsResolver.allocationSignature(native),
             StreamSettingsResolver.allocationSignature(StreamSettingsResolver.sessionSignature(for: retuned))
+        )
+        XCTAssertNotEqual(
+            StreamSettingsResolver.allocationSignature(native),
+            StreamSettingsResolver.allocationSignature(original)
         )
     }
 
@@ -4634,6 +4652,14 @@ final class OpenNOWiOSParityTests: XCTestCase {
         sdr.applyLiveStreamQuality(maxBitrateMbps: 20, codec: "H264")
         XCTAssertEqual(sdr.liveCodecPreference, "Auto")
         XCTAssertTrue(sdr.streamQualitySummary.contains("50 Mbps"))
+        XCTAssertEqual(sdr.connectionLabel, "WebRTC")
+
+        // The native receiver can only take a change through a reopen; without one, read-only.
+        var nativeSettings = settings
+        nativeSettings.experimentalNativeNVSTEnabled = true
+        let native = makeTouchControlsCoordinator(settings: nativeSettings)
+        XCTAssertEqual(native.connectionLabel, "Native NVST")
+        XCTAssertFalse(native.liveStreamQualityAvailable)
 
         settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
         let tenBit = makeTouchControlsCoordinator(settings: settings)
