@@ -46,9 +46,14 @@ func nativeStreamShouldUseFilteredRenderer(
     isSimulator || osMajorVersion >= 26 || videoCodec == .h265 || streamSharpeningEnabled
 }
 
+/// The display clock runs at the panel's full rate, never slower than it must to show every
+/// stream frame. Frames arrive off the network with jitter; a clock that ticks only as often as
+/// they arrive drops one whenever two land between the same pair of ticks and holds the next up
+/// to a whole stream interval. On a 120 Hz panel a 60 fps stream then waits at most 8 ms.
 func nativeStreamDisplayFrameRateRange(streamFPS: Int, displayMaximumFPS: Int) -> CAFrameRateRange {
-    let rate = Float(min(max(1, streamFPS), max(1, displayMaximumFPS)))
-    return CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+    let display = Float(max(1, displayMaximumFPS))
+    let stream = min(Float(max(1, streamFPS)), display)
+    return CAFrameRateRange(minimum: stream, maximum: display, preferred: display)
 }
 
 enum NativeStreamTransportPolicy {
@@ -654,6 +659,16 @@ struct StreamerView: View {
         _ = onNativeFallbackRequiresFreshEndpoint
     }
 
+    /// True while the game owns hardware mouse input: playing, with nothing of ours on top.
+    private var pointerCaptureWanted: Bool {
+        NativeStreamPointerCapturePolicy.shouldCapture(
+            videoActive: coordinator.videoActive && !coordinator.showStatusOverlay,
+            sceneActive: scenePhase == .active, controlsVisible: coordinator.controlsPanelVisible,
+            editing: coordinator.touchLayoutEditing,
+            guidanceVisible: coordinator.presentedGuidanceSheet != nil || coordinator.inputModePrompt != nil,
+            pipActive: coordinator.isPictureInPictureActive)
+    }
+
     var body: some View {
         GeometryReader { proxy in
             ZStack {
@@ -815,12 +830,11 @@ struct StreamerView: View {
                 coordinator.handleViewDisappear(scenePhase: scenePhase)
             }
         }
-        .background(NativeStreamPresentationPreferences(pointerCaptureRequested:
-            NativeStreamPointerCapturePolicy.shouldCapture(videoActive: coordinator.videoActive && !coordinator.showStatusOverlay,
-                sceneActive: scenePhase == .active, controlsVisible: coordinator.controlsPanelVisible,
-                editing: coordinator.touchLayoutEditing, guidanceVisible: coordinator.presentedGuidanceSheet != nil
-                    || coordinator.inputModePrompt != nil,
-                pipActive: coordinator.isPictureInPictureActive)))
+        .background(NativeStreamPresentationPreferences(pointerCaptureRequested: pointerCaptureWanted))
+        .onAppear { coordinator.inputBridge.setHardwareMouseForwarding(pointerCaptureWanted) }
+        .onChangeCompat(of: pointerCaptureWanted) { wanted in
+            coordinator.inputBridge.setHardwareMouseForwarding(wanted)
+        }
         .sheet(item: $coordinator.presentedGuidanceSheet) { destination in
             switch destination {
             case .streamTutorial:
@@ -2304,12 +2318,13 @@ private struct NativeStreamControlsPanel: View {
                         title: "Mouse events",
                         value: Self.mouseEventSummary(status, now: timeline.date)
                     )
+                    NativeStreamInfoRow(title: "Pointer capture", value: NativeStreamPointerLockDiagnostics.lastOutcome.label)
                     NativeStreamInfoRow(title: "Keyboard", value: status.keyboardConnected ? "Connected" : "Not reported by iOS")
                     NativeStreamInfoRow(
                         title: "AssistiveTouch",
                         value: UIAccessibility.isAssistiveTouchRunning ? "On" : "Off"
                     )
-                    NativeStreamPanelNote("A mouse reaches the game only when iOS lists it here. If it is paired but not listed, iOS is keeping it from apps on this device.")
+                    NativeStreamPanelNote("A mouse drives the game only while iOS delivers its events here. iPhone lists a mouse but delivers nothing unless AssistiveTouch is on.")
                 }
             }
 

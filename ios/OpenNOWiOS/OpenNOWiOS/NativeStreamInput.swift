@@ -715,6 +715,34 @@ final class NativeStreamInputBridge {
         hardwareMouseEventCount += 1
         lastHardwareMouseEventAt = Date()
     }
+
+    /// Whether a hardware mouse drives the game. iOS keeps delivering raw mouse events while
+    /// the in-game menu or a sheet is on top, so without this the game cursor follows the
+    /// pointer the user is aiming at our own controls.
+    private var hardwareMouseForwarding = true
+    private var hardwareHeldMouseButtons: Set<Int> = []
+
+    func setHardwareMouseForwarding(_ enabled: Bool) {
+        guard hardwareMouseForwarding != enabled else { return }
+        hardwareMouseForwarding = enabled
+        guard !enabled else { return }
+        // Let go of anything held, or the host keeps the button down behind the menu.
+        for button in hardwareHeldMouseButtons.sorted() {
+            sendMouseButton(button, pressed: false)
+        }
+        hardwareHeldMouseButtons.removeAll()
+    }
+
+    private func forwardHardwareMouseButton(_ button: Int, pressed: Bool) {
+        if pressed {
+            guard hardwareMouseForwarding else { return }
+            hardwareHeldMouseButtons.insert(button)
+        } else {
+            // A release whose press was withheld must be withheld too.
+            guard hardwareHeldMouseButtons.remove(button) != nil else { return }
+        }
+        sendMouseButton(button, pressed: pressed)
+    }
     private var controllersBySlot: [Int: GCController] = [:]
     private var controllerSlots: [ObjectIdentifier: Int] = [:]
     private var lastGamepadStates: [Int: NativeStreamGamepadState] = [:]
@@ -941,6 +969,7 @@ final class NativeStreamInputBridge {
         }
         keyboard = nil
         mice = []
+        hardwareHeldMouseButtons.removeAll()
         controllersBySlot.removeAll(keepingCapacity: true)
         controllerSlots.removeAll(keepingCapacity: true)
         lastGamepadStates.removeAll(keepingCapacity: true)
@@ -1280,30 +1309,31 @@ final class NativeStreamInputBridge {
                     deltaY: deltaY
                 )
                 self?.noteHardwareMouseEvent()
+                guard self?.hardwareMouseForwarding == true else { return }
                 self?.coalesceMouse(dx: delta.x, dy: delta.y)
             }
             input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
                 self?.noteHardwareMouseEvent()
-                self?.sendMouseButton(1, pressed: pressed)
+                self?.forwardHardwareMouseButton(1, pressed: pressed)
             }
             input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in
                 self?.noteHardwareMouseEvent()
-                self?.sendMouseButton(2, pressed: pressed)
+                self?.forwardHardwareMouseButton(2, pressed: pressed)
             }
             input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
                 self?.noteHardwareMouseEvent()
-                self?.sendMouseButton(3, pressed: pressed)
+                self?.forwardHardwareMouseButton(3, pressed: pressed)
             }
             input.scroll.valueChangedHandler = { [weak self] _, _, yValue in
                 self?.noteHardwareMouseEvent()
                 let delta = Int((CGFloat(yValue) * 120).rounded())
-                guard delta != 0 else { return }
+                guard delta != 0, self?.hardwareMouseForwarding == true else { return }
                 self?.sendMouseWheel(delta: delta)
             }
             input.auxiliaryButtons?.enumerated().forEach { offset, button in
                 button.pressedChangedHandler = { [weak self] _, _, pressed in
                     self?.noteHardwareMouseEvent()
-                    self?.sendMouseButton(4 + offset, pressed: pressed)
+                    self?.forwardHardwareMouseButton(4 + offset, pressed: pressed)
                 }
             }
         }
@@ -1904,6 +1934,7 @@ final class NativeStreamInputBridge {
     func setPhoneRumbleFallback(_ enabled: Bool) {}
     func attach() {}
     func detach() {}
+    func setHardwareMouseForwarding(_ enabled: Bool) {}
     func sendTouchMouseMove(dx: CGFloat, dy: CGFloat) {}
     @discardableResult
     func sendNativeTouch(_ records: [NativeTouchRecord]) -> Bool { false }

@@ -65,12 +65,43 @@ final class NativeStreamPresentationController: UIViewController {
     }
 }
 
+/// What iOS answered the last time the stream asked for pointer lock. The in-game menu releases
+/// the lock while it is open, so the readout there needs the answer from before it opened.
+enum NativeStreamPointerLockDiagnostics {
+    enum Outcome {
+        case notRequested, granted, refused
+        var label: String {
+            switch self {
+            case .notRequested: return "Not requested yet"
+            case .granted: return "Granted by iOS"
+            case .refused: return "Refused by iOS"
+            }
+        }
+    }
+    static private(set) var lastOutcome: Outcome = .notRequested
+    static func record(locked: Bool) { lastOutcome = locked ? .granted : .refused }
+}
+
 final class NativeStreamHostingController: UIHostingController<AnyView> {
     var pointerCaptureRequested = false {
         didSet {
             guard oldValue != pointerCaptureRequested else { return }
             setNeedsUpdateOfPrefersPointerLocked()
+            guard pointerCaptureRequested else { return }
+            // iOS answers asynchronously and posts nothing when it refuses.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.recordPointerLock() }
         }
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        NotificationCenter.default.addObserver(self, selector: #selector(recordPointerLock),
+            name: UIPointerLockState.didChangeNotification, object: nil)
+    }
+
+    @objc private func recordPointerLock() {
+        guard pointerCaptureRequested, let state = view.window?.windowScene?.pointerLockState else { return }
+        NativeStreamPointerLockDiagnostics.record(locked: state.isLocked)
     }
 
     override var prefersPointerLocked: Bool { pointerCaptureRequested }
