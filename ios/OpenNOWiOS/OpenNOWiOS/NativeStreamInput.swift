@@ -717,9 +717,9 @@ final class NativeStreamInputBridge {
     }
 
     /// Whether a hardware mouse drives the game. iOS keeps delivering raw mouse events while
-    /// the in-game menu or a sheet is on top, so without this the game cursor follows the
-    /// pointer the user is aiming at our own controls.
-    private var hardwareMouseForwarding = true
+    /// the in-game menu is open, so without this the game cursor follows the pointer the user
+    /// is aiming at the menu. On unless the menu says otherwise.
+    private(set) var hardwareMouseForwarding = true
     private var hardwareHeldMouseButtons: Set<Int> = []
 
     func setHardwareMouseForwarding(_ enabled: Bool) {
@@ -1934,6 +1934,7 @@ final class NativeStreamInputBridge {
     func setPhoneRumbleFallback(_ enabled: Bool) {}
     func attach() {}
     func detach() {}
+    var hardwareMouseForwarding: Bool { true }
     func setHardwareMouseForwarding(_ enabled: Bool) {}
     func sendTouchMouseMove(dx: CGFloat, dy: CGFloat) {}
     @discardableResult

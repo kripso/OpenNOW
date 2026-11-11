@@ -831,10 +831,6 @@ struct StreamerView: View {
             }
         }
         .background(NativeStreamPresentationPreferences(pointerCaptureRequested: pointerCaptureWanted))
-        .onAppear { coordinator.inputBridge.setHardwareMouseForwarding(pointerCaptureWanted) }
-        .onChangeCompat(of: pointerCaptureWanted) { wanted in
-            coordinator.inputBridge.setHardwareMouseForwarding(wanted)
-        }
         .sheet(item: $coordinator.presentedGuidanceSheet) { destination in
             switch destination {
             case .streamTutorial:
@@ -3140,7 +3136,12 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     @Published var retryAvailable = false
     @Published var showStatsOverlay = false
     @Published var controlsPanelVisible = false {
-        didSet { inputBridge.setControllerHUDActive(controlsPanelVisible) }
+        didSet {
+            inputBridge.setControllerHUDActive(controlsPanelVisible)
+            // The mouse is aimed at the menu while it is open, not at the game. Tied to the
+            // menu's own state and nothing else, so the mouse can never be left switched off.
+            inputBridge.setHardwareMouseForwarding(!controlsPanelVisible)
+        }
     }
     @Published var controllerHUDInput: NativeStreamControllerHUDInput?
     @Published fileprivate var touchLayoutEditing = false

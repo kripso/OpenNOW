@@ -4653,6 +4653,17 @@ final class OpenNOWiOSParityTests: XCTestCase {
     }
 
     @MainActor
+    func testHardwareMouseDrivesTheGameExceptWhileTheInGameMenuIsOpen() {
+        let coordinator = makeTouchControlsCoordinator(settings: .default)
+        // On from the start: nothing has to happen first for a mouse to work.
+        XCTAssertTrue(coordinator.inputBridge.hardwareMouseForwarding)
+        coordinator.controlsPanelVisible = true
+        XCTAssertFalse(coordinator.inputBridge.hardwareMouseForwarding)
+        coordinator.controlsPanelVisible = false
+        XCTAssertTrue(coordinator.inputBridge.hardwareMouseForwarding)
+    }
+
+    @MainActor
     func testInStreamQualityOffersOnlyCodecsTheSessionColourAllowsAndIgnoresApplyWhileDisconnected() {
         var settings = AppSettings.default
         settings.preferredCodec = "Auto"
