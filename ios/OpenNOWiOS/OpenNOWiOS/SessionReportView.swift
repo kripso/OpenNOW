@@ -26,6 +26,7 @@ struct SessionReportView: View {
                     if report.limitedData { limitedDataNotice }
                     if report.showsTrendChart { trendSection }
                     measurementsSection
+                    if let delivery = report.frameDelivery { frameDeliverySection(delivery) }
                     if !report.downgrades.isEmpty { findingsSection("What happened", report.downgrades) }
                     findingsSection("Suggestions", report.recommendations)
                     footerControls
@@ -231,6 +232,53 @@ struct SessionReportView: View {
                     level: deliveredDiffersFromRequest ? .fair : .good,
                     showsDivider: false
                 )
+            }
+            .openNowCard()
+        }
+    }
+
+    /// Which stage the missing frames were lost at, so a rough session says where to look.
+    private func frameDeliverySection(_ delivery: SessionFrameDelivery) -> some View {
+        func seconds(_ count: Int) -> String { "\(count) s" }
+        func level(_ count: Int) -> StreamQualityLevel {
+            count * 20 > delivery.seconds ? .poor : (count > 0 ? .fair : .good)
+        }
+        return VStack(alignment: .leading, spacing: OpenNOWSpacing.sm) {
+            sectionHeader("Frame delivery")
+            VStack(spacing: 0) {
+                measurementRow("At full rate", primary: seconds(delivery.steady),
+                    secondary: "of \(delivery.seconds) s", level: .good)
+                measurementRow("Fewer frames arrived", primary: seconds(delivery.arrivedShort),
+                    secondary: delivery.arrivedShortWithLoss > 0 ? "\(delivery.arrivedShortWithLoss) s with packet loss" : nil,
+                    level: level(delivery.arrivedShort))
+                measurementRow("Lost in decoding", primary: seconds(delivery.decodeShort), secondary: nil,
+                    level: level(delivery.decodeShort))
+                measurementRow("Lost at display", primary: seconds(delivery.displayShort),
+                    secondary: delivery.averageDisplayedFps.map { String(format: "shown %.0f fps", $0) },
+                    level: level(delivery.displayShort))
+                if let arrived = delivery.arrived {
+                    measurementRow("Stutters from the decoder", primary: "\(arrived.longGaps)",
+                        secondary: String(format: "longest gap %.0f ms", arrived.longestGapMs),
+                        level: arrived.longGaps > 0 ? .fair : .good)
+                }
+                if let shown = delivery.shown {
+                    measurementRow("Stutters on screen", primary: "\(shown.longGaps)",
+                        secondary: String(format: "longest gap %.0f ms", shown.longestGapMs),
+                        level: shown.longGaps > 0 ? .fair : .good)
+                }
+                if let arrived = delivery.arrived {
+                    measurementRow("Frames never shown", primary: "\(arrived.replaced)",
+                        secondary: delivery.averageReceiveBufferMs.map { String(format: "buffered %.0f ms", $0) },
+                        level: arrived.replaced > 0 ? .fair : .good)
+                }
+                if delivery.hasReceiverCounters {
+                    measurementRow("Freezes", primary: "\(delivery.freezes)",
+                        secondary: "\(delivery.framesDropped) frames dropped", level: level(delivery.freezes))
+                    measurementRow("Keyframe requests", primary: "\(delivery.keyframeRequests)",
+                        secondary: "\(delivery.resendRequests) resends", level: .good)
+                }
+                measurementRow("Codec", primary: report.deliveredCodec ?? report.requestedCodec,
+                    secondary: delivery.renderer, level: .good, showsDivider: false)
             }
             .openNowCard()
         }

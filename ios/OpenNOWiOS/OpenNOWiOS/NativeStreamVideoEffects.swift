@@ -182,8 +182,54 @@ final class NativeStreamSpatialUpscaler {
 }
 #endif
 
+/// The gaps between consecutive frames at one point in the pipeline, over one reporting window.
+/// A stream can deliver every frame of a second and still stutter: the count hides the frame
+/// that came late and the one behind it that came early. The gaps do not.
+struct NativeStreamFrameCadence: Equatable {
+    var frames = 0
+    var longestGapMs = 0.0
+    /// Gaps of at least `longGapRatio` frame intervals: a frame's turn passed with nothing new.
+    var longGaps = 0
+    /// Frames overwritten by a newer one before they could be shown.
+    var replaced = 0
+}
+
+final class NativeStreamFrameCadenceMeter: @unchecked Sendable {
+    static let longGapRatio = 1.75
+    /// Longer than this is a pause (the menu, a reconnect), not a stutter.
+    private static let pauseSeconds = 3.0
+
+    private let lock = NSLock()
+    private var last: Double?
+    private var nominalInterval = 1.0 / 60
+    private var window = NativeStreamFrameCadence()
+
+    func setStreamFrameRate(_ fps: Int) {
+        lock.lock(); nominalInterval = 1.0 / Double(max(1, fps)); lock.unlock()
+    }
+
+    func observe(time: Double, replacedPending: Bool = false) {
+        lock.lock(); defer { lock.unlock() }
+        if replacedPending { window.replaced += 1 }
+        defer { last = time }
+        guard let last, time > last, time - last < Self.pauseSeconds else { return }
+        let gap = time - last
+        window.frames += 1
+        window.longestGapMs = max(window.longestGapMs, gap * 1_000)
+        if gap >= nominalInterval * Self.longGapRatio { window.longGaps += 1 }
+    }
+
+    /// The window since the last call. The next window still measures from the last frame.
+    func drain() -> NativeStreamFrameCadence {
+        lock.lock(); defer { lock.unlock() }
+        defer { window = NativeStreamFrameCadence() }
+        return window
+    }
+}
+
 /// Track actual drawable presentations for the user-facing FPS statistic.
 final class NativeStreamPresentationTracker: @unchecked Sendable {
+    let cadence = NativeStreamFrameCadenceMeter()
     private let lock = NSLock()
     private var meter = NativeStreamPresentationRateMeter()
     func rates(now: Double) -> NativeStreamPresentationRates? {
@@ -192,6 +238,7 @@ final class NativeStreamPresentationTracker: @unchecked Sendable {
     }
     func resetRates() { lock.lock(); meter = NativeStreamPresentationRateMeter(); lock.unlock() }
     func recordPresentation(at time: Double) {
+        cadence.observe(time: time)
         lock.lock(); defer { lock.unlock() }
         meter.observe(time: time)
     }

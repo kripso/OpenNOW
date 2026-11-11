@@ -5594,6 +5594,92 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertFalse(report.limitedData)
     }
 
+    func testSessionReportCountsEachShortSecondAgainstTheFirstStageThatLostFrames() throws {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        func second(received: Int, decoded: Int, displayed: Double, lost: Int = 0) -> StreamRuntimeSample {
+            StreamRuntimeSample(timestamp: 0, fps: decoded, receivedFps: received, decodedFps: decoded,
+                packetsLostDelta: lost, packetsReceivedDelta: 1_000, displayedFps: displayed,
+                freezeDelta: 1, keyframeRequestDelta: 2, resendRequestDelta: 3, framesDroppedDelta: 4,
+                renderer: "Metal")
+        }
+        for _ in 0..<6 { accumulator.record(second(received: 60, decoded: 60, displayed: 60)) }
+        // 54 of 60 is still nine tenths: not short.
+        accumulator.record(second(received: 54, decoded: 54, displayed: 54))
+        // Too few arrived, twice, once with loss. The decoder is not blamed for those.
+        accumulator.record(second(received: 40, decoded: 30, displayed: 20, lost: 5))
+        accumulator.record(second(received: 40, decoded: 40, displayed: 40))
+        // All arrived, the decoder fell behind.
+        accumulator.record(second(received: 60, decoded: 45, displayed: 30))
+        // All arrived and decoded, the display showed fewer.
+        accumulator.record(second(received: 60, decoded: 60, displayed: 48))
+        // A sample without frame rates adds its counters but is not a measured second.
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 20, freezeDelta: 1))
+
+        let delivery = try XCTUnwrap(accumulator.finish()?.frameDelivery)
+        XCTAssertEqual(delivery.seconds, 11)
+        XCTAssertEqual(delivery.steady, 7)
+        XCTAssertEqual(delivery.arrivedShort, 2)
+        XCTAssertEqual(delivery.arrivedShortWithLoss, 1)
+        XCTAssertEqual(delivery.decodeShort, 1)
+        XCTAssertEqual(delivery.displayShort, 1)
+        XCTAssertEqual(delivery.freezes, 12)
+        XCTAssertEqual(delivery.keyframeRequests, 22)
+        XCTAssertEqual(delivery.resendRequests, 33)
+        XCTAssertEqual(delivery.framesDropped, 44)
+        XCTAssertEqual(delivery.renderer, "Metal")
+        XCTAssertEqual(try XCTUnwrap(delivery.averageDisplayedFps), (6 * 60 + 54 + 20 + 40 + 30 + 48) / 11.0, accuracy: 0.001)
+
+        // Nothing measured the gaps between frames in that session.
+        XCTAssertNil(delivery.arrived)
+        XCTAssertNil(delivery.shown)
+
+        // No frame rates at all: the report carries no breakdown.
+        let bare = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        bare.record(StreamRuntimeSample(timestamp: 0, pingMs: 20))
+        XCTAssertNil(try XCTUnwrap(bare.finish()).frameDelivery)
+    }
+
+    func testFrameGapsAreCountedAsStuttersEvenWhenEveryFrameOfTheSecondArrives() throws {
+        let meter = NativeStreamFrameCadenceMeter()
+        meter.setStreamFrameRate(60)
+        // Sixty frames in a second, but one comes 14 ms late and the next catches up.
+        var time = 100.0
+        meter.observe(time: time)
+        for frame in 1...60 {
+            time = 100.0 + Double(frame) / 60 + (frame == 30 ? 0.014 : 0)
+            meter.observe(time: time, replacedPending: frame == 31)
+        }
+        let window = meter.drain()
+        XCTAssertEqual(window.frames, 60)
+        XCTAssertEqual(window.longGaps, 1)
+        XCTAssertEqual(window.longestGapMs, 1_000.0 / 60 + 14, accuracy: 0.01)
+        XCTAssertEqual(window.replaced, 1)
+
+        // The next window starts empty but still measures from the last frame; a pause of
+        // seconds (the menu, a reconnect) is not a stutter.
+        meter.observe(time: time + 1.0 / 60)
+        meter.observe(time: time + 10)
+        let next = meter.drain()
+        XCTAssertEqual(next.frames, 1)
+        XCTAssertEqual(next.longGaps, 0)
+        XCTAssertEqual(next.longestGapMs, 1_000.0 / 60, accuracy: 0.01)
+
+        // The report adds the windows up and keeps the worst gap.
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 20,
+            arrivedCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 20, longGaps: 0, replaced: 1),
+            shownCadence: NativeStreamFrameCadence(frames: 59, longestGapMs: 34, longGaps: 1, replaced: 0),
+            receiveBufferMs: 4))
+        accumulator.record(StreamRuntimeSample(timestamp: 1, pingMs: 20,
+            arrivedCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 41, longGaps: 2, replaced: 0),
+            shownCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 30, longGaps: 2, replaced: 0),
+            receiveBufferMs: 8))
+        let delivery = try XCTUnwrap(accumulator.finish()?.frameDelivery)
+        XCTAssertEqual(delivery.arrived, NativeStreamFrameCadence(frames: 120, longestGapMs: 41, longGaps: 2, replaced: 1))
+        XCTAssertEqual(delivery.shown, NativeStreamFrameCadence(frames: 119, longestGapMs: 34, longGaps: 3, replaced: 0))
+        XCTAssertEqual(try XCTUnwrap(delivery.averageReceiveBufferMs), 6, accuracy: 0.001)
+    }
+
     func testShortSessionsAreMarkedAsLimitedData() {
         let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
         for _ in 0..<3 {

@@ -198,6 +198,32 @@ struct NativeStreamRecoveryProgressTracker {
     }
 }
 
+/// The video receiver's own running totals, read from its `inbound-rtp` statistics.
+struct NativeStreamReceiverCounters: Equatable {
+    var freezes: Int?
+    var keyframeRequests: Int?
+    var resendRequests: Int?
+    var framesDropped: Int?
+    var bufferDelaySeconds: Double?
+    var bufferEmitted: Int?
+
+    /// How long a frame waited in the receive buffer, on average, since `previous`.
+    func bufferMs(since previous: NativeStreamReceiverCounters) -> Double? {
+        guard let delay = bufferDelaySeconds, let emitted = bufferEmitted,
+              let previousDelay = previous.bufferDelaySeconds, let previousEmitted = previous.bufferEmitted,
+              emitted > previousEmitted, delay >= previousDelay else { return nil }
+        return (delay - previousDelay) / Double(emitted - previousEmitted) * 1_000
+    }
+
+    mutating func read(_ values: [String: NSObject]) {
+        bufferDelaySeconds = (values["jitterBufferDelay"] as? NSNumber)?.doubleValue ?? bufferDelaySeconds
+        bufferEmitted = (values["jitterBufferEmittedCount"] as? NSNumber)?.intValue ?? bufferEmitted
+        freezes = (values["freezeCount"] as? NSNumber)?.intValue ?? freezes
+        keyframeRequests = (values["pliCount"] as? NSNumber)?.intValue ?? keyframeRequests
+        resendRequests = (values["nackCount"] as? NSNumber)?.intValue ?? resendRequests
+    }
+}
+
 /// Requires sustained proof that packets are arriving near the requested rate while decoded
 /// output falls behind and decoding exceeds one frame budget. This keeps network loss and a slow
 /// cloud game from being misdiagnosed as a local decoder failure.
@@ -3280,6 +3306,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var lastStatsTotalDecodeTime: Double?
     private var lastStatsPacketsLost: Int?
     private var lastStatsPacketsReceived: Int?
+    private var lastStatsReceiverCounters = NativeStreamReceiverCounters()
     private var mediaTransportConnected = false
     private var mediaLivenessWatchdog = NativeStreamLivenessWatchdog()
     private var recoveryProgressTracker = NativeStreamRecoveryProgressTracker()
@@ -3646,11 +3673,14 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         statsSnapshot.effects = renderer?.videoEffectsStatus ?? ""
         statsSnapshot.presentationRates = renderer?.presentationRates
         if decoded > 0 { handleDecodedVideoProgress(framesDecoded: decoded); raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution) }
+        let cadence = renderer?.drainFrameCadence()
         onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
             bitrateKbps: bitrate, jitterMs: sample.jitterMilliseconds, fps: decodedFPS, receivedFps: receivedFPS,
             decodedFps: decodedFPS, decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
             packetsLostDelta: lostDelta, packetsReceivedDelta: packetsDelta, packetLossPercent: loss,
-            resolution: resolution, codec: selectedCodec.rawValue.uppercased(), networkKind: deviceStatus.networkTransport.sessionNetworkKind))
+            resolution: resolution, codec: selectedCodec.rawValue.uppercased(), networkKind: deviceStatus.networkTransport.sessionNetworkKind,
+            displayedFps: statsSnapshot.presentationRates?.displayedFPS, renderer: statsSnapshot.effects,
+            arrivedCadence: cadence?.arrived, shownCadence: cadence?.shown))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }
@@ -4617,6 +4647,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         lastStatsTotalDecodeTime = nil
         lastStatsPacketsLost = nil
         lastStatsPacketsReceived = nil
+        lastStatsReceiverCounters = NativeStreamReceiverCounters()
     }
 
     private func setVideoTrack(_ track: RTCVideoTrack) {
@@ -5325,6 +5356,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         var rttMs: Double?
         var totalDecodeTimeSeconds: Double?
         var decoderImplementation: String?
+        var receiverCounters = NativeStreamReceiverCounters()
         var selectedPairValues: [String: NSObject]?
         var candidateStats: [String: [String: NSObject]] = [:]
 
@@ -5342,6 +5374,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 framesRendered = (stat.values["framesRendered"] as? NSNumber)?.intValue ?? framesRendered
                 framesPerSecond = (stat.values["framesPerSecond"] as? NSNumber)?.intValue ?? framesPerSecond
                 framesDropped = (stat.values["framesDropped"] as? NSNumber)?.intValue ?? framesDropped
+                receiverCounters.read(stat.values)
                 width = (stat.values["frameWidth"] as? NSNumber)?.intValue ?? width
                 height = (stat.values["frameHeight"] as? NSNumber)?.intValue ?? height
                 bytesReceived = (stat.values["bytesReceived"] as? NSNumber)?.intValue ?? bytesReceived
@@ -5487,6 +5520,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution)
         }
 
+        let cadence = renderer?.drainFrameCadence()
         onRuntimeSample(
             StreamRuntimeSample(
                 timestamp: now,
@@ -5502,9 +5536,22 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 packetLossPercent: packetLossPercent,
                 resolution: resolution,
                 codec: selectedCodec.rawValue.uppercased(),
-                networkKind: deviceStatus.networkTransport.sessionNetworkKind
+                networkKind: deviceStatus.networkTransport.sessionNetworkKind,
+                displayedFps: statsSnapshot.presentationRates?.displayedFPS,
+                freezeDelta: monotonicDelta(current: receiverCounters.freezes, previous: lastStatsReceiverCounters.freezes),
+                keyframeRequestDelta: monotonicDelta(current: receiverCounters.keyframeRequests,
+                                                     previous: lastStatsReceiverCounters.keyframeRequests),
+                resendRequestDelta: monotonicDelta(current: receiverCounters.resendRequests,
+                                                   previous: lastStatsReceiverCounters.resendRequests),
+                framesDroppedDelta: monotonicDelta(current: framesDropped, previous: lastStatsReceiverCounters.framesDropped),
+                renderer: decoderImplementation.map { "\($0) · \(statsSnapshot.effects)" } ?? statsSnapshot.effects,
+                arrivedCadence: cadence?.arrived,
+                shownCadence: cadence?.shown,
+                receiveBufferMs: receiverCounters.bufferMs(since: lastStatsReceiverCounters)
             )
         )
+        receiverCounters.framesDropped = framesDropped
+        lastStatsReceiverCounters = receiverCounters
 
         lastStatsSampleAt = now
         lastStatsFramesReceived = framesReceived
@@ -6742,6 +6789,9 @@ private final class NativeStreamRenderView: UIView {
     var presentationRates: NativeStreamPresentationRates? {
         filteredRendererActive ? filteredMetalView?.presentationRates : nil
     }
+    func drainFrameCadence() -> (arrived: NativeStreamFrameCadence, shown: NativeStreamFrameCadence)? {
+        filteredRendererActive ? filteredMetalView?.drainFrameCadence() : nil
+    }
 
     func setVideoCodec(_ codec: NativeStreamVideoCodec) {
         rendererStateLock.lock()
@@ -7012,10 +7062,14 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
         self.maximumInFlight = maximumInFlight
     }
 
-    func offer(_ frame: Frame) {
+    /// Whether the frame replaced one that was still waiting to be shown.
+    @discardableResult
+    func offer(_ frame: Frame) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
+        let replaced = pending != nil
         pending = Entry(frame: frame)
-        lock.unlock()
+        return replaced
     }
 
     func take() -> Entry? {
@@ -7106,6 +7160,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let frames = NativeStreamLatestFrameMailbox<RTCVideoFrame>(maximumInFlight: 3)
     private let gpuAdmission = DispatchSemaphore(value: 3)
     private let presentations = NativeStreamPresentationTracker()
+    private let arrivals = NativeStreamFrameCadenceMeter()
     private var streamFPS = 60
     private var displayLink: CADisplayLink?
     private lazy var displayClock = DisplayClock(owner: self)
@@ -7201,6 +7256,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 
     func setStreamFrameRate(_ fps: Int) {
+        arrivals.setStreamFrameRate(fps)
+        presentations.cadence.setStreamFrameRate(fps)
         guard streamFPS != fps else { return }
         streamFPS = fps
         updateDisplayFrameRate()
@@ -7212,7 +7269,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     func display(frame: RTCVideoFrame?) {
         guard let frame else { return }
-        frames.offer(frame)
+        arrivals.observe(time: CACurrentMediaTime(), replacedPending: frames.offer(frame))
+    }
+
+    /// Frame gaps since the last call: out of the decoder, and onto the screen.
+    func drainFrameCadence() -> (arrived: NativeStreamFrameCadence, shown: NativeStreamFrameCadence) {
+        (arrivals.drain(), presentations.cadence.drain())
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

@@ -192,6 +192,19 @@ struct StreamRuntimeSample: Equatable {
     var resolution: String?
     var codec: String?
     var networkKind: SessionNetworkKind = .unknown
+    /// Frames that reached the screen in the last second, where the renderer reports it.
+    var displayedFps: Double? = nil
+    /// Changes in the receiver's own counters since the previous sample.
+    var freezeDelta: Int? = nil
+    var keyframeRequestDelta: Int? = nil
+    var resendRequestDelta: Int? = nil
+    var framesDroppedDelta: Int? = nil
+    var renderer: String? = nil
+    /// Gaps between frames out of the decoder and onto the screen, where the renderer measures them.
+    var arrivedCadence: NativeStreamFrameCadence? = nil
+    var shownCadence: NativeStreamFrameCadence? = nil
+    /// How long frames waited in the receive buffer before decoding.
+    var receiveBufferMs: Double? = nil
 
     var carriesReportableValues: Bool {
         pingMs != nil
@@ -202,6 +215,88 @@ struct StreamRuntimeSample: Equatable {
             || decodeMs != nil
             || jitterMs != nil
             || packetLossPercent != nil
+    }
+}
+
+/// Where a session's missing frames went, from one reading a second. A second counts against
+/// the first stage that fell short, so the stages never overlap: frames that did not arrive
+/// cannot also be blamed on the decoder, nor frames that were not decoded on the display.
+struct SessionFrameDelivery: Equatable {
+    /// A stage is short when it passes on under nine tenths of what reached it.
+    static let shortRatio = 0.9
+
+    private(set) var seconds = 0
+    private(set) var arrivedShort = 0
+    private(set) var arrivedShortWithLoss = 0
+    private(set) var decodeShort = 0
+    private(set) var displayShort = 0
+    private(set) var freezes = 0
+    private(set) var keyframeRequests = 0
+    private(set) var resendRequests = 0
+    private(set) var framesDropped = 0
+    private(set) var hasReceiverCounters = false
+    private(set) var renderer: String?
+    /// Stutters: gaps of a frame's turn or more with nothing new. Counted where frames leave the
+    /// decoder and again where they reach the screen, so a stutter on screen that was not there
+    /// out of the decoder was made by the display path.
+    private(set) var arrived: NativeStreamFrameCadence?
+    private(set) var shown: NativeStreamFrameCadence?
+    private var displayedSeconds = 0
+    private var displayedTotal = 0.0
+    private var receiveBufferSamples = 0
+    private var receiveBufferTotal = 0.0
+
+    var averageReceiveBufferMs: Double? {
+        receiveBufferSamples > 0 ? receiveBufferTotal / Double(receiveBufferSamples) : nil
+    }
+    var hasReadings: Bool { seconds > 0 || arrived != nil || shown != nil }
+
+    private static func adding(_ window: NativeStreamFrameCadence?, to total: NativeStreamFrameCadence?) -> NativeStreamFrameCadence? {
+        guard let window else { return total }
+        var total = total ?? NativeStreamFrameCadence()
+        total.frames += window.frames
+        total.longGaps += window.longGaps
+        total.replaced += window.replaced
+        total.longestGapMs = max(total.longestGapMs, window.longestGapMs)
+        return total
+    }
+
+    var steady: Int { seconds - arrivedShort - decodeShort - displayShort }
+    var averageDisplayedFps: Double? {
+        displayedSeconds > 0 ? displayedTotal / Double(displayedSeconds) : nil
+    }
+
+    mutating func record(_ sample: StreamRuntimeSample, targetFps: Int) {
+        func add(_ delta: Int?, to total: inout Int) {
+            guard let delta else { return }
+            hasReceiverCounters = true
+            total += max(0, delta)
+        }
+        add(sample.freezeDelta, to: &freezes)
+        add(sample.keyframeRequestDelta, to: &keyframeRequests)
+        add(sample.resendRequestDelta, to: &resendRequests)
+        add(sample.framesDroppedDelta, to: &framesDropped)
+        if let renderer = sample.renderer, !renderer.isEmpty { self.renderer = renderer }
+        arrived = Self.adding(sample.arrivedCadence, to: arrived)
+        shown = Self.adding(sample.shownCadence, to: shown)
+        if let buffer = sample.receiveBufferMs, buffer >= 0 {
+            receiveBufferSamples += 1
+            receiveBufferTotal += buffer
+        }
+        guard targetFps > 0, let received = sample.receivedFps, let decoded = sample.decodedFps else { return }
+        seconds += 1
+        if let displayed = sample.displayedFps {
+            displayedSeconds += 1
+            displayedTotal += displayed
+        }
+        if Double(received) < Double(targetFps) * Self.shortRatio {
+            arrivedShort += 1
+            if (sample.packetsLostDelta ?? 0) > 0 { arrivedShortWithLoss += 1 }
+        } else if Double(decoded) < Double(received) * Self.shortRatio {
+            decodeShort += 1
+        } else if let displayed = sample.displayedFps, displayed < Double(decoded) * Self.shortRatio {
+            displayShort += 1
+        }
     }
 }
 
@@ -247,6 +342,7 @@ struct SessionReport: Identifiable, Equatable {
     let trend: [SessionReportTrendPoint]
     let downgrades: [SessionReportFinding]
     let recommendations: [SessionReportFinding]
+    var frameDelivery: SessionFrameDelivery? = nil
 
     /// The chart needs enough points to say something true. Four points is a lie.
     var showsTrendChart: Bool { trend.count >= 8 }
@@ -303,6 +399,7 @@ final class StreamSessionReportAccumulator {
     private var decodedFpsTotal = 0
     private var consecutiveDecoderOverloadSamples = 0
     private var decoderOverloadDetected = false
+    private var frameDelivery = SessionFrameDelivery()
     private var decodeCount = 0
     private var decodeTotal = 0.0
     private var peakDecodeMs: Double?
@@ -363,6 +460,7 @@ final class StreamSessionReportAccumulator {
             decodeTotal += decode
             peakDecodeMs = max(peakDecodeMs ?? decode, decode)
         }
+        frameDelivery.record(sample, targetFps: launchProfile.initialProfile.fps)
         consecutiveDecoderOverloadSamples = Self.isDecoderOverloadSample(
             sample,
             requestedFps: launchProfile.initialProfile.fps
@@ -502,7 +600,8 @@ final class StreamSessionReportAccumulator {
                 targetBitrateKbps: launchProfile.initialProfile.maxBitrateKbps,
                 averageBitrateKbps: averageBitrateKbps,
                 networkKind: networkKind
-            )
+            ),
+            frameDelivery: frameDelivery.hasReadings ? frameDelivery : nil
         )
     }
 
