@@ -205,6 +205,14 @@ struct StreamRuntimeSample: Equatable {
     var shownCadence: NativeStreamFrameCadence? = nil
     /// How long frames waited in the receive buffer before decoding.
     var receiveBufferMs: Double? = nil
+    /// Whether the app has been left during this session, and whether it is away right now.
+    var interruption: StreamInterruptionPhase = .none
+    /// Picture in picture: whether it is on, and what its frame conversion cost this window.
+    var pipActive = false
+    var pipFrames: Int? = nil
+    var pipConvertMs: Double? = nil
+    /// The kind of network route the stream is on, without addresses.
+    var route: String? = nil
 
     var carriesReportableValues: Bool {
         pingMs != nil
@@ -216,6 +224,17 @@ struct StreamRuntimeSample: Equatable {
             || jitterMs != nil
             || packetLossPercent != nil
     }
+}
+
+/// Whether the player has left the app during a session. Leaving covers anything that takes
+/// the scene out of the foreground: another app, the app switcher, Notification Centre.
+enum StreamInterruptionPhase: Equatable {
+    /// The app has stayed in front since the stream started.
+    case none
+    /// The app is not in front right now. Nothing is on screen, so nothing is measured.
+    case away
+    /// Back in front after being away at least once.
+    case returned
 }
 
 /// Where a session's missing frames went, from one reading a second. A second counts against
@@ -241,6 +260,12 @@ struct SessionFrameDelivery: Equatable {
     /// out of the decoder was made by the display path.
     private(set) var arrived: NativeStreamFrameCadence?
     private(set) var shown: NativeStreamFrameCadence?
+    /// Seconds that measured the gaps between frames, for rates per minute.
+    private(set) var cadenceSeconds = 0
+    private(set) var pipFrames = 0
+    private(set) var pipConvertMs = 0.0
+    /// Seconds picture in picture stayed on while the app itself was in front.
+    private(set) var pipSecondsInApp = 0
     private var displayedSeconds = 0
     private var displayedTotal = 0.0
     private var receiveBufferSamples = 0
@@ -254,12 +279,15 @@ struct SessionFrameDelivery: Equatable {
     private static func adding(_ window: NativeStreamFrameCadence?, to total: NativeStreamFrameCadence?) -> NativeStreamFrameCadence? {
         guard let window else { return total }
         var total = total ?? NativeStreamFrameCadence()
-        total.frames += window.frames
-        total.longGaps += window.longGaps
-        total.replaced += window.replaced
-        total.longestGapMs = max(total.longestGapMs, window.longestGapMs)
+        total.add(window)
         return total
     }
+
+    /// The routes the stream took, in order, each listed once per switch.
+    private(set) var routes: [String] = []
+    private var pingSamples = 0
+    private var pingTotal = 0
+    var averagePingMs: Int? { pingSamples > 0 ? pingTotal / pingSamples : nil }
 
     var steady: Int { seconds - arrivedShort - decodeShort - displayShort }
     var averageDisplayedFps: Double? {
@@ -279,6 +307,15 @@ struct SessionFrameDelivery: Equatable {
         if let renderer = sample.renderer, !renderer.isEmpty { self.renderer = renderer }
         arrived = Self.adding(sample.arrivedCadence, to: arrived)
         shown = Self.adding(sample.shownCadence, to: shown)
+        if sample.shownCadence != nil { cadenceSeconds += 1 }
+        pipFrames += max(0, sample.pipFrames ?? 0)
+        pipConvertMs += max(0, sample.pipConvertMs ?? 0)
+        if sample.pipActive { pipSecondsInApp += 1 }
+        if let ping = sample.pingMs, ping >= 0 {
+            pingSamples += 1
+            pingTotal += ping
+        }
+        if let route = sample.route, !route.isEmpty, routes.last != route, routes.count < 8 { routes.append(route) }
         if let buffer = sample.receiveBufferMs, buffer >= 0 {
             receiveBufferSamples += 1
             receiveBufferTotal += buffer
@@ -343,6 +380,9 @@ struct SessionReport: Identifiable, Equatable {
     let downgrades: [SessionReportFinding]
     let recommendations: [SessionReportFinding]
     var frameDelivery: SessionFrameDelivery? = nil
+    /// The part of `frameDelivery` measured after the app was left and came back.
+    var frameDeliveryAfterReturn: SessionFrameDelivery? = nil
+    var timesAway = 0
 
     /// The chart needs enough points to say something true. Four points is a lie.
     var showsTrendChart: Bool { trend.count >= 8 }
@@ -400,6 +440,9 @@ final class StreamSessionReportAccumulator {
     private var consecutiveDecoderOverloadSamples = 0
     private var decoderOverloadDetected = false
     private var frameDelivery = SessionFrameDelivery()
+    private var frameDeliveryAfterReturn = SessionFrameDelivery()
+    private var timesAway = 0
+    private var wasAway = false
     private var decodeCount = 0
     private var decodeTotal = 0.0
     private var peakDecodeMs: Double?
@@ -460,7 +503,18 @@ final class StreamSessionReportAccumulator {
             decodeTotal += decode
             peakDecodeMs = max(peakDecodeMs ?? decode, decode)
         }
-        frameDelivery.record(sample, targetFps: launchProfile.initialProfile.fps)
+        // While the app is away nothing reaches the screen; counting that as lost frames would
+        // bury the readings from the time it was actually being played.
+        if sample.interruption == .away {
+            if !wasAway { timesAway += 1 }
+            wasAway = true
+        } else {
+            wasAway = false
+            frameDelivery.record(sample, targetFps: launchProfile.initialProfile.fps)
+            if sample.interruption == .returned {
+                frameDeliveryAfterReturn.record(sample, targetFps: launchProfile.initialProfile.fps)
+            }
+        }
         consecutiveDecoderOverloadSamples = Self.isDecoderOverloadSample(
             sample,
             requestedFps: launchProfile.initialProfile.fps
@@ -601,7 +655,9 @@ final class StreamSessionReportAccumulator {
                 averageBitrateKbps: averageBitrateKbps,
                 networkKind: networkKind
             ),
-            frameDelivery: frameDelivery.hasReadings ? frameDelivery : nil
+            frameDelivery: frameDelivery.hasReadings ? frameDelivery : nil,
+            frameDeliveryAfterReturn: frameDeliveryAfterReturn.hasReadings ? frameDeliveryAfterReturn : nil,
+            timesAway: timesAway
         )
     }
 

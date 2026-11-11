@@ -3307,6 +3307,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var lastStatsPacketsLost: Int?
     private var lastStatsPacketsReceived: Int?
     private var lastStatsReceiverCounters = NativeStreamReceiverCounters()
+    private var sceneHasBeenAway = false
+    private var interruptionPhase: StreamInterruptionPhase {
+        latestScenePhase != .active ? .away : (sceneHasBeenAway ? .returned : .none)
+    }
     private var mediaTransportConnected = false
     private var mediaLivenessWatchdog = NativeStreamLivenessWatchdog()
     private var recoveryProgressTracker = NativeStreamRecoveryProgressTracker()
@@ -3674,13 +3678,16 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         statsSnapshot.presentationRates = renderer?.presentationRates
         if decoded > 0 { handleDecodedVideoProgress(framesDecoded: decoded); raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution) }
         let cadence = renderer?.drainFrameCadence()
+        let pip = pictureInPictureBridge.drainConversionCost()
         onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
             bitrateKbps: bitrate, jitterMs: sample.jitterMilliseconds, fps: decodedFPS, receivedFps: receivedFPS,
             decodedFps: decodedFPS, decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
             packetsLostDelta: lostDelta, packetsReceivedDelta: packetsDelta, packetLossPercent: loss,
             resolution: resolution, codec: selectedCodec.rawValue.uppercased(), networkKind: deviceStatus.networkTransport.sessionNetworkKind,
             displayedFps: statsSnapshot.presentationRates?.displayedFPS, renderer: statsSnapshot.effects,
-            arrivedCadence: cadence?.arrived, shownCadence: cadence?.shown))
+            arrivedCadence: cadence?.arrived, shownCadence: cadence?.shown,
+            interruption: interruptionPhase, pipActive: isPictureInPictureActive && latestScenePhase == .active,
+            pipFrames: pip.frames, pipConvertMs: pip.milliseconds))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }
@@ -3695,6 +3702,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 
     func handleScenePhase(_ phase: ScenePhase) {
         latestScenePhase = phase
+        if phase != .active { sceneHasBeenAway = true }
         updateVirtualControllerAvailability()
         if phase != .active, started, !stopped {
             refreshDeviceStatus()
@@ -5521,6 +5529,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         }
 
         let cadence = renderer?.drainFrameCadence()
+        let pip = pictureInPictureBridge.drainConversionCost()
         onRuntimeSample(
             StreamRuntimeSample(
                 timestamp: now,
@@ -5547,7 +5556,12 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 renderer: decoderImplementation.map { "\($0) · \(statsSnapshot.effects)" } ?? statsSnapshot.effects,
                 arrivedCadence: cadence?.arrived,
                 shownCadence: cadence?.shown,
-                receiveBufferMs: receiverCounters.bufferMs(since: lastStatsReceiverCounters)
+                receiveBufferMs: receiverCounters.bufferMs(since: lastStatsReceiverCounters),
+                interruption: interruptionPhase,
+                pipActive: isPictureInPictureActive && latestScenePhase == .active,
+                pipFrames: pip.frames,
+                pipConvertMs: pip.milliseconds,
+                route: selectedIceRoute(pair: selectedPairValues, candidates: candidateStats)
             )
         )
         receiverCounters.framesDropped = framesDropped
@@ -5780,6 +5794,21 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         let remote = remoteID.flatMap { candidates[$0] }.flatMap(candidateEndpoint)
         guard local != nil || remote != nil else { return nil }
         return "ice \(local ?? "?")->\(remote ?? "?")"
+    }
+
+    /// The kind of route the stream takes, without addresses: "wifi host/udp → srflx".
+    private func selectedIceRoute(pair: [String: NSObject]?, candidates: [String: [String: NSObject]]) -> String? {
+        guard let pair else { return nil }
+        func kind(_ key: String, network: Bool) -> String? {
+            guard let values = (pair[key] as? String).flatMap({ candidates[$0] }) else { return nil }
+            return [network ? values["networkType"] as? String : nil,
+                    (values["candidateType"] as? String)?.lowercased(),
+                    network ? (values["protocol"] as? String)?.lowercased() : nil]
+                .compactMap { $0 }.joined(separator: " ")
+        }
+        guard let local = kind("localCandidateId", network: true),
+              let remote = kind("remoteCandidateId", network: false) else { return nil }
+        return "\(local) → \(remote)"
     }
 
     private func candidateEndpoint(_ values: [String: NSObject]) -> String {
@@ -6398,6 +6427,8 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
     private var possibilityObservation: NSKeyValueObservation?
     private let frameInFlight = DispatchSemaphore(value: 1)
     private let converter = NativeStreamPiPFrameConverter()
+    private let conversionCostLock = NSLock()
+    private var conversionCost: (frames: Int, milliseconds: Double) = (0, 0)
     private let generationLock = NSLock()
     private var generation: UInt64 = 0
     private var availabilityPublished = false
@@ -6506,8 +6537,26 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
         }
     }
 
+    /// Frames converted for picture in picture since the last call, and the time that took.
+    func drainConversionCost() -> (frames: Int, milliseconds: Double) {
+        conversionCostLock.lock(); defer { conversionCostLock.unlock() }
+        defer { conversionCost = (0, 0) }
+        return conversionCost
+    }
+
+    private func timedConversion(of pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let started = CACurrentMediaTime()
+        let converted = converter.convert(pixelBuffer)
+        let elapsed = (CACurrentMediaTime() - started) * 1_000
+        conversionCostLock.lock()
+        conversionCost.frames += 1
+        conversionCost.milliseconds += elapsed
+        conversionCostLock.unlock()
+        return converted
+    }
+
     private func enqueue(pixelBuffer: CVPixelBuffer, generation frameGeneration: UInt64) {
-        guard shouldAcceptFrame(), let converted = converter.convert(pixelBuffer),
+        guard shouldAcceptFrame(), let converted = timedConversion(of: pixelBuffer),
               let sampleBuffer = makeSampleBuffer(pixelBuffer: converted) else {
             frameInFlight.signal()
             return
@@ -7072,6 +7121,11 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
         return replaced
     }
 
+    var hasPending: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pending != nil
+    }
+
     func take() -> Entry? {
         lock.lock()
         defer { lock.unlock() }
@@ -7264,6 +7318,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 
     private func displayTick(_ link: CADisplayLink) {
+        presentations.cadence.noteTick(time: CACurrentMediaTime(), interval: link.targetTimestamp - link.timestamp)
         mtkView.draw()
     }
 
@@ -7282,10 +7337,22 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard !isHidden, window != nil else { return }
         let drawStarted = CACurrentMediaTime()
-        guard gpuAdmission.wait(timeout: .now()) == .success else { return }
+        guard gpuAdmission.wait(timeout: .now()) == .success else {
+            if frames.hasPending { presentations.cadence.noteHeldBack() }
+            return
+        }
         var submitted = false
-        defer { if !submitted { gpuAdmission.signal() } }
-        guard let entry = frames.take() else { return }
+        defer {
+            if submitted {
+                presentations.cadence.noteDraw(milliseconds: (CACurrentMediaTime() - drawStarted) * 1_000)
+            } else {
+                gpuAdmission.signal()
+            }
+        }
+        guard let entry = frames.take() else {
+            if frames.hasPending { presentations.cadence.noteHeldBack() }
+            return
+        }
         defer {
             // Return the slot on conversion/drawable failures too.
             if !submitted { frames.complete() }

@@ -5680,6 +5680,74 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(delivery.averageReceiveBufferMs), 6, accuracy: 0.001)
     }
 
+    func testSessionReportSeparatesStuttersAfterReturningToTheAppAndIgnoresTimeAway() throws {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        func second(_ phase: StreamInterruptionPhase, stutters: Int, replaced: Int = 0,
+                    pipActive: Bool = false, pipFrames: Int? = nil, pipMs: Double? = nil) -> StreamRuntimeSample {
+            StreamRuntimeSample(timestamp: 0, pingMs: 20,
+                arrivedCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 20, longGaps: 0, replaced: replaced),
+                shownCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 30, longGaps: stutters, replaced: 0),
+                interruption: phase, pipActive: pipActive, pipFrames: pipFrames, pipConvertMs: pipMs)
+        }
+        for _ in 0..<3 { accumulator.record(second(.none, stutters: 0, pipFrames: 2, pipMs: 6)) }
+        // Away: every frame is "never shown" while nothing draws. None of it may count.
+        for _ in 0..<2 { accumulator.record(second(.away, stutters: 9, replaced: 60, pipFrames: 30, pipMs: 90)) }
+        for _ in 0..<3 { accumulator.record(second(.returned, stutters: 2, pipActive: true, pipFrames: 30, pipMs: 120)) }
+        // Away a second time, then back.
+        accumulator.record(second(.away, stutters: 9, replaced: 60))
+        accumulator.record(second(.returned, stutters: 1))
+
+        let report = try XCTUnwrap(accumulator.finish())
+        let all = try XCTUnwrap(report.frameDelivery)
+        let after = try XCTUnwrap(report.frameDeliveryAfterReturn)
+        XCTAssertEqual(report.timesAway, 2)
+        XCTAssertEqual(all.cadenceSeconds, 7)
+        XCTAssertEqual(all.shown?.longGaps, 7)
+        XCTAssertEqual(all.arrived?.replaced, 0)
+        XCTAssertEqual(after.cadenceSeconds, 4)
+        XCTAssertEqual(after.shown?.longGaps, 7)
+        XCTAssertEqual(all.pipFrames, 3 * 2 + 3 * 30)
+        XCTAssertEqual(all.pipConvertMs, 3 * 6 + 3 * 120, accuracy: 0.001)
+        XCTAssertEqual(all.pipSecondsInApp, 3)
+
+        // The display clock, the cost of drawing and the network route are carried the same way.
+        let clock = NativeStreamFrameCadenceMeter()
+        clock.noteTick(time: 10.000, interval: 1.0 / 120)
+        clock.noteTick(time: 10.008, interval: 1.0 / 120)
+        clock.noteTick(time: 10.030, interval: 1.0 / 120)
+        clock.noteDraw(milliseconds: 2)
+        clock.noteDraw(milliseconds: 6)
+        clock.noteHeldBack()
+        let ticked = clock.drain()
+        XCTAssertEqual(ticked.ticks, 2)
+        XCTAssertEqual(ticked.lateTicks, 1)
+        XCTAssertEqual(ticked.longestTickGapMs, 22, accuracy: 0.01)
+        XCTAssertEqual(ticked.draws, 2)
+        XCTAssertEqual(ticked.drawMs, 8, accuracy: 0.001)
+        XCTAssertEqual(ticked.longestDrawMs, 6, accuracy: 0.001)
+        XCTAssertEqual(ticked.heldBack, 1)
+
+        let routed = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        for (ping, route, phase) in [(20, "wifi host udp → srflx", StreamInterruptionPhase.none),
+                                     (22, "wifi host udp → srflx", .none),
+                                     (90, "wifi relay udp → srflx", .returned)] {
+            routed.record(StreamRuntimeSample(timestamp: 0, pingMs: ping, shownCadence: ticked, interruption: phase, route: route))
+        }
+        let routedReport = try XCTUnwrap(routed.finish())
+        XCTAssertEqual(routedReport.frameDelivery?.routes, ["wifi host udp → srflx", "wifi relay udp → srflx"])
+        XCTAssertEqual(routedReport.frameDelivery?.averagePingMs, 44)
+        XCTAssertEqual(routedReport.frameDeliveryAfterReturn?.averagePingMs, 90)
+        XCTAssertEqual(routedReport.frameDelivery?.shown?.ticks, 6)
+        XCTAssertEqual(routedReport.frameDelivery?.shown?.longestDrawMs ?? 0, 6, accuracy: 0.001)
+
+        // A session that never left the app has no "after returning" part.
+        let steady = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        steady.record(second(.none, stutters: 1))
+        let steadyReport = try XCTUnwrap(steady.finish())
+        XCTAssertNil(steadyReport.frameDeliveryAfterReturn)
+        XCTAssertEqual(steadyReport.timesAway, 0)
+    }
+
     func testShortSessionsAreMarkedAsLimitedData() {
         let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
         for _ in 0..<3 {

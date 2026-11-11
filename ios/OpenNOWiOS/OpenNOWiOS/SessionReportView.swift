@@ -277,10 +277,63 @@ struct SessionReportView: View {
                     measurementRow("Keyframe requests", primary: "\(delivery.keyframeRequests)",
                         secondary: "\(delivery.resendRequests) resends", level: .good)
                 }
+                if let after = report.frameDeliveryAfterReturn, after.cadenceSeconds > 0 {
+                    stutterRateRow("Before leaving the app",
+                        shown: (delivery.shown?.longGaps ?? 0) - (after.shown?.longGaps ?? 0),
+                        arrived: (delivery.arrived?.longGaps ?? 0) - (after.arrived?.longGaps ?? 0),
+                        seconds: delivery.cadenceSeconds - after.cadenceSeconds)
+                    stutterRateRow(report.timesAway == 1 ? "After returning" : "After returning (\(report.timesAway) times away)",
+                        shown: after.shown?.longGaps ?? 0, arrived: after.arrived?.longGaps ?? 0,
+                        seconds: after.cadenceSeconds)
+                }
+                if let shown = delivery.shown, shown.ticks > 0, delivery.cadenceSeconds > 0 {
+                    measurementRow("Display clock",
+                        primary: String(format: "%.0f Hz", Double(shown.ticks) / Double(delivery.cadenceSeconds)),
+                        secondary: String(format: "%d late · longest gap %.0f ms", shown.lateTicks, shown.longestTickGapMs),
+                        level: shown.lateTicks > 0 ? .fair : .good)
+                }
+                if let shown = delivery.shown, shown.draws > 0 {
+                    measurementRow("Drawing a frame",
+                        primary: String(format: "%.1f ms", shown.drawMs / Double(shown.draws)),
+                        secondary: String(format: "worst %.0f ms", shown.longestDrawMs),
+                        level: shown.longestDrawMs >= 8 ? .fair : .good)
+                }
+                if let after = report.frameDeliveryAfterReturn, let afterPing = after.averagePingMs,
+                   let allPing = delivery.averagePingMs {
+                    measurementRow("Latency after returning", primary: "\(afterPing) ms",
+                        secondary: "whole session \(allPing) ms", level: afterPing > allPing + 20 ? .fair : .good)
+                }
+                if !delivery.routes.isEmpty {
+                    measurementRow("Network route", primary: delivery.routes.count == 1 ? "unchanged" : "\(delivery.routes.count - 1) switches",
+                        secondary: delivery.routes.last, level: delivery.routes.count == 1 ? .good : .fair)
+                }
+                if let shown = delivery.shown, shown.heldBack > 0 {
+                    measurementRow("Frames held back by the display", primary: "\(shown.heldBack)",
+                        secondary: report.frameDeliveryAfterReturn?.shown.map { "\($0.heldBack) after returning" },
+                        level: .fair)
+                }
+                if delivery.pipFrames > 0 {
+                    measurementRow("Picture in picture", primary: "\(delivery.pipFrames) frames",
+                        secondary: String(format: "%.1f ms each · on in the app %d s",
+                                          delivery.pipConvertMs / Double(delivery.pipFrames), delivery.pipSecondsInApp),
+                        level: delivery.pipSecondsInApp > 0 ? .fair : .good)
+                }
                 measurementRow("Codec", primary: report.deliveredCodec ?? report.requestedCodec,
                     secondary: delivery.renderer, level: .good, showsDivider: false)
             }
             .openNowCard()
+        }
+    }
+
+    /// Stutters a minute over one stretch of the session, so two stretches of different length
+    /// can be compared.
+    @ViewBuilder
+    private func stutterRateRow(_ title: String, shown: Int, arrived: Int, seconds: Int) -> some View {
+        if seconds > 0 {
+            let perMinute = 60.0 / Double(seconds)
+            measurementRow(title, primary: String(format: "%.1f stutters/min", Double(shown) * perMinute),
+                secondary: String(format: "from the decoder %.1f/min · %d s", Double(arrived) * perMinute, seconds),
+                level: shown > 0 ? .fair : .good)
         }
     }
 

@@ -192,6 +192,33 @@ struct NativeStreamFrameCadence: Equatable {
     var longGaps = 0
     /// Frames overwritten by a newer one before they could be shown.
     var replaced = 0
+    /// Display ticks that left a waiting frame unshown because earlier frames were still on
+    /// their way through the GPU.
+    var heldBack = 0
+    /// The display clock itself: how often it ticked, and how often a tick came late because
+    /// the main thread was busy.
+    var ticks = 0
+    var lateTicks = 0
+    var longestTickGapMs = 0.0
+    /// Main-thread time spent preparing and submitting frames that were drawn.
+    var draws = 0
+    var drawMs = 0.0
+    var longestDrawMs = 0.0
+
+    /// Adds another window: counts add up, worst cases stay the worst.
+    mutating func add(_ other: NativeStreamFrameCadence) {
+        frames += other.frames
+        longGaps += other.longGaps
+        replaced += other.replaced
+        heldBack += other.heldBack
+        ticks += other.ticks
+        lateTicks += other.lateTicks
+        draws += other.draws
+        drawMs += other.drawMs
+        longestGapMs = max(longestGapMs, other.longestGapMs)
+        longestTickGapMs = max(longestTickGapMs, other.longestTickGapMs)
+        longestDrawMs = max(longestDrawMs, other.longestDrawMs)
+    }
 }
 
 final class NativeStreamFrameCadenceMeter: @unchecked Sendable {
@@ -201,6 +228,7 @@ final class NativeStreamFrameCadenceMeter: @unchecked Sendable {
 
     private let lock = NSLock()
     private var last: Double?
+    private var lastTick: Double?
     private var nominalInterval = 1.0 / 60
     private var window = NativeStreamFrameCadence()
 
@@ -217,6 +245,28 @@ final class NativeStreamFrameCadenceMeter: @unchecked Sendable {
         window.frames += 1
         window.longestGapMs = max(window.longestGapMs, gap * 1_000)
         if gap >= nominalInterval * Self.longGapRatio { window.longGaps += 1 }
+    }
+
+    func noteHeldBack() {
+        lock.lock(); window.heldBack += 1; lock.unlock()
+    }
+
+    /// One callback of the display clock, `interval` being how far apart the screen asks for them.
+    func noteTick(time: Double, interval: Double) {
+        lock.lock(); defer { lock.unlock() }
+        defer { lastTick = time }
+        guard let lastTick, time > lastTick, time - lastTick < Self.pauseSeconds else { return }
+        let gap = time - lastTick
+        window.ticks += 1
+        window.longestTickGapMs = max(window.longestTickGapMs, gap * 1_000)
+        if interval > 0, gap >= interval * Self.longGapRatio { window.lateTicks += 1 }
+    }
+
+    func noteDraw(milliseconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        window.draws += 1
+        window.drawMs += milliseconds
+        window.longestDrawMs = max(window.longestDrawMs, milliseconds)
     }
 
     /// The window since the last call. The next window still measures from the last frame.
