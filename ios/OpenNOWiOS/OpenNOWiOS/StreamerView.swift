@@ -3271,6 +3271,13 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var nativeNVSTFinished = false
 
     private let networkMonitor = NWPathMonitor()
+    private var lastInterfaceCounters: NetworkInterfaceActivity.Counters?
+    /// Packets per interface since the previous stats sample; nil on the first.
+    private func drainInterfaceActivity() -> NetworkInterfaceActivity? {
+        let current = NetworkInterfaceActivity.readCounters()
+        defer { lastInterfaceCounters = current }
+        return lastInterfaceCounters.map { NetworkInterfaceActivity.between($0, current) }
+    }
     private let networkMonitorQueue = DispatchQueue(label: "OpenNOW.NativeStreamer.Network")
     private let peerName = "peer-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
     private var peerId = 0
@@ -3724,6 +3731,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             longestNetworkSilenceMs: sample.networkSilences.longestMilliseconds,
             lateReceiveWakeUps: sample.networkSilences.lateWakeUps,
             longestLateReceiveWakeUpMs: sample.networkSilences.longestLateMilliseconds,
+            interfaces: drainInterfaceActivity(),
             transportDetail: sample.detail))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
@@ -5603,7 +5611,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 pipActive: isPictureInPictureActive && latestScenePhase == .active,
                 pipFrames: pip.frames,
                 pipConvertMs: pip.milliseconds,
-                route: selectedIceRoute(pair: selectedPairValues, candidates: candidateStats)
+                route: selectedIceRoute(pair: selectedPairValues, candidates: candidateStats),
+                interfaces: drainInterfaceActivity()
             )
         )
         receiverCounters.framesDropped = framesDropped

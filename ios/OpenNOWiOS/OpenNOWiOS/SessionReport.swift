@@ -220,6 +220,8 @@ struct StreamRuntimeSample: Equatable {
     /// inside this device rather than on the network.
     var lateReceiveWakeUps: Int? = nil
     var longestLateReceiveWakeUpMs: Double? = nil
+    /// Packets on the device's network interfaces this second (see `NetworkInterfaceActivity`).
+    var interfaces: NetworkInterfaceActivity? = nil
     /// The transport's own running counters as one line of text: loss, repairs, keyframe requests.
     var transportDetail: String? = nil
 
@@ -378,6 +380,9 @@ struct SessionTimelineRow: Equatable {
     var peakJitterUs: Int?
     var lateReceiveWakeUps = 0
     var longestLateReceiveWakeUpMs = 0
+    var wifiPackets: Int?
+    var peerToPeerPackets: Int?
+    var lowLatencyLinkPackets: Int?
     /// 0 in front since the start, 1 back after being away, 2 away.
     var phase = 0
 
@@ -385,7 +390,8 @@ struct SessionTimelineRow: Equatable {
         "offsetSeconds", "samples", "peakPingMs", "lowestReceivedFps", "lowestDecodedFps", "lowestShownFps",
         "lowestBitrateKbps", "packetsLost", "networkSilences", "longestNetworkSilenceMs", "decoderStutters",
         "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks",
-        "peakJitterUs", "lateReceiveWakeUps", "longestLateReceiveWakeUpMs", "phase"
+        "peakJitterUs", "lateReceiveWakeUps", "longestLateReceiveWakeUpMs",
+        "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "phase"
     ]
 
     /// In the order of `columns`; -1 stands for a reading the stretch did not have.
@@ -393,7 +399,8 @@ struct SessionTimelineRow: Equatable {
         [offsetSeconds, samples, peakPingMs ?? -1, lowestReceivedFps ?? -1, lowestDecodedFps ?? -1, lowestShownFps ?? -1,
          lowestBitrateKbps ?? -1, packetsLost, networkSilences, longestNetworkSilenceMs, decoderStutters,
          longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks,
-         peakJitterUs ?? -1, lateReceiveWakeUps, longestLateReceiveWakeUpMs, phase]
+         peakJitterUs ?? -1, lateReceiveWakeUps, longestLateReceiveWakeUpMs,
+         wifiPackets ?? -1, peerToPeerPackets ?? -1, lowLatencyLinkPackets ?? -1, phase]
     }
 
     init(_ sample: StreamRuntimeSample, offsetSeconds: Int) {
@@ -415,6 +422,9 @@ struct SessionTimelineRow: Equatable {
         peakJitterUs = sample.jitterMs.map { Int(($0 * 1_000).rounded()) }
         lateReceiveWakeUps = max(0, sample.lateReceiveWakeUps ?? 0)
         longestLateReceiveWakeUpMs = Int((sample.longestLateReceiveWakeUpMs ?? 0).rounded())
+        wifiPackets = sample.interfaces?.wifiPackets
+        peerToPeerPackets = sample.interfaces?.peerToPeerPackets
+        lowLatencyLinkPackets = sample.interfaces?.lowLatencyLinkPackets
         switch sample.interruption {
         case .none: phase = 0
         case .returned: phase = 1
@@ -446,6 +456,10 @@ struct SessionTimelineRow: Equatable {
         peakJitterUs = worst(peakJitterUs, next.peakJitterUs, max)
         lateReceiveWakeUps += next.lateReceiveWakeUps
         longestLateReceiveWakeUpMs = max(longestLateReceiveWakeUpMs, next.longestLateReceiveWakeUpMs)
+        func sum(_ a: Int?, _ b: Int?) -> Int? { a.map { $0 + (b ?? 0) } ?? b }
+        wifiPackets = sum(wifiPackets, next.wifiPackets)
+        peerToPeerPackets = sum(peerToPeerPackets, next.peerToPeerPackets)
+        lowLatencyLinkPackets = sum(lowLatencyLinkPackets, next.lowLatencyLinkPackets)
         phase = max(phase, next.phase)
     }
 }
@@ -1119,5 +1133,54 @@ final class StreamSessionReportAccumulator {
     static func summary(_ profile: StreamVideoProfile) -> String {
         let mbps = Double(profile.maxBitrateKbps) / 1_000
         return String(format: "%dx%d at %d fps, %.0f Mb/s", profile.width, profile.height, profile.fps, mbps)
+    }
+}
+
+/// Packets each second on the device's own network interfaces, from the system's interface
+/// counters. `awdl0` is Apple's peer-to-peer Wi-Fi (AirDrop, Handoff, Universal Control, Sidecar)
+/// and `llw0` its low-latency link: while either is busy, the Wi-Fi radio leaves the home network's
+/// channel on a schedule, and the stream's packets wait. `en0` is the Wi-Fi interface itself, so a
+/// count there shows the counters can be read at all on this device.
+struct NetworkInterfaceActivity: Equatable {
+    static let wifi = "en0"
+    static let peerToPeer = "awdl0"
+    static let lowLatencyLink = "llw0"
+    static let names: Set<String> = [wifi, peerToPeer, lowLatencyLink]
+
+    /// Packets in plus out since the previous reading, per interface; nil for an interface the
+    /// system did not list now or last time.
+    var wifiPackets: Int?
+    var peerToPeerPackets: Int?
+    var lowLatencyLinkPackets: Int?
+
+    /// Cumulative packets in plus out per interface name, as the system's 32-bit counters hold them.
+    typealias Counters = [String: UInt32]
+
+    /// The difference between two readings. The counters are 32-bit and wrap.
+    static func between(_ previous: Counters, _ current: Counters) -> NetworkInterfaceActivity {
+        func delta(_ name: String) -> Int? {
+            guard let before = previous[name], let now = current[name] else { return nil }
+            return Int(now &- before)
+        }
+        return NetworkInterfaceActivity(wifiPackets: delta(wifi), peerToPeerPackets: delta(peerToPeer),
+                                        lowLatencyLinkPackets: delta(lowLatencyLink))
+    }
+
+    /// The system's current counters for `names`.
+    static func readCounters() -> Counters {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return [:] }
+        defer { freeifaddrs(head) }
+        var counters: Counters = [:]
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let entry = pointer.pointee
+            guard let address = entry.ifa_addr, address.pointee.sa_family == UInt8(AF_LINK),
+                  let data = entry.ifa_data else { continue }
+            let name = String(cString: entry.ifa_name)
+            guard names.contains(name) else { continue }
+            let stats = data.assumingMemoryBound(to: if_data.self).pointee
+            counters[name] = stats.ifi_ipackets &+ stats.ifi_opackets
+        }
+        return counters
     }
 }

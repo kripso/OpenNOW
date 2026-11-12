@@ -3017,6 +3017,32 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertNil([UInt8]().withUnsafeBytes { NvstMjolnirReceiver.kernelArrivalNanoseconds(control: $0) })
     }
 
+    func testInterfacePacketsAreCountedPerSecondAndReachTheTimeline() throws {
+        // Counters are 32-bit and wrap; an interface missing from either reading has no count.
+        let activity = NetworkInterfaceActivity.between(
+            ["en0": 1_000, "awdl0": UInt32.max - 9, "llw0": 5],
+            ["en0": 4_200, "awdl0": 30])
+        XCTAssertEqual(activity, NetworkInterfaceActivity(wifiPackets: 3_200, peerToPeerPackets: 40, lowLatencyLinkPackets: nil))
+        // The device's own interfaces can be read; the simulator lists at least one of them.
+        XCTAssertFalse(NetworkInterfaceActivity.readCounters().isEmpty)
+
+        var timeline = SessionTimeline()
+        timeline.record(StreamRuntimeSample(timestamp: 0, interfaces: activity), offsetSeconds: 0)
+        var folded = SessionTimelineRow(StreamRuntimeSample(timestamp: 0, interfaces: activity), offsetSeconds: 0)
+        folded.absorb(SessionTimelineRow(StreamRuntimeSample(timestamp: 1, interfaces: .init(wifiPackets: 800, peerToPeerPackets: 2)),
+                                         offsetSeconds: 1))
+        XCTAssertEqual(folded.wifiPackets, 4_000)
+        XCTAssertEqual(folded.peerToPeerPackets, 42)
+        XCTAssertNil(folded.lowLatencyLinkPackets)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(timeline)) as? [String: Any])
+        let row = try XCTUnwrap((json["rows"] as? [[Int]])?.first)
+        let columns = SessionTimelineRow.columns
+        XCTAssertEqual(row.count, columns.count)
+        XCTAssertEqual(row[columns.firstIndex(of: "wifiPackets")!], 3_200)
+        XCTAssertEqual(row[columns.firstIndex(of: "peerToPeerPackets")!], 40)
+        XCTAssertEqual(row[columns.firstIndex(of: "lowLatencyLinkPackets")!], -1)
+    }
+
     func testLateReadsReachTheSessionTimeline() throws {
         var timeline = SessionTimeline()
         timeline.record(StreamRuntimeSample(timestamp: 0, pingMs: 90, lateReceiveWakeUps: 2, longestLateReceiveWakeUpMs: 104.4),
