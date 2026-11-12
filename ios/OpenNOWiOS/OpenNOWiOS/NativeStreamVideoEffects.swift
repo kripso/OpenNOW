@@ -185,7 +185,7 @@ final class NativeStreamSpatialUpscaler {
 /// The gaps between consecutive frames at one point in the pipeline, over one reporting window.
 /// A stream can deliver every frame of a second and still stutter: the count hides the frame
 /// that came late and the one behind it that came early. The gaps do not.
-struct NativeStreamFrameCadence: Equatable {
+struct NativeStreamFrameCadence: Equatable, Encodable {
     var frames = 0
     var longestGapMs = 0.0
     /// Gaps of at least `longGapRatio` frame intervals: a frame's turn passed with nothing new.

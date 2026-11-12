@@ -135,7 +135,7 @@ struct BugReportView: View {
                         .foregroundStyle(OpenNOWPalette.statusPoor)
                 }
             } footer: {
-                Text("Reports are read by the OpenNOW maintainers and may be quoted in a public issue. Don't include anything you would not post publicly.")
+                Text("Reports are read by the developers of this build and may be quoted in a public issue. Don't include anything you would not post publicly.")
                     .foregroundStyle(OpenNOWPalette.statusNotice)
             }
         }
@@ -224,7 +224,7 @@ struct BugReportView: View {
                 .accessibilityHidden(true)
             Text("Report sent")
                 .font(.title2.bold())
-            Text("Thanks — the maintainers have what they need to investigate.")
+            Text("Thanks — the developers have what they need to investigate.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

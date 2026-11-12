@@ -114,7 +114,7 @@ enum StreamQuality {
 
 // MARK: - Report model
 
-enum SessionReportRating: String, Equatable {
+enum SessionReportRating: String, Equatable, Encodable {
     case excellent
     case good
     case fair
@@ -147,12 +147,12 @@ enum SessionReportRating: String, Equatable {
     }
 }
 
-enum SessionReportFindingKind: Equatable {
+enum SessionReportFindingKind: String, Equatable, Encodable {
     case info
     case warning
 }
 
-struct SessionReportFinding: Identifiable, Equatable {
+struct SessionReportFinding: Identifiable, Equatable, Encodable {
     let title: String
     let detail: String
     var kind: SessionReportFindingKind = .info
@@ -160,7 +160,7 @@ struct SessionReportFinding: Identifiable, Equatable {
     var id: String { title }
 }
 
-enum SessionNetworkKind: String, Equatable {
+enum SessionNetworkKind: String, Equatable, Encodable {
     case wifi
     case cellular
     case wired
@@ -243,7 +243,7 @@ enum StreamInterruptionPhase: Equatable {
 /// Where a session's missing frames went, from one reading a second. A second counts against
 /// the first stage that fell short, so the stages never overlap: frames that did not arrive
 /// cannot also be blamed on the decoder, nor frames that were not decoded on the display.
-struct SessionFrameDelivery: Equatable {
+struct SessionFrameDelivery: Equatable, Encodable {
     /// A stage is short when it passes on under nine tenths of what reached it.
     static let shortRatio = 0.9
 
@@ -348,15 +348,131 @@ struct SessionFrameDelivery: Equatable {
     }
 }
 
+/// One stretch of a session: a second of it, or several once a long session has been folded.
+/// Counts add up over the stretch and every other reading keeps its worst value.
+struct SessionTimelineRow: Equatable {
+    var offsetSeconds: Int
+    var samples = 1
+    var peakPingMs: Int?
+    var lowestReceivedFps: Int?
+    var lowestDecodedFps: Int?
+    var lowestShownFps: Int?
+    var lowestBitrateKbps: Int?
+    var packetsLost = 0
+    var networkSilences = 0
+    var longestNetworkSilenceMs = 0
+    var decoderStutters = 0
+    var longestDecoderGapMs = 0
+    var screenStutters = 0
+    var longestScreenGapMs = 0
+    var framesNeverShown = 0
+    var lateDisplayTicks = 0
+    /// 0 in front since the start, 1 back after being away, 2 away.
+    var phase = 0
+
+    static let columns = [
+        "offsetSeconds", "samples", "peakPingMs", "lowestReceivedFps", "lowestDecodedFps", "lowestShownFps",
+        "lowestBitrateKbps", "packetsLost", "networkSilences", "longestNetworkSilenceMs", "decoderStutters",
+        "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks", "phase"
+    ]
+
+    /// In the order of `columns`; -1 stands for a reading the stretch did not have.
+    var values: [Int] {
+        [offsetSeconds, samples, peakPingMs ?? -1, lowestReceivedFps ?? -1, lowestDecodedFps ?? -1, lowestShownFps ?? -1,
+         lowestBitrateKbps ?? -1, packetsLost, networkSilences, longestNetworkSilenceMs, decoderStutters,
+         longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks, phase]
+    }
+
+    init(_ sample: StreamRuntimeSample, offsetSeconds: Int) {
+        self.offsetSeconds = offsetSeconds
+        peakPingMs = sample.pingMs
+        lowestReceivedFps = sample.receivedFps
+        lowestDecodedFps = sample.decodedFps
+        lowestShownFps = sample.displayedFps.map { Int($0.rounded()) }
+        lowestBitrateKbps = sample.bitrateKbps
+        packetsLost = max(0, sample.packetsLostDelta ?? 0)
+        networkSilences = max(0, sample.networkSilences ?? 0)
+        longestNetworkSilenceMs = Int((sample.longestNetworkSilenceMs ?? 0).rounded())
+        decoderStutters = sample.arrivedCadence?.longGaps ?? 0
+        longestDecoderGapMs = Int((sample.arrivedCadence?.longestGapMs ?? 0).rounded())
+        screenStutters = sample.shownCadence?.longGaps ?? 0
+        longestScreenGapMs = Int((sample.shownCadence?.longestGapMs ?? 0).rounded())
+        framesNeverShown = sample.arrivedCadence?.replaced ?? 0
+        lateDisplayTicks = sample.shownCadence?.lateTicks ?? 0
+        switch sample.interruption {
+        case .none: phase = 0
+        case .returned: phase = 1
+        case .away: phase = 2
+        }
+    }
+
+    mutating func absorb(_ next: SessionTimelineRow) {
+        func worst(_ a: Int?, _ b: Int?, _ pick: (Int, Int) -> Int) -> Int? {
+            guard let a else { return b }
+            guard let b else { return a }
+            return pick(a, b)
+        }
+        samples += next.samples
+        peakPingMs = worst(peakPingMs, next.peakPingMs, max)
+        lowestReceivedFps = worst(lowestReceivedFps, next.lowestReceivedFps, min)
+        lowestDecodedFps = worst(lowestDecodedFps, next.lowestDecodedFps, min)
+        lowestShownFps = worst(lowestShownFps, next.lowestShownFps, min)
+        lowestBitrateKbps = worst(lowestBitrateKbps, next.lowestBitrateKbps, min)
+        packetsLost += next.packetsLost
+        networkSilences += next.networkSilences
+        longestNetworkSilenceMs = max(longestNetworkSilenceMs, next.longestNetworkSilenceMs)
+        decoderStutters += next.decoderStutters
+        longestDecoderGapMs = max(longestDecoderGapMs, next.longestDecoderGapMs)
+        screenStutters += next.screenStutters
+        longestScreenGapMs = max(longestScreenGapMs, next.longestScreenGapMs)
+        framesNeverShown += next.framesNeverShown
+        lateDisplayTicks += next.lateDisplayTicks
+        phase = max(phase, next.phase)
+    }
+}
+
+/// The session as rows, bounded: once it is full, neighbouring rows are folded into one and
+/// each row from then on covers twice as many samples.
+struct SessionTimeline: Equatable, Encodable {
+    static let maxRows = 1_200
+
+    private(set) var rows: [SessionTimelineRow] = []
+    private var samplesPerRow = 1
+
+    mutating func record(_ sample: StreamRuntimeSample, offsetSeconds: Int) {
+        let row = SessionTimelineRow(sample, offsetSeconds: offsetSeconds)
+        if let last = rows.indices.last, rows[last].samples < samplesPerRow {
+            rows[last].absorb(row)
+            return
+        }
+        rows.append(row)
+        guard rows.count > Self.maxRows else { return }
+        rows = stride(from: 0, to: rows.count, by: 2).map { index in
+            var folded = rows[index]
+            if index + 1 < rows.count { folded.absorb(rows[index + 1]) }
+            return folded
+        }
+        samplesPerRow *= 2
+    }
+
+    private enum CodingKeys: String, CodingKey { case columns, rows }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(SessionTimelineRow.columns, forKey: .columns)
+        try container.encode(rows.map(\.values), forKey: .rows)
+    }
+}
+
 /// One point on the report's latency chart. Kept small: a two-hour session at one sample a second
 /// is 7,200 of these, and they are downsampled before they reach the view.
-struct SessionReportTrendPoint: Identifiable, Equatable {
+struct SessionReportTrendPoint: Identifiable, Equatable, Encodable {
     let offsetSeconds: Int
     let pingMs: Int
     var id: Int { offsetSeconds }
 }
 
-struct SessionReport: Identifiable, Equatable {
+struct SessionReport: Identifiable, Equatable, Encodable {
     let id = UUID()
     let gameTitle: String
     let score: Int
@@ -394,8 +510,12 @@ struct SessionReport: Identifiable, Equatable {
     /// The part of `frameDelivery` measured after the app was left and came back.
     var frameDeliveryAfterReturn: SessionFrameDelivery? = nil
     var timesAway = 0
+    /// How often the stream was closed and reopened without ending the session.
+    var reconnects = 0
     /// The part of `frameDelivery` measured while latency sat well above the session's best.
     var frameDeliveryRaisedLatency: SessionFrameDelivery? = nil
+    /// The session second by second, for a report that is sent rather than shown.
+    var timeline = SessionTimeline()
 
     /// The chart needs enough points to say something true. Four points is a lie.
     var showsTrendChart: Bool { trend.count >= 8 }
@@ -455,7 +575,8 @@ final class StreamSessionReportAccumulator {
     private var frameDelivery = SessionFrameDelivery()
     private var frameDeliveryAfterReturn = SessionFrameDelivery()
     private var timesAway = 0
-    private var wasAway = false
+    private var reconnects = 0
+    private var lastInterruption = StreamInterruptionPhase.none
     /// Latency counts as raised once it sits this far above the lowest the session has seen.
     /// The lowest is only trusted after a few readings, so a slow first second is not the bar.
     static let raisedLatencyMarginMs = 30
@@ -477,6 +598,7 @@ final class StreamSessionReportAccumulator {
     private var lastCodec: String?
     private var networkKindCounts: [SessionNetworkKind: Int] = [:]
     private var trendSamples: [SessionReportTrendPoint] = []
+    private var timeline = SessionTimeline()
     private var recoveryReason: String?
     private var finalProfile: StreamVideoProfile
     private var finalCodec: String
@@ -488,14 +610,15 @@ final class StreamSessionReportAccumulator {
         self.finalCodec = launchProfile.requestedCodec
     }
 
-    func record(_ sample: StreamRuntimeSample) {
+    func record(_ sample: StreamRuntimeSample, at time: Date = Date()) {
         if sample.carriesReportableValues { sampleCount += 1 }
+        timeline.record(sample, offsetSeconds: max(0, Int(time.timeIntervalSince(startedAt))))
 
         if let ping = sample.pingMs, ping >= 0 {
             pingCount += 1
             pingTotal += ping
             peakPingMs = max(peakPingMs ?? ping, ping)
-            appendTrendPoint(pingMs: ping)
+            appendTrendPoint(pingMs: ping, at: time)
         }
         if let bitrate = sample.bitrateKbps, bitrate >= 0 {
             bitrateCount += 1
@@ -527,10 +650,10 @@ final class StreamSessionReportAccumulator {
         // While the app is away nothing reaches the screen; counting that as lost frames would
         // bury the readings from the time it was actually being played.
         if sample.interruption == .away {
-            if !wasAway { timesAway += 1 }
-            wasAway = true
+            if lastInterruption != .away { timesAway += 1 }
         } else {
-            wasAway = false
+            // Readings stop while the app is away, so the first one back can be the only sign.
+            if sample.interruption == .returned, lastInterruption == .none { timesAway += 1 }
             frameDelivery.record(sample, targetFps: launchProfile.initialProfile.fps)
             if sample.interruption == .returned {
                 frameDeliveryAfterReturn.record(sample, targetFps: launchProfile.initialProfile.fps)
@@ -546,6 +669,7 @@ final class StreamSessionReportAccumulator {
                 frameDeliveryRaisedLatency.record(sample, targetFps: launchProfile.initialProfile.fps)
             }
         }
+        lastInterruption = sample.interruption
         consecutiveDecoderOverloadSamples = Self.isDecoderOverloadSample(
             sample,
             requestedFps: launchProfile.initialProfile.fps
@@ -581,6 +705,8 @@ final class StreamSessionReportAccumulator {
         networkKindCounts[sample.networkKind, default: 0] += 1
     }
 
+    func recordReconnect() { reconnects += 1 }
+
     func recordRecovery(reason: String, profile: StreamVideoProfile, codec: String) {
         let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
         recoveryReason = trimmed.isEmpty ? nil : trimmed
@@ -593,10 +719,10 @@ final class StreamSessionReportAccumulator {
     private var trendStride = 1
     private var trendCounter = 0
 
-    private func appendTrendPoint(pingMs: Int) {
+    private func appendTrendPoint(pingMs: Int, at time: Date) {
         trendCounter += 1
         guard trendCounter % trendStride == 0 else { return }
-        let offset = Int(Date().timeIntervalSince(startedAt))
+        let offset = Int(time.timeIntervalSince(startedAt))
         trendSamples.append(SessionReportTrendPoint(offsetSeconds: offset, pingMs: pingMs))
         if trendSamples.count > Self.maxTrendPoints {
             trendSamples = trendSamples.enumerated().filter { $0.offset.isMultiple(of: 2) }.map(\.element)
@@ -689,7 +815,9 @@ final class StreamSessionReportAccumulator {
             frameDelivery: frameDelivery.hasReadings ? frameDelivery : nil,
             frameDeliveryAfterReturn: frameDeliveryAfterReturn.hasReadings ? frameDeliveryAfterReturn : nil,
             timesAway: timesAway,
-            frameDeliveryRaisedLatency: frameDeliveryRaisedLatency.hasReadings ? frameDeliveryRaisedLatency : nil
+            reconnects: reconnects,
+            frameDeliveryRaisedLatency: frameDeliveryRaisedLatency.hasReadings ? frameDeliveryRaisedLatency : nil,
+            timeline: timeline
         )
     }
 

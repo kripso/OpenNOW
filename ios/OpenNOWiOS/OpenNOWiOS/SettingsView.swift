@@ -1705,6 +1705,9 @@ struct SettingsView: View {
         Section {
             Toggle("Session Counter", isOn: $store.settings.sessionCounterEnabled)
             Toggle("Session Report", isOn: $store.settings.showSessionReportAfterStream)
+            if ReportDestination.configuration != nil {
+                Toggle("Send Session Reports", isOn: $store.settings.sendSessionReports)
+            }
             Toggle("Chime When Ready", isOn: $store.settings.queueReadySound)
             #if !os(tvOS)
             Toggle("Queue Live Activities", isOn: $store.settings.queueLiveActivitiesEnabled)
@@ -1712,7 +1715,7 @@ struct SettingsView: View {
         } header: {
             SettingsPageHeader("Sessions")
         } footer: {
-            Text("The session report appears after a stream ends and scores how the connection held up. The chime plays once when a rig frees up, so you can put the phone down while you wait for a long queue.")
+            Text("The session report appears after a stream ends and scores how the connection held up. Sending session reports gives the developers of this build each session's measurements, the game's name and your device model, and nothing else. The chime plays once when a rig frees up, so you can put the phone down while you wait for a long queue.")
         }
     }
 
@@ -1731,7 +1734,7 @@ struct SettingsView: View {
         } header: {
             SettingsPageHeader("Privacy")
         } footer: {
-            Text("OpenNOW does not run usage analytics. Diagnostics leave this device only when you choose to export, upload logs, or submit a problem report.")
+            Text("OpenNOW does not run usage analytics. Diagnostics leave this device only when you choose to export, upload logs, submit a problem report, or turn on Send Session Reports.")
         }
     }
 
@@ -2470,6 +2473,7 @@ private struct OpenNOWPrivacyPolicyView: View {
                 Text("When you sign in, browse games, link stores, or start a stream, the app communicates directly with NVIDIA and the selected GeForce NOW alliance provider. Those services receive the account, device, network, and session information needed to provide their service under their own privacy terms.")
                 Text("Free-tier server selection can contact PrintedWaste queue endpoints. OpenNOW does not send OAuth passwords to PrintedWaste.")
                 Text("If you explicitly choose Upload Redacted Logs, OpenNOW sends a strictly sanitized diagnostic artifact to paste.rtech.support. The unlisted paste expires after seven days. The app does not upload diagnostics automatically.")
+                Text("If you submit a problem report, your description, sanitized diagnostics and the last session's measurements are sent to the developers of this build through GitHub. If you turn on Send Session Reports, each session's measurements, the game's name and your device model are sent the same way.")
             }
 
             Section("Apple Features") {

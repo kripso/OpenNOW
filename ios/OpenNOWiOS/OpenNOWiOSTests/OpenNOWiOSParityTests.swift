@@ -5849,6 +5849,214 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(steadyReport.timesAway, 0)
     }
 
+    // MARK: Reports sent to this build's own destination
+
+    func testSessionTimelineFoldsALongSessionInsteadOfGrowing() throws {
+        var timeline = SessionTimeline()
+        for second in 0..<(SessionTimeline.maxRows * 2) {
+            timeline.record(StreamRuntimeSample(
+                timestamp: 0, pingMs: second == 7 ? 180 : 25, receivedFps: second == 9 ? 31 : 60,
+                packetsLostDelta: 1,
+                arrivedCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: second == 8 ? 90 : 17, longGaps: 1),
+                interruption: second == 6 ? .away : .none, networkSilences: 2
+            ), offsetSeconds: second)
+        }
+        // Folded once on overflow, and the rows after that each cover two readings.
+        XCTAssertLessThanOrEqual(timeline.rows.count, SessionTimeline.maxRows)
+        XCTAssertEqual(timeline.rows.reduce(0) { $0 + $1.samples }, SessionTimeline.maxRows * 2)
+        XCTAssertEqual(timeline.rows.reduce(0) { $0 + $1.packetsLost }, SessionTimeline.maxRows * 2)
+        XCTAssertEqual(timeline.rows.reduce(0) { $0 + $1.networkSilences }, SessionTimeline.maxRows * 4)
+        // A folded row keeps the worst of what it covers.
+        XCTAssertEqual(timeline.rows[3].offsetSeconds, 6)
+        XCTAssertEqual(timeline.rows[3].peakPingMs, 180)
+        XCTAssertEqual(timeline.rows[3].phase, 2)
+        XCTAssertEqual(timeline.rows[4].longestDecoderGapMs, 90)
+        XCTAssertEqual(timeline.rows[4].lowestReceivedFps, 31)
+
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(timeline)) as? [String: Any])
+        let rows = try XCTUnwrap(json["rows"] as? [[Int]])
+        XCTAssertEqual(json["columns"] as? [String], SessionTimelineRow.columns)
+        XCTAssertEqual(rows.count, timeline.rows.count)
+        XCTAssertTrue(rows.allSatisfy { $0.count == SessionTimelineRow.columns.count })
+        XCTAssertEqual(rows[3][SessionTimelineRow.columns.firstIndex(of: "peakPingMs")!], 180)
+        // A reading the session never had is -1, not zero.
+        XCTAssertEqual(rows[3][SessionTimelineRow.columns.firstIndex(of: "lowestShownFps")!], -1)
+    }
+
+    func testReportDestinationNeedsARepositoryAndAToken() {
+        XCTAssertEqual(
+            ReportDestination.configuration(from: ["OpenNOWReportsRepository": " owner/reports ", "OpenNOWReportsToken": "token"]),
+            ReportDestination.Configuration(repository: "owner/reports", token: "token"))
+        // An unset build setting arrives as an empty string.
+        XCTAssertNil(ReportDestination.configuration(from: ["OpenNOWReportsRepository": "", "OpenNOWReportsToken": ""]))
+        XCTAssertNil(ReportDestination.configuration(from: ["OpenNOWReportsRepository": "owner/reports", "OpenNOWReportsToken": ""]))
+        XCTAssertNil(ReportDestination.configuration(from: ["OpenNOWReportsToken": "token"]))
+        for repository in ["owner", "owner/", "/reports", "owner/reports/extra", "owner/re ports", "owner/reports?x=1"] {
+            XCTAssertNil(ReportDestination.configuration(
+                from: ["OpenNOWReportsRepository": repository, "OpenNOWReportsToken": "token"]), repository)
+        }
+    }
+
+    private func inflatedBundle(_ payload: String) throws -> [String: Any] {
+        let compressed = try XCTUnwrap(Data(base64Encoded: payload))
+        let json = try (compressed as NSData).decompressed(using: .zlib) as Data
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: json) as? [String: Any])
+    }
+
+    func testReportRequestStartsTheIngestWorkflowWithTheWholeReport() throws {
+        var bundle = ReportBundle(kind: .session, app: .init(version: "1.0", build: "42"),
+                                  device: .init(model: "iPad16,5", system: "iPadOS 26.1"))
+        bundle.report = steadyLatencyReport()
+        let request = try ReportDestination.request(
+            bundle, id: "abc123def456", configuration: .init(repository: "owner/reports", token: "secret"))
+
+        XCTAssertEqual(request.url?.absoluteString,
+                       "https://api.github.com/repos/owner/reports/actions/workflows/ingest.yml/dispatches")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(body["ref"] as? String, "main")
+        let inputs = try XCTUnwrap(body["inputs"] as? [String: String])
+        XCTAssertEqual(inputs["id"], "abc123def456")
+        XCTAssertEqual(inputs["kind"], "session")
+
+        let sent = try inflatedBundle(XCTUnwrap(inputs["payload"]))
+        XCTAssertEqual(sent["schema"] as? Int, 1)
+        XCTAssertEqual((sent["app"] as? [String: String])?["build"], "42")
+        XCTAssertEqual((sent["device"] as? [String: String])?["model"], "iPad16,5")
+        let report = try XCTUnwrap(sent["report"] as? [String: Any])
+        XCTAssertEqual(report["gameTitle"] as? String, "Test Game")
+        XCTAssertEqual(report["rating"] as? String, bundle.report?.rating.rawValue)
+        XCTAssertNotNil((report["frameDelivery"] as? [String: Any])?["shown"])
+        XCTAssertEqual(((report["timeline"] as? [String: Any])?["rows"] as? [[Int]])?.count, 12)
+        // The token travels in the header only.
+        XCTAssertFalse(String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self).contains("secret"))
+    }
+
+    func testOversizedDiagnosticsAreCutUntilTheReportFits() throws {
+        var bundle = ReportBundle(kind: .problem, app: .init(version: "1.0", build: "42"),
+                                  device: .init(model: "iPad16,5", system: "iPadOS 26.1"))
+        bundle.title = "Stream stutters after returning"
+        // Random text does not compress, so this is far over the limit.
+        var generator = SystemRandomNumberGenerator()
+        let noise = String((0..<400_000).map { _ in Character(UnicodeScalar(UInt8.random(in: 97...122, using: &generator))) })
+        bundle.diagnostics = "HEAD" + noise + "TAIL"
+
+        let payload = try ReportDestination.payload(for: bundle)
+        XCTAssertLessThanOrEqual(payload.count, ReportDestination.maxPayloadCharacters)
+        let sent = try inflatedBundle(payload)
+        XCTAssertEqual(sent["title"] as? String, "Stream stutters after returning")
+        let diagnostics = try XCTUnwrap(sent["diagnostics"] as? String)
+        XCTAssertTrue(diagnostics.hasPrefix("HEAD"))
+        XCTAssertTrue(diagnostics.hasSuffix("TAIL"))
+        XCTAssertTrue(diagnostics.contains("[cut to fit]"))
+
+        // Small diagnostics are sent whole.
+        bundle.diagnostics = "state\nlogs"
+        XCTAssertEqual(try inflatedBundle(ReportDestination.payload(for: bundle))["diagnostics"] as? String, "state\nlogs")
+    }
+
+    func testProblemReportIsValidatedBeforeItIsSent() {
+        func submission(_ description: String) -> BugReportSubmission {
+            BugReportSubmission(title: "Stream stutters after returning", description: description, versionName: "1.0",
+                                versionCode: "42", reporterId: "br1_" + String(repeating: "a", count: 64),
+                                metadata: "{}", attachments: [])
+        }
+        XCTAssertThrowsError(try BugReportClient.validated(submission("it doesnt work")))
+        let accepted = try? BugReportClient.validated(submission(
+            "  After switching to another app and coming back the stream stutters every few seconds until I restart it.  "))
+        XCTAssertEqual(accepted?.title, "Stream stutters after returning")
+        XCTAssertEqual(accepted?.description.hasPrefix("After switching"), true)
+    }
+
+    func testSendingSessionReportsIsOffUntilChosen() throws {
+        XCTAssertFalse(try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8)).sendSessionReports)
+        XCTAssertTrue(try JSONDecoder().decode(AppSettings.self, from: Data(#"{"sendSessionReports":true}"#.utf8))
+            .sendSessionReports)
+    }
+
+    // MARK: Report and stream sharing the screen
+
+    func testAReconnectKeepsTheReportAndCountsIt() throws {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25))
+        accumulator.recordReconnect()
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 27))
+        let report = try XCTUnwrap(accumulator.finish())
+        XCTAssertEqual(report.reconnects, 1)
+        XCTAssertEqual(report.sampleCount, 2)
+    }
+
+    func testReturningCountsAsOneTimeAwayEvenWithNoReadingTakenWhileAway() throws {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25))
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, interruption: .returned))
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, interruption: .returned))
+        XCTAssertEqual(try XCTUnwrap(accumulator.finish()).timesAway, 1)
+
+        let sampledWhileAway = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        for phase in [StreamInterruptionPhase.none, .away, .away, .returned, .away, .returned] {
+            sampledWhileAway.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, interruption: phase))
+        }
+        XCTAssertEqual(try XCTUnwrap(sampledWhileAway.finish()).timesAway, 2)
+    }
+
+    @MainActor
+    func testStoreHoldsTheReportBackWhileAStreamReconnects() throws {
+        let store = OpenNOWStore()
+        store.installDebugSessionReportAfterStreamPreview()
+        XCTAssertNotNil(store.streamSession)
+
+        // Closing to reconnect neither ends the report nor shows one.
+        store.dismissStreamer(reconnecting: true)
+        XCTAssertNil(store.streamSession)
+        XCTAssertNil(store.sessionReport)
+
+        // Closing for good does, with the reconnect counted in it.
+        store.dismissStreamer()
+        XCTAssertEqual(store.sessionReport?.reconnects, 1)
+        XCTAssertEqual(store.sessionReport?.sampleCount, 300)
+    }
+
+    @MainActor
+    func testStreamPresentationWaitsForASheetThatIsAlreadyUp() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        // UIKit refuses a second presentation from the same controller, which used to leave the
+        // stream's empty container on screen.
+        let sheet = UIViewController()
+        root.present(sheet, animated: false)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(root.presentedViewController === sheet)
+
+        var dismissals = 0
+        let controller = NativeStreamPresentationController(content: AnyView(Color.black))
+        controller.onCoverChange = { up in if !up { dismissals += 1 } }
+        root.addChild(controller)
+        controller.view.frame = root.view.bounds
+        root.view.addSubview(controller.view)
+        controller.didMove(toParent: root)
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertTrue(root.presentedViewController === controller.host, "The stream goes up once the sheet has left")
+
+        // Taking the stream down reports back only when UIKit has finished, which is when a
+        // sheet may be presented again.
+        controller.tearDown()
+        XCTAssertEqual(dismissals, 0)
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertNil(root.presentedViewController)
+        XCTAssertEqual(dismissals, 1)
+    }
+
     private func steadyLatencyReport() -> SessionReport {
         let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
         for ping in [24, 26, 25, 30, 41, 25, 24, 27, 26, 25, 49, 25] {

@@ -31,6 +31,16 @@ struct ContentView: View {
                 // than it does alone, and alone is not how anyone sees it.
                 MainTabView(initialPage: .store)
                     .task { store.installDebugStorePreview() }
+            } else if ProcessInfo.processInfo.arguments.contains("--opennow-session-report-preview") {
+                MainTabView(initialPage: .store)
+                    .task {
+                        store.installDebugStorePreview()
+                        if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--opennow-report-") }) {
+                            store.installDebugSessionReportAfterStreamPreview()
+                        } else {
+                            store.installDebugSessionReportPreview()
+                        }
+                    }
             } else if ProcessInfo.processInfo.arguments.contains("--opennow-store-preview")
                         || ProcessInfo.processInfo.arguments.contains("--opennow-console-preview") {
                 HomeView()
@@ -61,6 +71,7 @@ struct ContentView: View {
                   !ProcessInfo.processInfo.arguments.contains("--opennow-store-preview"),
                   !ProcessInfo.processInfo.arguments.contains("--opennow-stream-controls-preview"),
                   !ProcessInfo.processInfo.arguments.contains("--opennow-settings-preview"),
+                  !ProcessInfo.processInfo.arguments.contains("--opennow-session-report-preview"),
                   !ProcessInfo.processInfo.arguments.contains("--opennow-details-preview"),
                   !ProcessInfo.processInfo.arguments.contains("--opennow-server-picker-preview") else { return }
             #endif
@@ -402,6 +413,9 @@ struct MainTabView: View {
     @State private var bugReportDeck: BugReportPreflightDeck?
     @State private var pendingBugReportDeck: BugReportPreflightDeck?
     @State private var sessionReportPresented = false
+    /// Streams whose full-screen controller is up or still on its way out. UIKit refuses to
+    /// present a sheet until the last one has finished leaving.
+    @State private var streamerCovers = 0
     @State private var bugReportPresented = false
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -561,7 +575,7 @@ struct MainTabView: View {
             Text(conflict.message)
         }
         .sheet(item: Binding(
-            get: { store.sessionReport },
+            get: { streamerCovers == 0 ? store.sessionReport : nil },
             set: { if $0 == nil { store.dismissSessionReport() } }
         ), onDismiss: {
             sessionReportPresented = false
@@ -656,7 +670,7 @@ struct MainTabView: View {
     }
 
     private func streamerSurface(session: ActiveSession) -> some View {
-        NativeStreamPresentation {
+        NativeStreamPresentation(onCoverChange: { up in streamerCovers = max(0, streamerCovers + (up ? 1 : -1)) }) {
         StreamerView(
             session: session,
             settings: store.currentStreamerSettings,
@@ -730,12 +744,12 @@ struct MainTabView: View {
                 presentedStreamerSession = nil
                 streamerAutoRetryCount += 1
                 store.rollBackUnconfirmedInStreamQualityChange()
-                store.dismissStreamer()
+                store.dismissStreamer(reconnecting: true)
                 store.scheduleStreamerReopen()
             } : nil,
             onReopen: {
                 presentedStreamerSession = nil
-                store.dismissStreamer()
+                store.dismissStreamer(reconnecting: true)
                 store.scheduleStreamerReopen()
             }
         )

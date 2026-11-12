@@ -6,15 +6,27 @@ import UIKit
 struct NativeStreamPresentation<Content: View>: UIViewControllerRepresentable {
     @Environment(\.scenePhase) private var scenePhase
     let content: Content
+    /// Called with `true` when a stream's controller is made and with `false` once UIKit has
+    /// finished taking it down, exactly once each. In between UIKit refuses any other
+    /// presentation, such as a sheet over the catalog.
+    let onCoverChange: (Bool) -> Void
 
-    init(@ViewBuilder content: () -> Content) { self.content = content() }
+    init(onCoverChange: @escaping (Bool) -> Void = { _ in }, @ViewBuilder content: () -> Content) {
+        self.onCoverChange = onCoverChange
+        self.content = content()
+    }
 
     func makeUIViewController(context: Context) -> NativeStreamPresentationController {
-        NativeStreamPresentationController(content: AnyView(content.environment(\.scenePhase, scenePhase)))
+        let controller = NativeStreamPresentationController(content: AnyView(content.environment(\.scenePhase, scenePhase)))
+        controller.onCoverChange = onCoverChange
+        // Not from inside the view update that is making this controller.
+        DispatchQueue.main.async { [onCoverChange] in onCoverChange(true) }
+        return controller
     }
 
     func updateUIViewController(_ controller: NativeStreamPresentationController, context: Context) {
         controller.host.rootView = AnyView(content.environment(\.scenePhase, scenePhase))
+        controller.onCoverChange = onCoverChange
     }
 
     static func dismantleUIViewController(_ controller: NativeStreamPresentationController, coordinator: ()) {
@@ -24,6 +36,7 @@ struct NativeStreamPresentation<Content: View>: UIViewControllerRepresentable {
 
 final class NativeStreamPresentationController: UIViewController {
     let host: NativeStreamHostingController
+    var onCoverChange: (Bool) -> Void = { _ in }
     private var dismantled = false
     private let orientationBeforePresentation: UIInterfaceOrientationMask
 
@@ -44,7 +57,24 @@ final class NativeStreamPresentationController: UIViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        guard !dismantled, host.presentingViewController == nil else { return }
+        presentHost()
+    }
+
+    /// UIKit refuses to present over a controller that is already presenting and reports it only
+    /// in the log, which would leave this controller's empty view on screen. A sheet over the
+    /// catalog can still be up when a stream opens, so it goes first.
+    private func presentHost() {
+        guard !dismantled, host.presentingViewController == nil, let window = view.window else { return }
+        if let blocking = window.rootViewController?.presentedViewController {
+            if !blocking.isBeingDismissed {
+                blocking.dismiss(animated: false) { [weak self] in self?.presentHost() }
+            } else if let coordinator = blocking.transitionCoordinator {
+                coordinator.animate(alongsideTransition: nil) { [weak self] _ in self?.presentHost() }
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.presentHost() }
+            }
+            return
+        }
         StreamOrientation.setStreaming(true, restoring: orientationBeforePresentation)
         present(host, animated: false)
     }
@@ -54,13 +84,17 @@ final class NativeStreamPresentationController: UIViewController {
         dismantled = true
         host.releaseSystemPreferences(restoreOrientation: false)
         if host.presentingViewController != nil {
-            host.dismiss(animated: false) { [weak self] in
+            // SwiftUI lets go of this controller before UIKit is done, so the callback is held
+            // on its own rather than reached through `self`.
+            host.dismiss(animated: false) { [weak self, onCoverChange] in
                 StreamOrientation.setStreaming(false)
                 self?.setNeedsStatusBarAppearanceUpdate()
+                onCoverChange(false)
             }
         } else {
             StreamOrientation.setStreaming(false)
             setNeedsStatusBarAppearanceUpdate()
+            DispatchQueue.main.async { [onCoverChange] in onCoverChange(false) }
         }
     }
 }

@@ -291,6 +291,9 @@ struct SessionReportView: View {
                         shown: after.shown?.longGaps ?? 0, arrived: after.arrived?.longGaps ?? 0,
                         seconds: after.cadenceSeconds)
                 }
+                if report.reconnects > 0 {
+                    measurementRow("Stream reconnects", primary: "\(report.reconnects)", secondary: nil, level: .fair)
+                }
                 if let shown = delivery.shown, shown.ticks > 0, delivery.cadenceSeconds > 0 {
                     measurementRow("Display clock",
                         primary: String(format: "%.0f Hz", Double(shown.ticks) / Double(delivery.cadenceSeconds)),

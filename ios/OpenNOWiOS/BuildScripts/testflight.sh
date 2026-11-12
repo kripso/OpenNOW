@@ -14,6 +14,15 @@
 #   IOS_OUT_DIR       where the archive and export land (default
 #                     /tmp/opennow-ios-release)
 #   IOS_SKIP_UPLOAD   set to 1 to stop after the archive
+#   IOS_REPORTS_REPO, IOS_REPORTS_TOKEN
+#                     where the build sends problem reports and, when the player
+#                     turns that on, session reports: a GitHub repository as
+#                     owner/name whose default branch has an ingest.yml workflow
+#                     taking the inputs id, kind and payload, and a fine-grained
+#                     token for that repository with the Actions permission only.
+#                     Anyone can read the token out of the app, so it must not be
+#                     able to do anything but start that workflow. Without both,
+#                     the build sends no reports.
 #
 # Both bundle IDs must be registered as App IDs, and App Store Connect must have
 # an app record for IOS_BUNDLE_ID; Apple's API cannot create that record.
@@ -52,6 +61,8 @@ PRODUCT_BUNDLE_IDENTIFIER = \$(OPENNOW_BUNDLE_ID_\$(TARGET_NAME))
 OPENNOW_BUNDLE_ID_OpenNOWiOS = $IOS_BUNDLE_ID
 OPENNOW_BUNDLE_ID_OpenNOWWidget = $IOS_BUNDLE_ID.widget
 OPENNOW_BUNDLE_ID_OpenNOWiOSTests = $IOS_BUNDLE_ID.tests
+OPENNOW_REPORTS_REPOSITORY = ${IOS_REPORTS_REPO:-}
+OPENNOW_REPORTS_TOKEN = ${IOS_REPORTS_TOKEN:-}
 EOF
 
 xcodebuild \

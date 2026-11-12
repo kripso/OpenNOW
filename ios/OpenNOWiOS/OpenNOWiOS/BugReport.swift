@@ -225,7 +225,8 @@ enum BugReportError: LocalizedError {
 
 enum BugReportClient {
 
-    static func buildRequest(_ submission: BugReportSubmission) throws -> URLRequest {
+    /// The trimmed title and description of a submission that passes every check.
+    static func validated(_ submission: BugReportSubmission) throws -> (title: String, description: String) {
         let title = submission.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let description = submission.description.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -243,6 +244,11 @@ enum BugReportClient {
         for attachment in submission.attachments where attachment.data.count > BugReportEndpoint.maxFileBytes {
             throw BugReportError.invalid("\(attachment.fileName) is larger than 10 MB.")
         }
+        return (title, description)
+    }
+
+    static func buildRequest(_ submission: BugReportSubmission) throws -> URLRequest {
+        let (title, description) = try validated(submission)
 
         let boundary = "opennow.\(UUID().uuidString)"
         var request = URLRequest(url: BugReportEndpoint.url)
@@ -380,5 +386,126 @@ enum BugReportMetadata {
             return "{}"
         }
         return String(decoding: data, as: UTF8.self)
+    }
+}
+
+// MARK: - This build's own report destination
+
+/// What one report carries. Everything here is listed by name so that nothing is sent by accident.
+struct ReportBundle: Encodable {
+    enum Kind: String, Encodable {
+        /// The measurements of one finished session.
+        case session
+        /// A "Report a Problem" submission.
+        case problem
+    }
+
+    struct App: Encodable, Equatable {
+        let version: String
+        let build: String
+    }
+
+    struct Device: Encodable, Equatable {
+        let model: String
+        let system: String
+    }
+
+    var schema = 1
+    let kind: Kind
+    let app: App
+    let device: Device
+    var title: String?
+    var description: String?
+    var reporterId: String?
+    /// The pre-flight facts, as the JSON text the form already builds.
+    var metadata: String?
+    var report: SessionReport?
+    var diagnostics: String?
+}
+
+/// Where this build sends reports: a GitHub repository of whoever built it.
+///
+/// `BuildScripts/testflight.sh` can put a repository and a token into the build. The token may
+/// only start that repository's ingest workflow, which files what it receives; it cannot read
+/// the repository, so a token taken out of the app does not expose earlier reports. A build
+/// without both sends nothing.
+enum ReportDestination {
+    struct Configuration: Equatable {
+        let repository: String
+        let token: String
+    }
+
+    static let workflow = "ingest.yml"
+    /// GitHub allows a workflow run 65,535 characters of inputs in total.
+    static let maxPayloadCharacters = 60_000
+
+    static var configuration: Configuration? {
+        configuration(from: Bundle.main.infoDictionary ?? [:])
+    }
+
+    static func configuration(from info: [String: Any]) -> Configuration? {
+        func value(_ key: String) -> String {
+            (info[key] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let repository = value("OpenNOWReportsRepository")
+        let token = value("OpenNOWReportsToken")
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+        let parts = repository.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2, !token.isEmpty,
+              parts.allSatisfy({ !$0.isEmpty && $0.unicodeScalars.allSatisfy(allowed.contains) }) else { return nil }
+        return Configuration(repository: repository, token: token)
+    }
+
+    static func newReportID() -> String {
+        String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(12))
+    }
+
+    /// Base64 of the bundle's JSON, compressed as raw deflate. Diagnostics are the one part
+    /// without a bound, so they are cut from the middle until the report fits.
+    static func payload(for bundle: ReportBundle) throws -> String {
+        var bundle = bundle
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        while true {
+            let json = try encoder.encode(bundle)
+            let payload = try (json as NSData).compressed(using: .zlib).base64EncodedString()
+            if payload.count <= maxPayloadCharacters { return payload }
+            guard let diagnostics = bundle.diagnostics, diagnostics.count > 2_000 else {
+                throw BugReportError.invalid("This report is too large to send.")
+            }
+            let kept = diagnostics.count / 4
+            bundle.diagnostics = diagnostics.prefix(kept) + "\n[cut to fit]\n" + diagnostics.suffix(kept)
+        }
+    }
+
+    static func request(_ bundle: ReportBundle, id: String, configuration: Configuration) throws -> URLRequest {
+        var request = URLRequest(url: URL(
+            string: "https://api.github.com/repos/\(configuration.repository)/actions/workflows/\(workflow)/dispatches"
+        )!)
+        request.httpMethod = "POST"
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(configuration.token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "ref": "main",
+            "inputs": ["id": id, "kind": bundle.kind.rawValue, "payload": try payload(for: bundle)]
+        ])
+        return request
+    }
+
+    /// Returns the report's ID. GitHub answers a started workflow with no body, so the ID is
+    /// made here and travels with the report.
+    static func send(_ bundle: ReportBundle, session: URLSession = .shared) async throws -> String {
+        guard let configuration else {
+            throw BugReportError.invalid("This build has nowhere to send reports.")
+        }
+        let id = newReportID()
+        let (data, response) = try await session.data(for: request(bundle, id: id, configuration: configuration))
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200...299).contains(status) else {
+            throw BugReportClient.parseServerError(
+                body: String(decoding: data.prefix(64 * 1024), as: UTF8.self), status: status)
+        }
+        return id
     }
 }

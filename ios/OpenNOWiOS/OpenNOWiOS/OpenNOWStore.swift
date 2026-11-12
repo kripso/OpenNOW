@@ -1131,6 +1131,8 @@ struct AppSettings: Codable, Equatable {
 
     // Sessions
     var showSessionReportAfterStream: Bool = false
+    /// Sends each finished session's measurements to whoever built this app. Off unless chosen.
+    var sendSessionReports: Bool = false
     var sessionReportDefaultVersion: Int = 0
     var sessionClockShowEveryMinutes: Int = 60
     var sessionClockShowDurationSeconds: Int = 30
@@ -1224,6 +1226,7 @@ struct AppSettings: Codable, Equatable {
         case streamKeyboardClearConfirmationDisabled
         case showAntiAfkIndicator
         case showSessionReportAfterStream
+        case sendSessionReports
         case sessionReportDefaultVersion
         case sessionClockShowEveryMinutes
         case sessionClockShowDurationSeconds
@@ -1353,6 +1356,7 @@ struct AppSettings: Codable, Equatable {
         streamKeyboardClearConfirmationDisabled = try container.decodeIfPresent(Bool.self, forKey: .streamKeyboardClearConfirmationDisabled) ?? false
         showAntiAfkIndicator = try container.decodeIfPresent(Bool.self, forKey: .showAntiAfkIndicator) ?? false
         showSessionReportAfterStream = try container.decodeIfPresent(Bool.self, forKey: .showSessionReportAfterStream) ?? false
+        sendSessionReports = try container.decodeIfPresent(Bool.self, forKey: .sendSessionReports) ?? false
         sessionReportDefaultVersion = try container.decodeIfPresent(Int.self, forKey: .sessionReportDefaultVersion) ?? 0
         sessionClockShowEveryMinutes = try container.decodeIfPresent(Int.self, forKey: .sessionClockShowEveryMinutes) ?? 60
         sessionClockShowDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .sessionClockShowDurationSeconds) ?? 30
@@ -7038,6 +7042,70 @@ final class OpenNOWStore: ObservableObject {
         isBootstrapping = false
     }
 
+    /// Made-up readings for a session that was left half way through and came back with raised
+    /// latency and stutters, one a second.
+    private func debugSessionReportSamples(profile: StreamVideoProfile) -> [StreamRuntimeSample] {
+        (0..<300).map { second in
+            let returned = second >= 150
+            let stutter = returned && second.isMultiple(of: 4)
+            var arrived = NativeStreamFrameCadence(frames: profile.fps, longestGapMs: stutter ? 70 : 17)
+            arrived.longGaps = stutter ? 1 : 0
+            arrived.replaced = stutter ? 2 : 0
+            var shown = arrived
+            shown.ticks = 120
+            shown.draws = profile.fps
+            shown.drawMs = 0.6 * Double(profile.fps)
+            shown.longestDrawMs = 2
+            return StreamRuntimeSample(
+                timestamp: TimeInterval(second), pingMs: returned ? 95 : 25, bitrateKbps: 41_000, jitterMs: 0,
+                fps: profile.fps, receivedFps: profile.fps, decodedFps: profile.fps, decodeMs: 2.8,
+                packetsLostDelta: 0, packetsReceivedDelta: 4_000, resolution: profile.resolutionString, codec: "H264",
+                networkKind: .wifi, displayedFps: Double(profile.fps), renderer: "Native NVST · Metal / Core Image",
+                arrivedCadence: arrived, shownCadence: shown, interruption: returned ? .returned : .none,
+                networkSilences: stutter ? 1 : 0, longestNetworkSilenceMs: stutter ? 64 : 0
+            )
+        }
+    }
+
+    /// The report sheet over the catalog, filled from made-up readings.
+    func installDebugSessionReportPreview() {
+        let profile = StreamSettingsResolver.profile(for: settings, membershipTier: nil)
+        let start = Date().addingTimeInterval(-300)
+        let accumulator = StreamSessionReportAccumulator(
+            launchProfile: StreamReportLaunchProfile(
+                gameTitle: allGames.first?.title ?? "Preview", selectedProfile: profile, eligibleProfile: profile,
+                initialProfile: profile, requestedCodec: "H264", eligibleCodec: "H264", hdrRequested: false),
+            startedAt: start)
+        for (second, sample) in debugSessionReportSamples(profile: profile).enumerated() {
+            accumulator.record(sample, at: start.addingTimeInterval(TimeInterval(second)))
+        }
+        sessionReport = accumulator.finish()
+    }
+
+    /// A stream that has readings to report, so that closing it by hand goes through the same
+    /// steps as closing a real one: the streamer leaves and the report sheet arrives. With
+    /// `--opennow-report-before-stream` the report is up first and the stream opens over it.
+    func installDebugSessionReportAfterStreamPreview() {
+        // The view's task runs again each time the catalog returns from behind a stream.
+        guard activeSession == nil, sessionReport == nil, lastFinishedSessionReport == nil else { return }
+        installDebugQueuePreview(position: 1)
+        showStreamLoading = false
+        queueOverlayVisible = false
+        settings.showSessionReportAfterStream = true
+        guard let session = activeSession else { return }
+        beginSessionReport(for: session)
+        let profile = StreamSettingsResolver.profile(for: settings, membershipTier: nil)
+        debugSessionReportSamples(profile: profile).forEach { sessionReportAccumulator?.record($0) }
+        if ProcessInfo.processInfo.arguments.contains("--opennow-report-before-stream") {
+            installDebugSessionReportPreview()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.setStreamSession(session, reason: "debug preview")
+            }
+            return
+        }
+        setStreamSession(session, reason: "debug preview")
+    }
+
     func installDebugLibraryPreview() {
         installDebugStorePreview()
         user = UserProfile(userId: "library-preview", displayName: "Preview", email: nil, membershipTier: "Free")
@@ -8547,8 +8615,15 @@ final class OpenNOWStore: ObservableObject {
         }
     }
 
-    func dismissStreamer() {
-        finalizeSessionReport(reason: "dismissStreamer")
+    /// `reconnecting` is for a stream that is about to reopen: its report keeps collecting, so
+    /// the readings from before the reconnect stay with the ones after it, and no report sheet
+    /// comes up between the two.
+    func dismissStreamer(reconnecting: Bool = false) {
+        if reconnecting {
+            sessionReportAccumulator?.recordReconnect()
+        } else {
+            finalizeSessionReport(reason: "dismissStreamer")
+        }
         sessionAvailability = .checking
         setStreamSession(nil, reason: "dismissStreamer")
         showStreamLoading = false
@@ -8737,11 +8812,44 @@ final class OpenNOWStore: ObservableObject {
         guard let accumulator = sessionReportAccumulator else { return }
         sessionReportAccumulator = nil
         sessionReportSessionId = nil
-        guard settings.showSessionReportAfterStream, let report = accumulator.finish() else { return }
+        guard let report = accumulator.finish() else { return }
+        lastFinishedSessionReport = report
+        if settings.sendSessionReports { sendSessionReport(report) }
+        guard settings.showSessionReportAfterStream else { return }
         logger.notice(
             "session report reason=\(reason, privacy: .public) score=\(report.score) samples=\(report.sampleCount)"
         )
         sessionReport = report
+    }
+
+    /// The last finished session, kept so that a problem reported afterwards carries its
+    /// measurements even once the report sheet is closed, or was never shown.
+    private var lastFinishedSessionReport: SessionReport?
+
+    private func reportBundle(_ kind: ReportBundle.Kind) -> ReportBundle {
+        var system = "iOS"
+        #if canImport(UIKit)
+        system = "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
+        #endif
+        return ReportBundle(
+            kind: kind,
+            app: .init(version: Self.appVersionName, build: Self.appVersionCode),
+            device: .init(model: OpenNOWPlatform.modelIdentifier, system: system)
+        )
+    }
+
+    private func sendSessionReport(_ report: SessionReport) {
+        guard ReportDestination.configuration != nil else { return }
+        var bundle = reportBundle(.session)
+        bundle.report = report
+        Task {
+            do {
+                let id = try await ReportDestination.send(bundle)
+                logger.notice("session report sent id=\(id, privacy: .public)")
+            } catch {
+                logger.error("session report not sent error=\(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     /// Persists a settings change made from inside the stream.
@@ -8929,7 +9037,18 @@ final class OpenNOWStore: ObservableObject {
             attachments: [diagnosticsAttachment]
         )
         do {
-            let reference = try await BugReportClient.upload(submission)
+            // This build's reports go to whoever built it, never to the upstream project: the
+            // maintainers there cannot act on a report about code they do not have.
+            let (title, description) = try BugReportClient.validated(submission)
+            var bundle = reportBundle(.problem)
+            bundle.title = title
+            bundle.description = description
+            bundle.reporterId = reporterId
+            bundle.metadata = submission.metadata
+            // Reported from inside a stream, the session still running is the one meant.
+            bundle.report = sessionReportAccumulator?.finish() ?? lastFinishedSessionReport
+            bundle.diagnostics = diagnostics
+            let reference = try await ReportDestination.send(bundle)
             logger.notice("bug report accepted reference=\(reference, privacy: .public)")
             return .success(reference)
         } catch {
@@ -10165,6 +10284,8 @@ final class OpenNOWStore: ObservableObject {
         )
         streamSession = session
         if let session {
+            // A stream and the report of the one before it never share the screen.
+            sessionReport = nil
             beginSessionReport(for: session)
         }
         syncTrackedSessionSurface()
