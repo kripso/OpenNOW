@@ -52,6 +52,7 @@ struct NativeStreamNVSTSample: Sendable {
     let pixelFormat: String
     let bitstream: String
     let detail: String
+    var networkSilences = NvstSocketSilenceMeter.Window()
 }
 
 /// A protocol keeps the iOS 17 hardware API isolated from the app's iOS 16 deployment target.
@@ -414,7 +415,8 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
             lost: stats.finalizedLossPackets, packets: stats.authenticatedPackets, resolution: decoder.decodedResolution,
             decodeMilliseconds: state.decodeP50Milliseconds, pingMilliseconds: ping >= 0 ? ping : nil,
             jitterMilliseconds: Double(stats.lastJitter) / 90, hardware: decoder.isHardwareAccelerated,
-            pixelFormat: decoder.outputPixelFormatName, bitstream: decoder.bitstreamFormat?.summary ?? "pending", detail: detail))
+            pixelFormat: decoder.outputPixelFormatName, bitstream: decoder.bitstreamFormat?.summary ?? "pending", detail: detail,
+            networkSilences: receiver.drainSilences()))
     }
 
     private func fail(_ reason: String) {

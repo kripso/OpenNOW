@@ -59,6 +59,13 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
     private let adoptedDescriptor: Int32
     private let counterLock = NSLock()
     private var counters = NvstInboundCounters()
+    private var silences = NvstSocketSilenceMeter()
+
+    /// Stretches in which the socket received nothing, since the last call.
+    public func drainSilences() -> NvstSocketSilenceMeter.Window {
+        counterLock.lock(); defer { counterLock.unlock() }
+        return silences.drain()
+    }
 
     public var onAccessUnit: (@Sendable (NvstAccessUnit) -> Void)?
     /// The reference chain broke. The argument is the frame the damage landed in when the receiver
@@ -151,6 +158,11 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
         var flags = fcntl(descriptor, F_GETFL, 0)
         flags |= O_NONBLOCK
         _ = fcntl(descriptor, F_SETFL, flags)
+        // Tell the system what this flow is. A game stream is interactive video: low tolerance
+        // for delay, and it should be queued and scheduled as that from the socket down to the
+        // Wi-Fi layer rather than as best-effort data.
+        var serviceType = NET_SERVICE_TYPE_VI
+        setsockopt(descriptor, SOL_SOCKET, SO_NET_SERVICE_TYPE, &serviceType, socklen_t(MemoryLayout<Int32>.size))
         socketDescriptor = descriptor
 
         let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
@@ -308,10 +320,12 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
         var readThisWakeUp = 0
         let drainStart = DispatchTime.now().uptimeNanoseconds
         defer {
-            let elapsed = DispatchTime.now().uptimeNanoseconds - drainStart
+            let drainEnd = DispatchTime.now().uptimeNanoseconds
+            let elapsed = drainEnd - drainStart
             counterLock.lock()
             counters.datagramsPerWakeUp[min(readThisWakeUp, 8), default: 0] += 1
             counters.drainNanoseconds += elapsed
+            if readThisWakeUp > 0 { silences.observe(wakeStart: drainStart, wakeEnd: drainEnd) }
             counterLock.unlock()
         }
         for _ in 0..<Self.maxDatagramsPerWakeUp {
@@ -648,5 +662,47 @@ extension NvstMjolnirReceiver {
         let elapsed = DispatchTime.now().uptimeNanoseconds
         guard elapsed > sentAt else { return }
         lastRoundTripMilliseconds = Double(elapsed - sentAt) / 1_000_000
+    }
+}
+
+/// How long the socket goes without receiving anything.
+///
+/// A stream sends packets every millisecond or two, and at least one per frame even on a still
+/// picture. A stretch of 30 ms or more with none means nothing reached this device for a whole
+/// frame's turn: the network held the packets back, whatever the frame counters say afterwards.
+/// Measured here, before reassembly and decoding, so a quiet network can be told apart from a
+/// slow receiver.
+public struct NvstSocketSilenceMeter: Sendable {
+    public struct Window: Equatable, Sendable {
+        public var count = 0
+        public var longestMilliseconds = 0.0
+        public init(count: Int = 0, longestMilliseconds: Double = 0) {
+            self.count = count
+            self.longestMilliseconds = longestMilliseconds
+        }
+    }
+
+    public static let thresholdNanoseconds: UInt64 = 30_000_000
+    /// Longer than this is the stream being paused or the app being away, not a silence.
+    static let pauseNanoseconds: UInt64 = 3_000_000_000
+
+    private var lastWakeEnd: UInt64?
+    private var window = Window()
+
+    public init() {}
+
+    /// One wake-up of the socket that read at least one datagram.
+    public mutating func observe(wakeStart: UInt64, wakeEnd: UInt64) {
+        defer { lastWakeEnd = wakeEnd }
+        guard let lastWakeEnd, wakeStart > lastWakeEnd else { return }
+        let gap = wakeStart - lastWakeEnd
+        guard gap >= Self.thresholdNanoseconds, gap < Self.pauseNanoseconds else { return }
+        window.count += 1
+        window.longestMilliseconds = max(window.longestMilliseconds, Double(gap) / 1_000_000)
+    }
+
+    public mutating func drain() -> Window {
+        defer { window = Window() }
+        return window
     }
 }

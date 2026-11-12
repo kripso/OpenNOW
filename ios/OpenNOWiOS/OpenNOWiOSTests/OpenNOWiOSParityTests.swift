@@ -2910,6 +2910,31 @@ final class OpenNOWiOSParityTests: XCTestCase {
         mailbox.complete()
     }
 
+    func testASocketThatGoesQuietForAFramesTurnIsCountedAsANetworkSilence() throws {
+        var meter = NvstSocketSilenceMeter()
+        let ms: UInt64 = 1_000_000
+        // Packets flowing every couple of milliseconds, then nothing for 110 ms, then a burst.
+        meter.observe(wakeStart: 0, wakeEnd: 1 * ms)
+        meter.observe(wakeStart: 3 * ms, wakeEnd: 4 * ms)
+        meter.observe(wakeStart: 24 * ms, wakeEnd: 25 * ms)
+        meter.observe(wakeStart: 135 * ms, wakeEnd: 140 * ms)
+        meter.observe(wakeStart: 141 * ms, wakeEnd: 142 * ms)
+        meter.observe(wakeStart: 172 * ms, wakeEnd: 173 * ms)
+        XCTAssertEqual(meter.drain(), .init(count: 2, longestMilliseconds: 110))
+        // A pause of seconds (the stream stopped, or the app was away) is not a silence.
+        meter.observe(wakeStart: 9_000 * ms, wakeEnd: 9_001 * ms)
+        XCTAssertEqual(meter.drain(), .init())
+
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 20, networkSilences: 2, longestNetworkSilenceMs: 110))
+        accumulator.record(StreamRuntimeSample(timestamp: 1, pingMs: 20, networkSilences: 1, longestNetworkSilenceMs: 45))
+        let delivery = try XCTUnwrap(accumulator.finish()?.frameDelivery)
+        XCTAssertEqual(delivery.networkSilences, 3)
+        XCTAssertEqual(delivery.longestNetworkSilenceMs, 110, accuracy: 0.001)
+        // A transport that cannot see its socket reports no reading at all, not zero.
+        XCTAssertNil(steadyLatencyReport().frameDelivery?.networkSilences)
+    }
+
     func testLatencyAndRouteComeFromThePairTheStreamIsUsing() {
         func pair(rtt: Double, bytes: Int, nominated: Bool = true) -> [String: NSObject] {
             ["currentRoundTripTime": NSNumber(value: rtt), "bytesReceived": NSNumber(value: bytes),

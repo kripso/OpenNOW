@@ -213,6 +213,9 @@ struct StreamRuntimeSample: Equatable {
     var pipConvertMs: Double? = nil
     /// The kind of network route the stream is on, without addresses.
     var route: String? = nil
+    /// Stretches of 30 ms or more in which the network socket received nothing.
+    var networkSilences: Int? = nil
+    var longestNetworkSilenceMs: Double? = nil
 
     var carriesReportableValues: Bool {
         pingMs != nil
@@ -274,7 +277,7 @@ struct SessionFrameDelivery: Equatable {
     var averageReceiveBufferMs: Double? {
         receiveBufferSamples > 0 ? receiveBufferTotal / Double(receiveBufferSamples) : nil
     }
-    var hasReadings: Bool { seconds > 0 || arrived != nil || shown != nil }
+    var hasReadings: Bool { seconds > 0 || arrived != nil || shown != nil || networkSilences != nil }
 
     private static func adding(_ window: NativeStreamFrameCadence?, to total: NativeStreamFrameCadence?) -> NativeStreamFrameCadence? {
         guard let window else { return total }
@@ -282,6 +285,10 @@ struct SessionFrameDelivery: Equatable {
         total.add(window)
         return total
     }
+
+    /// Network silences, where the transport can measure them at its own socket.
+    private(set) var networkSilences: Int?
+    private(set) var longestNetworkSilenceMs = 0.0
 
     /// The routes the stream took, in order, each listed once per switch.
     private(set) var routes: [String] = []
@@ -316,6 +323,10 @@ struct SessionFrameDelivery: Equatable {
             pingTotal += ping
         }
         if let route = sample.route, !route.isEmpty, routes.last != route, routes.count < 8 { routes.append(route) }
+        if let silences = sample.networkSilences {
+            networkSilences = (networkSilences ?? 0) + max(0, silences)
+            longestNetworkSilenceMs = max(longestNetworkSilenceMs, sample.longestNetworkSilenceMs ?? 0)
+        }
         if let buffer = sample.receiveBufferMs, buffer >= 0 {
             receiveBufferSamples += 1
             receiveBufferTotal += buffer

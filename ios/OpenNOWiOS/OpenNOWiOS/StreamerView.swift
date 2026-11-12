@@ -3709,10 +3709,13 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             decodedFps: decodedFPS, decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
             packetsLostDelta: lostDelta, packetsReceivedDelta: packetsDelta, packetLossPercent: loss,
             resolution: resolution, codec: selectedCodec.rawValue.uppercased(), networkKind: deviceStatus.networkTransport.sessionNetworkKind,
-            displayedFps: statsSnapshot.presentationRates?.displayedFPS, renderer: statsSnapshot.effects,
+            displayedFps: statsSnapshot.presentationRates?.displayedFPS,
+            renderer: "Native NVST · \(statsSnapshot.effects)",
             arrivedCadence: cadence?.arrived, shownCadence: cadence?.shown,
             interruption: interruptionPhase, pipActive: isPictureInPictureActive && latestScenePhase == .active,
-            pipFrames: pip.frames, pipConvertMs: pip.milliseconds))
+            pipFrames: pip.frames, pipConvertMs: pip.milliseconds,
+            networkSilences: sample.networkSilences.count,
+            longestNetworkSilenceMs: sample.networkSilences.longestMilliseconds))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }
@@ -5581,7 +5584,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 resendRequestDelta: monotonicDelta(current: receiverCounters.resendRequests,
                                                    previous: lastStatsReceiverCounters.resendRequests),
                 framesDroppedDelta: monotonicDelta(current: framesDropped, previous: lastStatsReceiverCounters.framesDropped),
-                renderer: decoderImplementation.map { "\($0) · \(statsSnapshot.effects)" } ?? statsSnapshot.effects,
+                renderer: "WebRTC · " + (decoderImplementation.map { "\($0) · \(statsSnapshot.effects)" } ?? statsSnapshot.effects),
                 arrivedCadence: cadence?.arrived,
                 shownCadence: cadence?.shown,
                 receiveBufferMs: receiverCounters.bufferMs(since: lastStatsReceiverCounters),

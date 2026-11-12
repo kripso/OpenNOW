@@ -256,6 +256,11 @@ struct SessionReportView: View {
                 measurementRow("Lost at display", primary: seconds(delivery.displayShort),
                     secondary: delivery.averageDisplayedFps.map { String(format: "shown %.0f fps", $0) },
                     level: level(delivery.displayShort))
+                if let silences = delivery.networkSilences {
+                    measurementRow("Network silences", primary: "\(silences)",
+                        secondary: String(format: "30 ms or more · longest %.0f ms", delivery.longestNetworkSilenceMs),
+                        level: silences > 0 ? .fair : .good)
+                }
                 if let arrived = delivery.arrived {
                     measurementRow("Stutters from the decoder", primary: "\(arrived.longGaps)",
                         secondary: String(format: "longest gap %.0f ms", arrived.longestGapMs),
