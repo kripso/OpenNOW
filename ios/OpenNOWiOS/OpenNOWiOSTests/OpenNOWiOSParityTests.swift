@@ -482,6 +482,42 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertNil(SessionConnectionPolicy.resolve(session: [:], fallbackHost: "seat.example"))
     }
 
+    /// The stream is presented by UIKit, where the SwiftUI scene phase reaches it at launch and
+    /// never again. Leaving and returning must still be seen, from the app's own notifications.
+    @MainActor
+    func testTheStreamSeesTheAppLeaveAndReturn() {
+        var session = Self.makeActiveSession(game: Self.makeGame(title: "Away", controls: []), status: 3)
+        session.nativeTransportRequired = true
+        session.nativeRtspsEndpoints = ["rtsps://native.example:322"]
+        var settings = AppSettings.default
+        // Fails before any connection is attempted, so the test never touches the network.
+        settings.experimentalNativeNVSTEnabled = false
+        let coordinator = NativeStreamCoordinator(
+            session: session, settings: settings, membershipTier: "FREE", sessionHistory: nil,
+            onTouchLayoutChange: { _, _ in }, onStreamerPreferencesChange: { _ in },
+            onStreamSharpeningChange: { _, _ in }, onFingerMouseEnabledChange: { _ in },
+            onPhoneRumbleFallbackChange: { _ in }, onStreamTutorialCompleted: {},
+            onControllerTouchPromptDismissed: {}, onStatsOverlayChange: { _ in },
+            onTransportStable: {}, onSelectedVideoProfileRetry: { _ in }, onRuntimeSample: { _ in },
+            onSettingsChange: { _ in }, onBuildBugReportDeck: { BugReportPreflightDeck() },
+            onSubmitBugReport: { _, _ in .failure(BugReportError.invalid("Test")) }, onClose: {}, onRetry: nil)
+        coordinator.start(viewportSize: CGSize(width: 844, height: 390))
+        XCTAssertEqual(coordinator.interruptionPhase, .none)
+        let center = NotificationCenter.default
+        // Control Center or a pulled-down notification only resigns active: not leaving.
+        center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        XCTAssertEqual(coordinator.interruptionPhase, .none)
+        center.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        XCTAssertEqual(coordinator.interruptionPhase, .away)
+        center.post(name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(coordinator.interruptionPhase, .returned)
+        // Once the stream has stopped it no longer follows the app.
+        coordinator.stop()
+        center.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        XCTAssertEqual(coordinator.interruptionPhase, .returned)
+    }
+
     @MainActor
     func testDisabledNativePreferenceRejectsNativeOnlyAllocationBeforeStartup() throws {
         var session = Self.makeActiveSession(game: Self.makeGame(title: "Transport", controls: []), status: 3)

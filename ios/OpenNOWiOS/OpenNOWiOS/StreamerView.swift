@@ -3259,8 +3259,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private let onClose: () -> Void
     private let onRetry: (() -> Void)?
     private let logger = Logger(subsystem: "OpenNOWiOS", category: "NativeStreamer")
-    /// Logs each time the app stops or starts being the active one during a stream, at a level the
-    /// diagnostics bundle keeps, so a report's timeline can be lined up with leaving and returning.
+    /// Follows the app leaving and returning during a stream. The SwiftUI scene phase stops
+    /// reaching this view once it is presented by UIKit: it arrives at launch and never again, so
+    /// leaving the app was never seen (no time away in any report, no reconnect on return). Also
+    /// logs each change at a level the diagnostics bundle keeps.
     private var appStateObservers: [NSObjectProtocol] = []
     private let workQueue = DispatchQueue(label: "OpenNOW.NativeStreamer")
     private var nativeNVST: (any NativeStreamNVSTTransport)?
@@ -3336,7 +3338,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var lastStatsPacketsReceived: Int?
     private var lastStatsReceiverCounters = NativeStreamReceiverCounters()
     private var sceneHasBeenAway = false
-    private var interruptionPhase: StreamInterruptionPhase {
+    var interruptionPhase: StreamInterruptionPhase {
         latestScenePhase != .active ? .away : (sceneHasBeenAway ? .returned : .none)
     }
     private var mediaTransportConnected = false
@@ -3532,7 +3534,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         started = true
         stopped = false
         self.viewportSize = viewportSize
-        observeAppStateForDiagnostics()
+        observeAppState()
         batteryMonitoringWasEnabled = UIDevice.current.isBatteryMonitoringEnabled
         UIDevice.current.isBatteryMonitoringEnabled = true
         if let error = session.transportPreferenceError(settings: settings) {
@@ -6003,16 +6005,20 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         logger.info("\(message, privacy: .public)")
     }
 
-    private func observeAppStateForDiagnostics() {
-        let events: [(Notification.Name, String)] = [
-            (UIApplication.willResignActiveNotification, "inactive"),
-            (UIApplication.didEnterBackgroundNotification, "background"),
-            (UIApplication.willEnterForegroundNotification, "foreground"),
-            (UIApplication.didBecomeActiveNotification, "active"),
+    private func observeAppState() {
+        // Only real leaving and returning move the phase. Resigning active alone (Control Center,
+        // a notification pulled down) is left out: it would start Picture in Picture over the game.
+        let events: [(Notification.Name, String, ScenePhase?)] = [
+            (UIApplication.willResignActiveNotification, "inactive", nil),
+            (UIApplication.didEnterBackgroundNotification, "background", .background),
+            (UIApplication.willEnterForegroundNotification, "foreground", nil),
+            (UIApplication.didBecomeActiveNotification, "active", .active),
         ]
-        appStateObservers = events.map { name, label in
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [logger] _ in
+        appStateObservers = events.map { name, label, phase in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self, logger] _ in
                 logger.notice("App state \(label, privacy: .public) during stream")
+                guard let self, let phase, phase != latestScenePhase else { return }
+                handleScenePhase(phase)
             }
         }
     }
