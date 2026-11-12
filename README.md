@@ -98,8 +98,10 @@ The [plugin guide](decky/README.md) walks through installing Decky Loader and th
 
 These projects are separate from the Qt desktop app.
 
-- Try the iOS beta through [TestFlight](https://testflight.apple.com/join/u1XPJKH2).
-  The SwiftUI prototype is on the [`kief5555/ios` branch](https://github.com/OpenCloudGaming/OpenNOW/tree/kief5555/ios/ios/OpenNOWiOS).
+- Try this fork's iOS beta through [TestFlight](https://testflight.apple.com/join/sJpHCPZ7).
+  The app is in [`ios/OpenNOWiOS`](ios/OpenNOWiOS). The upstream beta is a
+  [separate TestFlight](https://testflight.apple.com/join/u1XPJKH2), built from the upstream
+  [`kief5555/ios` branch](https://github.com/OpenCloudGaming/OpenNOW/tree/kief5555/ios/ios/OpenNOWiOS).
 - Get the Android app from [Google Play](https://play.google.com/store/apps/details?id=com.opencloudgaming.opennow).
 - Get [OpenNOW-Switch](https://github.com/OpenCloudGaming/OpenNOW-Switch/releases/latest)
   for a modded Nintendo Switch. It runs as native Horizon OS homebrew.

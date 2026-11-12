@@ -1,0 +1,565 @@
+import CoreGraphics
+import Foundation
+
+enum SettingsPage: String, CaseIterable, Hashable, Identifiable {
+    case privacy, appData
+    case streamQuality, video, connection
+    case keyboard, pointer, nativeTouch, touchController, controller
+    case appearance, catalog, stats, streamControls, sessions
+    case experimental, diagnostics
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .privacy: return String(localized: "Privacy")
+        case .appData: return String(localized: "App Data")
+        case .streamQuality: return String(localized: "Stream Quality")
+        case .video: return String(localized: "Video & Display")
+        case .connection: return String(localized: "Connection")
+        case .keyboard: return String(localized: "Audio & Keyboard")
+        case .pointer: return String(localized: "Mouse & Pointer")
+        case .nativeTouch: return String(localized: "Touch Input")
+        case .touchController: return String(localized: "On-Screen Controller")
+        case .controller: return String(localized: "Physical Controller")
+        case .appearance: return String(localized: "Appearance")
+        case .catalog: return String(localized: "Catalog & Navigation")
+        case .stats: return String(localized: "Stream Statistics")
+        case .streamControls: return String(localized: "Stream Controls")
+        case .sessions: return String(localized: "Sessions & Queue")
+        case .experimental: return String(localized: "Experimental")
+        case .diagnostics: return String(localized: "Diagnostics & Support")
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .privacy: return String(localized: "Local data and privacy policy")
+        case .appData: return String(localized: "Welcome tour, tutorials, cache, and reset")
+        case .streamQuality: return String(localized: "Preset, resolution, frame rate, and bitrate")
+        case .video: return String(localized: "Codec, color, HDR, MetalFX, and sharpening")
+        case .connection: return String(localized: "Region, server selector, native receiver, and proxy")
+        case .keyboard: return String(localized: "Game sound, layout, language, and paste")
+        case .pointer: return String(localized: "Sensitivity, scrolling, and mouse modes")
+        case .nativeTouch: return String(localized: "Native touch routing and tap stability")
+        case .touchController: return String(localized: "Preset, sticks, size, and placement")
+        case .controller: return String(localized: "Game input, vibration, and shortcuts")
+        case .appearance: return String(localized: "Accent, surfaces, and selection effects")
+        case .catalog: return String(localized: "Launch page, cards, and wallpaper")
+        case .stats: return String(localized: "HUD style, position, metrics, and clock")
+        case .streamControls: return String(localized: "Immersive mode and keep session awake")
+        case .sessions: return String(localized: "Counter, report, ready chime, and Live Activities")
+        case .experimental: return String(localized: "L4S low-latency networking")
+        case .diagnostics: return String(localized: "Decoders, network logs, and problem reports")
+        }
+    }
+
+    private var keywords: String {
+        switch self {
+        case .privacy: return "general analytics telemetry tracking usage policy"
+        case .appData: return "general setup onboarding tutorial replay stream guide clear reload catalog image cache favorites favourites launchers defaults reset app data"
+        case .streamQuality: return "stream recommended data saver quality custom aspect ratio fps max bitrate mbps stretch fill bandwidth"
+        case .video: return "stream h264 h265 hevc av1 8-bit 10-bit 420 444 4:4:4 hdr metal 4 metal4 metalfx upscaling sharpness display"
+        case .connection: return "stream network server region skip hide selector native nvst receiver experimental session proxy url"
+        case .keyboard: return "input audio sound mute keyboard game language layout clipboard paste clear text confirmation"
+        case .pointer: return "input mouse acceleration scroll finger direct click controller cursor sensitivity"
+        case .nativeTouch: return "input native touch automatic never always scroll speed jitter tap stability 444 4:4:4"
+        case .touchController: return "input touch virtual gamepad gamecontroller joystick sticks dead zone aim lock split touchpad style opacity scale buttons size edge bottom padding offset placement reset layout xbox geforce"
+        case .controller: return "input physical bluetooth gamepad passthrough rumble haptics vibration phone shortcuts prompt"
+        case .appearance: return "interface ui theme accent color expressive surfaces animated selection reduce motion accessibility"
+        case .catalog: return "interface store library launch page console home compact cards titles favorite favourite badge size labels background wallpaper photo image"
+        case .stats: return "interface stream statistics hud overlay fps displayed ping latency decode bitrate packet loss renderer gpu codec resolution server battery network time clock metrics position"
+        case .streamControls: return "interface stream buttons immersive hide controls afk idle keep awake"
+        case .sessions: return "interface session counter timer clock report quality summary queue ready chime sound live activities notifications"
+        case .experimental: return "advanced experimental l4s latency networking"
+        case .diagnostics: return "advanced support bug problem report issue feedback codec decoders hardware probe debug network log logs export upload redacted diagnostics copy summary"
+        }
+    }
+
+    func matches(_ query: String) -> Bool {
+        let tokens = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .split(whereSeparator: \.isWhitespace)
+        let haystack = "\(title) \(summary) \(keywords)"
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        return tokens.allSatisfy { haystack.contains($0) }
+    }
+}
+
+extension AppSettings {
+    mutating func resetDefaultTouchLayout() {
+        touch.resetLayout()
+        touchControlLayouts["default"] = .preset(for: "default")
+    }
+}
+
+// These presets select the streamed input size; MetalFX spatial has no quality knob.
+enum MetalFXQualityPreset: String, Codable, CaseIterable, Identifiable {
+    case manual, quality, balanced, performance
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+    var inputScale: CGFloat? {
+        switch self {
+        case .manual: return nil
+        case .quality: return 0.85
+        case .balanced: return 2.0 / 3.0
+        case .performance: return 0.5
+        }
+    }
+}
+
+// MARK: - Microphone
+
+/// Mirrors Android's `MicrophoneMode`. The previous iOS build had a single `keepMicEnabled`
+/// boolean, which cannot express push-to-talk.
+enum MicrophoneMode: String, Codable, CaseIterable, Identifiable {
+    case disabled
+    case pushToTalk = "push-to-talk"
+    case voiceActivity = "voice-activity"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .disabled: return "Off"
+        case .pushToTalk: return "Push to talk"
+        case .voiceActivity: return "Voice activity"
+        }
+    }
+
+    var isEnabled: Bool { self != .disabled }
+}
+
+// MARK: - Touch routing
+
+/// Whether fingers reach the host as real touch rather than being turned into a cursor.
+///
+/// `automatic` limits it to games known to react to a touch device, which is the whole feature for
+/// most people. The other two exist because that list is maintained by hand and will lag reality.
+enum NativeTouchMode: String, Codable, CaseIterable, Identifiable {
+    case automatic
+    case never
+    case always
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .automatic: return "Automatic"
+        case .never: return "Never"
+        case .always: return "Always"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .automatic: return "Use touch only in games known to support it"
+        case .never: return "Always send a mouse cursor instead"
+        case .always: return "Send touch to every game"
+        }
+    }
+}
+
+/// The end state the touch routing actually resolves to, so the settings row can show it.
+/// Android exposes the inputs and leaves the user to work out the result; showing the result is
+/// the difference between a comprehensible screen and a confusing one.
+enum ResolvedTouchMode: Equatable {
+    case nativeTouch
+    /// Touch is wanted, but this session was created without the digitizer that would receive it.
+    /// The host decides that once, when the session starts, so the only way out is a new session.
+    case nativeTouchUnavailable
+    case trackpadCursor(directClick: Bool)
+    case virtualGamepad
+    case inert
+
+    var label: String {
+        switch self {
+        case .nativeTouch: return "Native touch"
+        case .nativeTouchUnavailable: return "Native touch — needs a new session"
+        case .trackpadCursor(let directClick): return directClick ? "Trackpad, direct click" : "Trackpad cursor"
+        case .virtualGamepad: return "Virtual gamepad"
+        case .inert: return "Touch does nothing"
+        }
+    }
+}
+
+enum TouchJoystickMode: String, Codable, CaseIterable, Identifiable {
+    case fixed
+    case dynamic
+
+    var id: String { rawValue }
+    var label: String { self == .fixed ? "Fixed" : "Follow finger" }
+}
+
+enum TouchControlMode: String, Codable, CaseIterable, Identifiable {
+    case virtualSticks
+    case splitTouchpad
+
+    var id: String { rawValue }
+    var label: String { self == .virtualSticks ? "Virtual sticks" : "Split touchpad" }
+}
+
+enum TouchControllerPreset: String, Codable, CaseIterable, Identifiable {
+    case standard
+    case geForceNOW
+    case xbox
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .standard: return "Standard"
+        case .geForceNOW: return "GeForce NOW"
+        case .xbox: return "Xbox"
+        }
+    }
+    var next: Self { Self.allCases[(Self.allCases.firstIndex(of: self)! + 1) % Self.allCases.count] }
+    var usesIndependentControls: Bool { self != .standard }
+    var supportsControlModeSelection: Bool { self == .standard }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        // Retired preset selections must not invalidate the user's saved app settings.
+        if value == "mobileGame" {
+            self = .standard
+        } else if let preset = Self(rawValue: value) {
+            self = preset
+        } else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unknown touch controller preset: \(value)")
+        }
+    }
+}
+
+enum TouchAimMode: String, Codable, CaseIterable, Identifiable {
+    case lockJoystick
+    case lockZone
+
+    var id: String { rawValue }
+    var label: String { self == .lockJoystick ? "Lock to stick" : "Lock to zone" }
+}
+
+enum TouchControllerStyle: String, Codable, CaseIterable, Identifiable {
+    case solid
+    case outline
+
+    var id: String { rawValue }
+    var label: String { self == .solid ? "Solid" : "Outline" }
+}
+
+// MARK: - Catalog backdrop
+
+enum CatalogWallpaperPreset: String, Codable, CaseIterable, Identifiable {
+    case colorfulAbstract = "colorful-abstract"
+    case original
+    case absoluteCinema = "absolute-cinema"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .colorfulAbstract: return "Colorful Abstract"
+        case .original: return "Original"
+        case .absoluteCinema: return "Absolute Cinema"
+        }
+    }
+}
+
+// MARK: - Stats HUD
+
+/// Optional metrics the in-stream HUD can show. Defaults match Android so a user moving between
+/// platforms sees the same four readouts.
+struct StreamStatsMetrics: Codable, Equatable {
+    var fps: Bool = true
+    var displayedFPS: Bool = false
+    var renderer: Bool = false
+    var gpu: Bool = false
+    var ping: Bool = true
+    var bitrate: Bool = false
+    var battery: Bool = true
+    var sessionBattery: Bool = false
+    var connection: Bool = true
+    var resolution: Bool = false
+    var codec: Bool = false
+    var location: Bool = false
+    var latency: Bool = false
+    var packetLoss: Bool = false
+
+    var enabledCount: Int {
+        [fps, displayedFPS, renderer, gpu, ping, bitrate, battery, sessionBattery, connection, resolution, codec, location, latency, packetLoss]
+            .filter { $0 }
+            .count
+    }
+
+    /// A HUD with nothing in it is a bug the user cannot recover from without finding this screen
+    /// again, so the last metric cannot be turned off — the HUD toggle is the way to hide it.
+    var isMinimallyPopulated: Bool { enabledCount > 0 }
+
+    static let `default` = StreamStatsMetrics()
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        fps = try c.decodeIfPresent(Bool.self, forKey: .fps) ?? true
+        displayedFPS = try c.decodeIfPresent(Bool.self, forKey: .displayedFPS) ?? false
+        renderer = try c.decodeIfPresent(Bool.self, forKey: .renderer) ?? false
+        gpu = try c.decodeIfPresent(Bool.self, forKey: .gpu) ?? false
+        ping = try c.decodeIfPresent(Bool.self, forKey: .ping) ?? true
+        bitrate = try c.decodeIfPresent(Bool.self, forKey: .bitrate) ?? false
+        battery = try c.decodeIfPresent(Bool.self, forKey: .battery) ?? true
+        sessionBattery = try c.decodeIfPresent(Bool.self, forKey: .sessionBattery) ?? false
+        connection = try c.decodeIfPresent(Bool.self, forKey: .connection) ?? true
+        resolution = try c.decodeIfPresent(Bool.self, forKey: .resolution) ?? false
+        codec = try c.decodeIfPresent(Bool.self, forKey: .codec) ?? false
+        location = try c.decodeIfPresent(Bool.self, forKey: .location) ?? false
+        latency = try c.decodeIfPresent(Bool.self, forKey: .latency) ?? false
+        packetLoss = try c.decodeIfPresent(Bool.self, forKey: .packetLoss) ?? false
+    }
+}
+
+// MARK: - Normalized point
+
+/// Fraction of the available area, 0...1 on both axes. Used for the draggable in-stream keyboard
+/// button so a saved position survives a rotation or a different device.
+struct NormalizedPoint: Codable, Equatable {
+    var x: Double
+    var y: Double
+
+    init(x: Double, y: Double) {
+        self.x = Self.clamped(x, fallback: 1)
+        self.y = Self.clamped(y, fallback: 0.5)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        x = Self.clamped(try c.decodeIfPresent(Double.self, forKey: .x), fallback: 1)
+        y = Self.clamped(try c.decodeIfPresent(Double.self, forKey: .y), fallback: 0.5)
+    }
+
+    private static func clamped(_ value: Double?, fallback: Double) -> Double {
+        guard let value, value.isFinite else { return fallback }
+        return min(max(value, 0), 1)
+    }
+
+    static let trailingCenter = NormalizedPoint(x: 1, y: 0.5)
+}
+
+// MARK: - Touch settings
+
+/// Everything about touch input that is not a control's position or size — those live in
+/// `TouchControlLayout`. Mirrors the non-geometry half of Android's `AndroidTouchSettings`.
+struct TouchSettings: Codable, Equatable {
+    var nativeTouchMode: NativeTouchMode = .automatic
+
+    /// Scales the velocity of touch movement in native touch mode. Below 1 slows scroll and swipe
+    /// gestures; above 1 speeds them up.
+    var nativeTouchScrollScale: Double = 1.0
+
+    /// Minimum movement in points before a move event is forwarded in native touch mode.
+    /// Suppresses sensor jitter that would otherwise turn a tap into a micro-swipe.
+    var nativeTouchJitterThreshold: Double = 8
+
+    var joystickMode: TouchJoystickMode = .fixed
+    var controlMode: TouchControlMode = .virtualSticks
+    var controllerPreset: TouchControllerPreset = .standard
+    var aimMode: TouchAimMode = .lockJoystick
+    var joystickDeadZone: Double = 0
+    var touchpadSensitivity: Double = 1
+    var style: TouchControllerStyle = .solid
+
+    /// Finger-mouse taps click where the finger lands rather than moving a cursor first.
+    var mouseDirectClick: Bool = false
+
+    var edgePadding: Double = 14
+    var bottomPadding: Double = 10
+    var leftOffsetX: Double = 0
+    var leftOffsetY: Double = 0
+    var rightOffsetX: Double = 0
+    var rightOffsetY: Double = 0
+
+    func sideOffset(for point: TouchControlPoint) -> CGSize {
+        switch point.x {
+        case ..<0.4: return CGSize(width: leftOffsetX, height: leftOffsetY)
+        case 0.6...: return CGSize(width: rightOffsetX, height: rightOffsetY)
+        default: return .zero
+        }
+    }
+
+    static let `default` = TouchSettings()
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        nativeTouchMode = try c.decodeIfPresent(NativeTouchMode.self, forKey: .nativeTouchMode) ?? .automatic
+        nativeTouchScrollScale = try c.decodeIfPresent(Double.self, forKey: .nativeTouchScrollScale) ?? 1.0
+        nativeTouchJitterThreshold = try c.decodeIfPresent(Double.self, forKey: .nativeTouchJitterThreshold) ?? 8
+        joystickMode = try c.decodeIfPresent(TouchJoystickMode.self, forKey: .joystickMode) ?? .fixed
+        controlMode = try c.decodeIfPresent(TouchControlMode.self, forKey: .controlMode) ?? .virtualSticks
+        controllerPreset = try c.decodeIfPresent(TouchControllerPreset.self, forKey: .controllerPreset) ?? .standard
+        aimMode = try c.decodeIfPresent(TouchAimMode.self, forKey: .aimMode) ?? .lockJoystick
+        joystickDeadZone = try c.decodeIfPresent(Double.self, forKey: .joystickDeadZone) ?? 0
+        touchpadSensitivity = try c.decodeIfPresent(Double.self, forKey: .touchpadSensitivity) ?? 1
+        style = try c.decodeIfPresent(TouchControllerStyle.self, forKey: .style) ?? .solid
+        mouseDirectClick = try c.decodeIfPresent(Bool.self, forKey: .mouseDirectClick) ?? false
+        edgePadding = try c.decodeIfPresent(Double.self, forKey: .edgePadding) ?? 14
+        bottomPadding = try c.decodeIfPresent(Double.self, forKey: .bottomPadding) ?? 10
+        leftOffsetX = try c.decodeIfPresent(Double.self, forKey: .leftOffsetX) ?? 0
+        leftOffsetY = try c.decodeIfPresent(Double.self, forKey: .leftOffsetY) ?? 0
+        rightOffsetX = try c.decodeIfPresent(Double.self, forKey: .rightOffsetX) ?? 0
+        rightOffsetY = try c.decodeIfPresent(Double.self, forKey: .rightOffsetY) ?? 0
+        normalize()
+    }
+
+    mutating func normalize() {
+        nativeTouchScrollScale = min(max(nativeTouchScrollScale, 0.25), 2.0)
+        nativeTouchJitterThreshold = min(max(nativeTouchJitterThreshold, 0), 24)
+        joystickDeadZone = min(max(joystickDeadZone, 0), 0.3)
+        touchpadSensitivity = min(max(touchpadSensitivity, 0.5), 2.0)
+        edgePadding = min(max(edgePadding, 0), 72)
+        bottomPadding = min(max(bottomPadding, 0), 120)
+        leftOffsetX = min(max(leftOffsetX, -220), 220)
+        leftOffsetY = min(max(leftOffsetY, -160), 160)
+        rightOffsetX = min(max(rightOffsetX, -220), 220)
+        rightOffsetY = min(max(rightOffsetY, -160), 160)
+    }
+
+    /// Resets only the offsets and paddings, leaving the routing choices alone —
+    /// "reset layout" should not silently change whether touch reaches the game.
+    mutating func resetLayout() {
+        let fresh = TouchSettings()
+        edgePadding = fresh.edgePadding
+        bottomPadding = fresh.bottomPadding
+        leftOffsetX = fresh.leftOffsetX
+        leftOffsetY = fresh.leftOffsetY
+        rightOffsetX = fresh.rightOffsetX
+        rightOffsetY = fresh.rightOffsetY
+    }
+}
+
+// MARK: - Stick maths
+
+/// Shared by the on-screen sticks and, in spirit, by the controller cursor curve.
+///
+/// Kept out of the view so it can be tested: the correctness that matters here is arithmetic, and
+/// a dead zone that clips instead of rescaling is a bug you only notice as "my stick feels short".
+enum TouchStickMath {
+    /// Rescales the remaining travel so the stick still reaches full deflection at the rim.
+    /// Simply zeroing inside the threshold would cost the player the top of their range.
+    static func applyDeadZone(x: CGFloat, y: CGFloat, deadZone: Double) -> (CGFloat, CGFloat) {
+        let threshold = CGFloat(min(max(deadZone, 0), 0.9))
+        guard threshold > 0 else { return (x, y) }
+        let magnitude = hypot(x, y)
+        guard magnitude > threshold else { return (0, 0) }
+        let scaled = (magnitude - threshold) / (1 - threshold)
+        let factor = scaled / magnitude
+        return (x * factor, y * factor)
+    }
+}
+
+enum TouchpadStickMath {
+    /// Converts finger travel from its landing point into an analog stick vector. A fixed travel
+    /// distance keeps the control predictable regardless of where in each half the finger lands.
+    static func vector(dx: CGFloat, dy: CGFloat, travel: CGFloat, sensitivity: Double, deadZone: Double) -> (CGFloat, CGFloat) {
+        let radius = max(travel, 1)
+        let gain = CGFloat(min(max(sensitivity, 0.5), 2.0))
+        let length = hypot(dx, dy)
+        let scale = length > radius ? radius / length : 1
+        return TouchStickMath.applyDeadZone(
+            x: dx * scale / radius * gain,
+            y: -dy * scale / radius * gain,
+            deadZone: deadZone
+        )
+    }
+
+}
+
+// MARK: - Session timer
+
+enum SessionTimerMode: Equatable {
+    case countdown
+    case stopwatch
+}
+
+/// Plan-derived session cap. Free accounts get a hard one-hour limit and therefore a countdown;
+/// paid tiers get a much longer cap and a stopwatch, because counting down from eight hours is
+/// anxiety with no information in it.
+struct SmartSessionLimit: Equatable {
+    let tierLabel: String
+    let limitHours: Int
+    let mode: SessionTimerMode
+
+    static let free = SmartSessionLimit(tierLabel: "Free", limitHours: 1, mode: .countdown)
+    static let performance = SmartSessionLimit(tierLabel: "Performance", limitHours: 6, mode: .stopwatch)
+    static let ultimate = SmartSessionLimit(tierLabel: "Ultimate", limitHours: 8, mode: .stopwatch)
+
+    static func forTier(_ membershipTier: String?) -> SmartSessionLimit {
+        let normalized = (membershipTier ?? "")
+            .uppercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .joined()
+        if normalized.contains("ULTIMATE") || normalized.contains("RTX3080") { return .ultimate }
+        if normalized.contains("PRIORITY") || normalized.contains("PERFORMANCE") || normalized.contains("FOUNDERS") {
+            return .performance
+        }
+        return .free
+    }
+
+    var limitSeconds: Int { limitHours * 3600 }
+}
+
+/// Thresholds, in seconds remaining, at which the session clock surfaces itself.
+let sessionWarningThresholdsSeconds: [Int] = [30 * 60, 10 * 60, 5 * 60, 3 * 60, 60]
+
+func sessionWarningThresholdCrossed(previousRemaining: Int?, remaining: Int) -> Int? {
+    guard let previous = previousRemaining else { return nil }
+    return sessionWarningThresholdsSeconds
+        .filter { previous > $0 && remaining <= $0 }
+        .min()
+}
+
+// MARK: - Analytics consent
+
+/// Three states, not two. "Not yet asked" has to be distinguishable from "asked and declined",
+/// or the consent prompt reappears every launch.
+enum AnalyticsConsent: Equatable {
+    case notAsked
+    case granted
+    case declined
+
+    init(asked: Bool, optOut: Bool) {
+        guard asked else { self = .notAsked; return }
+        self = optOut ? .declined : .granted
+    }
+
+    var isSharing: Bool { self == .granted }
+}
+
+// MARK: - App language
+
+/// The fourteen locales Android ships app-owned translations for, plus a system-default entry.
+/// The value is a BCP-47 tag; empty means "follow the system".
+enum AppLanguage {
+    static let systemDefault = ""
+
+    static let supported: [(tag: String, label: String)] = [
+        ("", "System default"),
+        ("en", "English"),
+        ("ar", "العربية"),
+        ("de", "Deutsch"),
+        ("es", "Español"),
+        ("fr", "Français"),
+        ("ja", "日本語"),
+        ("ko", "한국어"),
+        ("nl", "Nederlands"),
+        ("pl", "Polski"),
+        ("pt", "Português"),
+        ("ro", "Română"),
+        ("ru", "Русский"),
+        ("tr", "Türkçe"),
+        ("zh-Hans", "简体中文")
+    ]
+
+    static func label(for tag: String) -> String {
+        supported.first { $0.tag == tag }?.label ?? tag
+    }
+}

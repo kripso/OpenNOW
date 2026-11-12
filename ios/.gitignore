@@ -1,0 +1,31 @@
+# Xcode build products
+build/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM/
+*.dSYM.zip
+*.xcarchive
+*.xcresult
+
+# Required by App Store Connect: keep the vendor WebRTC device symbols versioned.
+!OpenNOWiOS/Frameworks/WebRTC.xcframework/ios-arm64/dSYMs/WebRTC.framework.dSYM/
+!OpenNOWiOS/Frameworks/WebRTC.xcframework/ios-arm64/dSYMs/WebRTC.framework.dSYM/**
+
+# Xcode local user state
+xcuserdata/
+*.xcuserstate
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.pbxuser
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+
+# Swift Package Manager local state
+.build/
+.swiftpm/
+
+# Carthage build output
+Carthage/Build/
