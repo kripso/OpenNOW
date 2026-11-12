@@ -246,6 +246,33 @@ struct NvstMjolnirFeedbackTests {
         #expect(receiver.stats.authenticatedPackets == 0)
     }
 
+    /// Drives the real receive loop: the first read of a wake-up goes through `recvmsg` for the
+    /// kernel's arrival time and the rest through `recvfrom`, and every datagram must still arrive.
+    /// A local socket pair carries no arrival time, so none is counted.
+    @Test func theReceiveLoopReadsEveryDatagramFromItsSocket() async throws {
+        var ends: [Int32] = [-1, -1]
+        #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &ends) == 0)
+        defer { close(ends[1]) }
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 8)
+        let receiver = try NvstMjolnirReceiver(handoff: handoff, existingDescriptor: ends[0])
+        try receiver.start()
+        defer { receiver.stop() }
+        let count = 12
+        for sequence in 1...count {
+            let datagram = try NvstReceiverFixtures.seal(
+                NvstReceiverFixtures.packet(sequence: UInt16(sequence), frameIndex: UInt32(sequence),
+                                            flags: 0x07, media: [0x00, 0x00, 0x00, 0x01, 0x65]),
+                sequence: UInt16(sequence), handoff: handoff)
+            let written = datagram.withUnsafeBytes { write(ends[1], $0.baseAddress, $0.count) }
+            #expect(written == datagram.count)
+        }
+        for _ in 0..<200 where receiver.stats.authenticatedPackets < count {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(receiver.stats.authenticatedPackets == count)
+        #expect(receiver.silenceTotals.timedWakeUps == 0)
+    }
+
     @Test func peerAddressConversionRoundTrips() throws {
         let network = try #require(NvstMjolnirReceiver.inetAddr("10.20.30.40"))
         #expect(NvstMjolnirReceiver.dottedQuad(network) == "10.20.30.40")

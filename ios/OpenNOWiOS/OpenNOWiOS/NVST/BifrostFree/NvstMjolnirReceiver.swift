@@ -44,6 +44,8 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
     /// of times per session, and allocating 64 KB on every wake-up was ~17 MB/s of churn on the
     /// user-interactive queue. The receive queue is serial, so a single reused buffer is safe.
     private var drainBuffer = [UInt8](repeating: 0, count: 65_536)
+    /// Ancillary data for the first read of each wake-up, which carries the kernel arrival time.
+    private var controlBuffer = [UInt8](repeating: 0, count: 64)
     private var readSource: DispatchSourceRead?
     private var pingTimer: DispatchSourceTimer?
     private var reportTimer: DispatchSourceTimer?
@@ -65,6 +67,11 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
     public func drainSilences() -> NvstSocketSilenceMeter.Window {
         counterLock.lock(); defer { counterLock.unlock() }
         return silences.drain()
+    }
+
+    public var silenceTotals: NvstSocketSilenceMeter.Totals {
+        counterLock.lock(); defer { counterLock.unlock() }
+        return silences.totals
     }
 
     public var onAccessUnit: (@Sendable (NvstAccessUnit) -> Void)?
@@ -163,6 +170,10 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
         // Wi-Fi layer rather than as best-effort data.
         var serviceType = NET_SERVICE_TYPE_VI
         setsockopt(descriptor, SOL_SOCKET, SO_NET_SERVICE_TYPE, &serviceType, socklen_t(MemoryLayout<Int32>.size))
+        // Have the kernel stamp each datagram's arrival, so a late read can be told apart from a
+        // network that held packets back (see `NvstSocketSilenceMeter`).
+        var stampArrivals: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &stampArrivals, socklen_t(MemoryLayout<Int32>.size))
         socketDescriptor = descriptor
 
         let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
@@ -318,6 +329,7 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
 
     private func drainSocket() {
         var readThisWakeUp = 0
+        var firstArrival: UInt64?
         let drainStart = DispatchTime.now().uptimeNanoseconds
         defer {
             let drainEnd = DispatchTime.now().uptimeNanoseconds
@@ -325,15 +337,23 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
             counterLock.lock()
             counters.datagramsPerWakeUp[min(readThisWakeUp, 8), default: 0] += 1
             counters.drainNanoseconds += elapsed
-            if readThisWakeUp > 0 { silences.observe(wakeStart: drainStart, wakeEnd: drainEnd) }
+            if readThisWakeUp > 0 {
+                silences.observe(wakeStart: drainStart, wakeEnd: drainEnd, firstArrival: firstArrival)
+            }
             counterLock.unlock()
         }
         for _ in 0..<Self.maxDatagramsPerWakeUp {
             var peer = sockaddr_in()
             var peerLength = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let received = withUnsafeMutablePointer(to: &peer) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-                    recvfrom(socketDescriptor, &drainBuffer, drainBuffer.count, 0, sockaddrPointer, &peerLength)
+            let received: Int
+            if readThisWakeUp == 0 {
+                // Only the first read needs its arrival time: it is the one that waited longest.
+                (received, firstArrival) = receiveStamped(into: &peer, length: &peerLength)
+            } else {
+                received = withUnsafeMutablePointer(to: &peer) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                        recvfrom(socketDescriptor, &drainBuffer, drainBuffer.count, 0, sockaddrPointer, &peerLength)
+                    }
                 }
             }
             if received <= 0 { return }
@@ -370,6 +390,63 @@ public final class NvstMjolnirReceiver: @unchecked Sendable {
             }
             handle(datagram: datagram)
         }
+    }
+
+    /// `recvmsg` into the drain buffer, returning the byte count and the kernel's arrival time.
+    private func receiveStamped(into peer: inout sockaddr_in, length peerLength: inout socklen_t) -> (Int, UInt64?) {
+        let descriptor = socketDescriptor
+        var arrival: UInt64?
+        let received: Int = drainBuffer.withUnsafeMutableBytes { data in
+            controlBuffer.withUnsafeMutableBytes { control in
+                withUnsafeMutablePointer(to: &peer) { peerPointer in
+                    var vector = iovec(iov_base: data.baseAddress, iov_len: data.count)
+                    return withUnsafeMutablePointer(to: &vector) { vectorPointer in
+                        var message = msghdr(msg_name: UnsafeMutableRawPointer(peerPointer),
+                                             msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
+                                             msg_iov: vectorPointer, msg_iovlen: 1,
+                                             msg_control: control.baseAddress,
+                                             msg_controllen: socklen_t(control.count), msg_flags: 0)
+                        let count = recvmsg(descriptor, &message, 0)
+                        peerLength = message.msg_namelen
+                        if count > 0 {
+                            arrival = Self.kernelArrivalNanoseconds(
+                                control: UnsafeRawBufferPointer(rebasing: control[0..<min(control.count, Int(message.msg_controllen))]))
+                        }
+                        return count
+                    }
+                }
+            }
+        }
+        return (received, arrival)
+    }
+
+    private static let timebase: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+
+    /// The `SCM_TIMESTAMP_MONOTONIC` arrival time in a datagram's ancillary data, converted from
+    /// Mach ticks to nanoseconds on the `DispatchTime.uptimeNanoseconds` clock.
+    static func kernelArrivalNanoseconds(control: UnsafeRawBufferPointer) -> UInt64? {
+        let headerSize = MemoryLayout<cmsghdr>.size
+        // Darwin aligns control messages and their data to 4 bytes.
+        func aligned(_ value: Int) -> Int { (value + 3) & ~3 }
+        var offset = 0
+        while offset + headerSize <= control.count {
+            let header = control.loadUnaligned(fromByteOffset: offset, as: cmsghdr.self)
+            let messageLength = Int(header.cmsg_len)
+            guard messageLength >= headerSize, offset + messageLength <= control.count else { return nil }
+            let dataOffset = offset + aligned(headerSize)
+            if header.cmsg_level == SOL_SOCKET, header.cmsg_type == SCM_TIMESTAMP_MONOTONIC,
+               dataOffset + MemoryLayout<UInt64>.size <= offset + messageLength {
+                let ticks = control.loadUnaligned(fromByteOffset: dataOffset, as: UInt64.self)
+                guard timebase.denom > 0 else { return nil }
+                return ticks * UInt64(timebase.numer) / UInt64(timebase.denom)
+            }
+            offset += aligned(messageLength)
+        }
+        return nil
     }
 
     private func handle(datagram: Data) {
@@ -665,20 +742,41 @@ extension NvstMjolnirReceiver {
     }
 }
 
-/// How long the socket goes without receiving anything.
+/// How long the socket goes without being read, and why.
 ///
 /// A stream sends packets every millisecond or two, and at least one per frame even on a still
-/// picture. A stretch of 30 ms or more with none means nothing reached this device for a whole
-/// frame's turn: the network held the packets back, whatever the frame counters say afterwards.
-/// Measured here, before reassembly and decoding, so a quiet network can be told apart from a
-/// slow receiver.
+/// picture. A silence is a stretch of 30 ms or more between two wake-ups of the receive loop.
+/// That alone cannot say whose the delay was: the network may have held the packets back, or
+/// they may have reached the device on time and waited in the socket because this loop did not
+/// run. The kernel stamps each datagram as it arrives, so the wake-up that ends a silence also
+/// says how long its first datagram had already been waiting. Waiting 30 ms or more is a late
+/// wake-up: the delay was this device's, not the network's.
 public struct NvstSocketSilenceMeter: Sendable {
     public struct Window: Equatable, Sendable {
         public var count = 0
         public var longestMilliseconds = 0.0
-        public init(count: Int = 0, longestMilliseconds: Double = 0) {
+        /// Wake-ups whose first datagram had reached the device 30 ms or more earlier.
+        public var lateWakeUps = 0
+        public var longestLateMilliseconds = 0.0
+        public init(count: Int = 0, longestMilliseconds: Double = 0,
+                    lateWakeUps: Int = 0, longestLateMilliseconds: Double = 0) {
             self.count = count
             self.longestMilliseconds = longestMilliseconds
+            self.lateWakeUps = lateWakeUps
+            self.longestLateMilliseconds = longestLateMilliseconds
+        }
+    }
+
+    /// The whole session, kept across `drain()`.
+    public struct Totals: Equatable, Sendable {
+        /// Wake-ups that carried a kernel arrival time. Zero means the measurement is not working
+        /// on this device, which is different from no late wake-ups.
+        public var timedWakeUps = 0
+        public var lateWakeUps = 0
+        public var longestLateMilliseconds = 0.0
+
+        public var summary: String {
+            String(format: "wake[timed=%d late=%d longestLate=%.0fms]", timedWakeUps, lateWakeUps, longestLateMilliseconds)
         }
     }
 
@@ -688,12 +786,27 @@ public struct NvstSocketSilenceMeter: Sendable {
 
     private var lastWakeEnd: UInt64?
     private var window = Window()
+    public private(set) var totals = Totals()
 
     public init() {}
 
-    /// One wake-up of the socket that read at least one datagram.
-    public mutating func observe(wakeStart: UInt64, wakeEnd: UInt64) {
+    /// One wake-up of the socket that read at least one datagram. `firstArrival` is when the
+    /// kernel received the first of them, on the same clock as the wake-up times.
+    public mutating func observe(wakeStart: UInt64, wakeEnd: UInt64, firstArrival: UInt64? = nil) {
         defer { lastWakeEnd = wakeEnd }
+        if let firstArrival {
+            totals.timedWakeUps += 1
+            if wakeStart > firstArrival {
+                let waited = wakeStart - firstArrival
+                if waited >= Self.thresholdNanoseconds, waited < Self.pauseNanoseconds {
+                    let milliseconds = Double(waited) / 1_000_000
+                    window.lateWakeUps += 1
+                    window.longestLateMilliseconds = max(window.longestLateMilliseconds, milliseconds)
+                    totals.lateWakeUps += 1
+                    totals.longestLateMilliseconds = max(totals.longestLateMilliseconds, milliseconds)
+                }
+            }
+        }
         guard let lastWakeEnd, wakeStart > lastWakeEnd else { return }
         let gap = wakeStart - lastWakeEnd
         guard gap >= Self.thresholdNanoseconds, gap < Self.pauseNanoseconds else { return }

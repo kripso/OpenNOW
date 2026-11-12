@@ -2935,6 +2935,65 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertNil(steadyLatencyReport().frameDelivery?.networkSilences)
     }
 
+    func testAReadThatComesLongAfterItsDatagramArrivedIsCountedAsLate() {
+        var meter = NvstSocketSilenceMeter()
+        let ms: UInt64 = 1_000_000
+        meter.observe(wakeStart: 0, wakeEnd: 1 * ms, firstArrival: 0)
+        // 110 ms between reads, but the datagram had arrived 2 ms in: the network was not quiet,
+        // this device was late reading it.
+        meter.observe(wakeStart: 111 * ms, wakeEnd: 112 * ms, firstArrival: 2 * ms)
+        // 111 ms between reads and the datagram arrived just before the read: the network.
+        meter.observe(wakeStart: 223 * ms, wakeEnd: 224 * ms, firstArrival: 222 * ms)
+        // A read with no kernel time is still a silence, and says nothing about lateness.
+        meter.observe(wakeStart: 300 * ms, wakeEnd: 301 * ms)
+        XCTAssertEqual(meter.drain(), .init(count: 3, longestMilliseconds: 111, lateWakeUps: 1, longestLateMilliseconds: 109))
+        XCTAssertEqual(meter.totals, .init(timedWakeUps: 3, lateWakeUps: 1, longestLateMilliseconds: 109))
+        XCTAssertEqual(meter.totals.summary, "wake[timed=3 late=1 longestLate=109ms]")
+        // The window starts over; the session totals do not.
+        meter.observe(wakeStart: 302 * ms, wakeEnd: 303 * ms, firstArrival: 302 * ms)
+        XCTAssertEqual(meter.drain(), .init())
+        XCTAssertEqual(meter.totals.timedWakeUps, 4)
+    }
+
+    func testTheKernelArrivalTimeIsReadFromTheDatagramsControlData() throws {
+        func message(level: Int32, type: Int32, value: UInt64) -> [UInt8] {
+            var header = cmsghdr(cmsg_len: socklen_t(MemoryLayout<cmsghdr>.size + 8), cmsg_level: level, cmsg_type: type)
+            var bytes = withUnsafeBytes(of: &header) { [UInt8]($0) }
+            var value = value
+            bytes += withUnsafeBytes(of: &value) { [UInt8]($0) }
+            return bytes
+        }
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+        let ticks: UInt64 = 24_000_000
+        let expected = ticks * UInt64(timebase.numer) / UInt64(timebase.denom)
+        // Behind another control message, as the kernel may add more than one.
+        let control = message(level: SOL_SOCKET, type: SCM_CREDS, value: 7)
+            + message(level: SOL_SOCKET, type: SCM_TIMESTAMP_MONOTONIC, value: ticks)
+        XCTAssertEqual(control.withUnsafeBytes { NvstMjolnirReceiver.kernelArrivalNanoseconds(control: $0) }, expected)
+        XCTAssertNil(message(level: SOL_SOCKET, type: SCM_CREDS, value: 7).withUnsafeBytes {
+            NvstMjolnirReceiver.kernelArrivalNanoseconds(control: $0)
+        })
+        // A length that runs past the buffer is rejected rather than read.
+        var truncated = message(level: SOL_SOCKET, type: SCM_TIMESTAMP_MONOTONIC, value: ticks)
+        truncated.removeLast(4)
+        XCTAssertNil(truncated.withUnsafeBytes { NvstMjolnirReceiver.kernelArrivalNanoseconds(control: $0) })
+        XCTAssertNil([UInt8]().withUnsafeBytes { NvstMjolnirReceiver.kernelArrivalNanoseconds(control: $0) })
+    }
+
+    func testLateReadsReachTheSessionTimeline() throws {
+        var timeline = SessionTimeline()
+        timeline.record(StreamRuntimeSample(timestamp: 0, pingMs: 90, lateReceiveWakeUps: 2, longestLateReceiveWakeUpMs: 104.4),
+                        offsetSeconds: 0)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(timeline)) as? [String: Any])
+        let row = try XCTUnwrap((json["rows"] as? [[Int]])?.first)
+        let columns = SessionTimelineRow.columns
+        XCTAssertEqual(row.count, columns.count)
+        XCTAssertEqual(row[columns.firstIndex(of: "lateReceiveWakeUps")!], 2)
+        XCTAssertEqual(row[columns.firstIndex(of: "longestLateReceiveWakeUpMs")!], 104)
+        XCTAssertEqual(columns.last, "phase")
+    }
+
     func testLatencyAndRouteComeFromThePairTheStreamIsUsing() {
         func pair(rtt: Double, bytes: Int, nominated: Bool = true) -> [String: NSObject] {
             ["currentRoundTripTime": NSNumber(value: rtt), "bytesReceived": NSNumber(value: bytes),

@@ -216,6 +216,10 @@ struct StreamRuntimeSample: Equatable {
     /// Stretches of 30 ms or more in which the network socket received nothing.
     var networkSilences: Int? = nil
     var longestNetworkSilenceMs: Double? = nil
+    /// Reads of the socket that came 30 ms or more after their first datagram had arrived: delay
+    /// inside this device rather than on the network.
+    var lateReceiveWakeUps: Int? = nil
+    var longestLateReceiveWakeUpMs: Double? = nil
     /// The transport's own running counters as one line of text: loss, repairs, keyframe requests.
     var transportDetail: String? = nil
 
@@ -372,6 +376,8 @@ struct SessionTimelineRow: Equatable {
     /// Arrival jitter in microseconds. The native transport sends this same figure to the server
     /// as its delay reading, which the server's bitrate control acts on.
     var peakJitterUs: Int?
+    var lateReceiveWakeUps = 0
+    var longestLateReceiveWakeUpMs = 0
     /// 0 in front since the start, 1 back after being away, 2 away.
     var phase = 0
 
@@ -379,7 +385,7 @@ struct SessionTimelineRow: Equatable {
         "offsetSeconds", "samples", "peakPingMs", "lowestReceivedFps", "lowestDecodedFps", "lowestShownFps",
         "lowestBitrateKbps", "packetsLost", "networkSilences", "longestNetworkSilenceMs", "decoderStutters",
         "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks",
-        "peakJitterUs", "phase"
+        "peakJitterUs", "lateReceiveWakeUps", "longestLateReceiveWakeUpMs", "phase"
     ]
 
     /// In the order of `columns`; -1 stands for a reading the stretch did not have.
@@ -387,7 +393,7 @@ struct SessionTimelineRow: Equatable {
         [offsetSeconds, samples, peakPingMs ?? -1, lowestReceivedFps ?? -1, lowestDecodedFps ?? -1, lowestShownFps ?? -1,
          lowestBitrateKbps ?? -1, packetsLost, networkSilences, longestNetworkSilenceMs, decoderStutters,
          longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks,
-         peakJitterUs ?? -1, phase]
+         peakJitterUs ?? -1, lateReceiveWakeUps, longestLateReceiveWakeUpMs, phase]
     }
 
     init(_ sample: StreamRuntimeSample, offsetSeconds: Int) {
@@ -407,6 +413,8 @@ struct SessionTimelineRow: Equatable {
         framesNeverShown = sample.arrivedCadence?.replaced ?? 0
         lateDisplayTicks = sample.shownCadence?.lateTicks ?? 0
         peakJitterUs = sample.jitterMs.map { Int(($0 * 1_000).rounded()) }
+        lateReceiveWakeUps = max(0, sample.lateReceiveWakeUps ?? 0)
+        longestLateReceiveWakeUpMs = Int((sample.longestLateReceiveWakeUpMs ?? 0).rounded())
         switch sample.interruption {
         case .none: phase = 0
         case .returned: phase = 1
@@ -436,6 +444,8 @@ struct SessionTimelineRow: Equatable {
         framesNeverShown += next.framesNeverShown
         lateDisplayTicks += next.lateDisplayTicks
         peakJitterUs = worst(peakJitterUs, next.peakJitterUs, max)
+        lateReceiveWakeUps += next.lateReceiveWakeUps
+        longestLateReceiveWakeUpMs = max(longestLateReceiveWakeUpMs, next.longestLateReceiveWakeUpMs)
         phase = max(phase, next.phase)
     }
 }

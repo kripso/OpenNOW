@@ -3259,6 +3259,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private let onClose: () -> Void
     private let onRetry: (() -> Void)?
     private let logger = Logger(subsystem: "OpenNOWiOS", category: "NativeStreamer")
+    /// Logs each time the app stops or starts being the active one during a stream, at a level the
+    /// diagnostics bundle keeps, so a report's timeline can be lined up with leaving and returning.
+    private var appStateObservers: [NSObjectProtocol] = []
     private let workQueue = DispatchQueue(label: "OpenNOW.NativeStreamer")
     private var nativeNVST: (any NativeStreamNVSTTransport)?
     private var nativeNVSTStart: Task<Void, Never>?
@@ -3529,6 +3532,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         started = true
         stopped = false
         self.viewportSize = viewportSize
+        observeAppStateForDiagnostics()
         batteryMonitoringWasEnabled = UIDevice.current.isBatteryMonitoringEnabled
         UIDevice.current.isBatteryMonitoringEnabled = true
         if let error = session.transportPreferenceError(settings: settings) {
@@ -3716,6 +3720,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             pipFrames: pip.frames, pipConvertMs: pip.milliseconds,
             networkSilences: sample.networkSilences.count,
             longestNetworkSilenceMs: sample.networkSilences.longestMilliseconds,
+            lateReceiveWakeUps: sample.networkSilences.lateWakeUps,
+            longestLateReceiveWakeUpMs: sample.networkSilences.longestLateMilliseconds,
             transportDetail: sample.detail))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
@@ -4513,6 +4519,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             self.batteryMonitoringWasEnabled = nil
         }
         stopped = true
+        appStateObservers.forEach(NotificationCenter.default.removeObserver)
+        appStateObservers = []
         StreamConnectionDiagnostics.shared.update(connectionDiagnosticID) { $0.stage = "local_stop" }
         nativeNVSTStart?.cancel(); nativeNVSTStart = nil
         let nativeTransport = nativeNVST; nativeNVST = nil
@@ -5993,6 +6001,20 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 
     private func log(_ message: String) {
         logger.info("\(message, privacy: .public)")
+    }
+
+    private func observeAppStateForDiagnostics() {
+        let events: [(Notification.Name, String)] = [
+            (UIApplication.willResignActiveNotification, "inactive"),
+            (UIApplication.didEnterBackgroundNotification, "background"),
+            (UIApplication.willEnterForegroundNotification, "foreground"),
+            (UIApplication.didBecomeActiveNotification, "active"),
+        ]
+        appStateObservers = events.map { name, label in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [logger] _ in
+                logger.notice("App state \(label, privacy: .public) during stream")
+            }
+        }
     }
 
     private func markMediaTransportConnected() {
