@@ -133,6 +133,14 @@ public final class NvstVideoReceiver: @unchecked Sendable {
     /// before an unrepairable gap falls back to the keyframe path.
     public static let fecRepairReorderWindow = 1200
 
+    /// How many frames past a gap must have started before the gap is given up, whatever the
+    /// packet-count windows say. A block's repair packets follow its sources and a frame's blocks
+    /// come before the next frame, so once a packet from two frames on has arrived nothing still
+    /// on its way can fill the gap. The packet windows were sized at ~8,500 packets/s; a
+    /// 12 Mb/s stream sends about 1,100, where 1,200 packets is over a second in which every
+    /// frame behind one lost packet is held back and then released in a single burst.
+    public static let framesHeldForRepair: UInt32 = 2
+
     public enum ReceiverError: LocalizedError, Equatable, Sendable {
         case unsupportedProfile(String)
 
@@ -154,6 +162,9 @@ public final class NvstVideoReceiver: @unchecked Sendable {
     private let reassembler: NvstFrameReassembler
     private var replay = SrtpReplayWindow()
     private var reorder: [UInt64: NvstRtpVideoPacket] = [:]
+    /// The lowest-numbered packet waiting behind an open gap, kept so the per-packet check
+    /// below does not have to search the buffer.
+    private var firstHeld: (index: UInt64, frameIndex: UInt32)?
     private var nextIndex: UInt64?
     private var boundSSRC: UInt32?
     private var srtcpIndex: UInt32 = 0
@@ -249,6 +260,7 @@ public final class NvstVideoReceiver: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         reorder.removeAll()
+        firstHeld = nil
         nextIndex = nil
         reassembler.reset()
     }
@@ -632,14 +644,16 @@ public final class NvstVideoReceiver: @unchecked Sendable {
             return []
         }
         if index > expected { stats.outOfOrderPackets += 1 }
-        if index - expected >= UInt64(reorderWindow),
+        let gap = index - expected
+        let agedOut = gap >= UInt64(reorderWindow)
            // With FEC armed, a gap must outlive the chance of repair before it is loss: the
            // block's parity packets arrive after all of its sources, which at 5K is up to ~1000
            // packets after an early-frame hole — far past the plain reorder window. Holding the
            // gap costs one frame a few milliseconds of delivery delay; finalizing it early costs
            // the frame, a keyframe round trip, and the seat's frame-rate knock. The armed check
            // runs only while a gap is already open, so the hot path never takes the extra lock.
-           !(index - expected < UInt64(Self.fecRepairReorderWindow) && fecRecovery.snapshot.isArmed) {
+            && !(gap < UInt64(Self.fecRepairReorderWindow) && fecRecovery.snapshot.isArmed)
+        if agedOut || repairChanceHasPassed(arriving: packet) {
             // The gap has aged past the reorder window: whatever is still missing below the first
             // buffered packet is finalized loss, and only that range is skipped. The buffered
             // packets arrived intact and are delivered below — flushing the whole buffer here
@@ -658,7 +672,29 @@ public final class NvstVideoReceiver: @unchecked Sendable {
             ready.append(next)
             nextIndex = cursor + 1
         }
+        noteFirstHeld(inserted: index, frameIndex: packet.frameIndex)
         return ready
+    }
+
+    /// True when `packet` belongs to a frame far enough past the open gap that the gap can no
+    /// longer be filled. Compared against the first packet waiting behind the gap: whatever is
+    /// missing is from that packet's frame or an earlier one.
+    private func repairChanceHasPassed(arriving packet: NvstRtpVideoPacket) -> Bool {
+        guard let firstHeld else { return false }
+        // Wrapping subtraction: a packet from an earlier frame reads as a huge distance.
+        let framesAhead = packet.frameIndex &- firstHeld.frameIndex
+        return framesAhead >= Self.framesHeldForRepair && framesAhead < 1 << 20
+    }
+
+    /// Keeps `firstHeld` on the lowest-numbered buffered packet. The buffer is searched only when
+    /// that packet was just delivered or a lower one arrived, not on every packet.
+    private func noteFirstHeld(inserted index: UInt64, frameIndex: UInt32) {
+        guard !reorder.isEmpty else { firstHeld = nil; return }
+        if let held = firstHeld, reorder[held.index] != nil {
+            if index < held.index, reorder[index] != nil { firstHeld = (index, frameIndex) }
+            return
+        }
+        firstHeld = reorder.min { $0.key < $1.key }.map { ($0.key, $0.value.frameIndex) }
     }
 
     private func recordRecovery(first: UInt64, last: UInt64, events: inout [NvstReceiveEvent]) {

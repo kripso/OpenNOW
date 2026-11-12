@@ -62,6 +62,33 @@ enum NvstReceiverFixtures {
                                          media: media, fecWord: fecWord, streamSequence: streamSequence)
     }
 
+    /// One frame as the seat sends it with repair data on: `sources` picture packets, then the
+    /// Reed-Solomon repair packets for them, all in one block. Sequence numbers run on from
+    /// `firstSequence`; the result is in sending order and not yet sealed.
+    static func protectedFrame(frameIndex: UInt32, firstSequence: UInt16, sources: Int = 4,
+                               percentage: UInt32 = 25) -> [(sequence: UInt16, packet: Data)] {
+        func fecWord(index: Int) -> UInt32 { percentage << 4 | UInt32(index) << 12 | UInt32(sources) << 22 }
+        var packets: [(sequence: UInt16, packet: Data)] = []
+        for index in 0..<sources {
+            let flags: UInt8 = index == 0 ? 0x05 : (index == sources - 1 ? 0x03 : 0x01)
+            let media: [UInt8] = index == 0
+                ? [0x00, 0x00, 0x00, 0x01, 0x65, UInt8(truncatingIfNeeded: frameIndex), 0x10, 0x11]
+                : [UInt8](repeating: UInt8(truncatingIfNeeded: Int(frameIndex) * 16 + index), count: 8)
+            let sequence = firstSequence &+ UInt16(index)
+            packets.append((sequence, packet(sequence: sequence, frameIndex: frameIndex, flags: flags,
+                                             media: media, fecWord: fecWord(index: index))))
+        }
+        let size = packets[0].packet.count
+        let parityCount = (sources * Int(percentage) + 99) / 100
+        let parity = NvstReedSolomon.encode(data: packets.map { [UInt8]($0.packet) }, parityCount: parityCount, size: size)!
+        for (offset, shard) in parity.enumerated() {
+            let sequence = firstSequence &+ UInt16(sources + offset)
+            packets.append((sequence, packet(sequence: sequence, frameIndex: frameIndex, flags: 0x00,
+                                             media: Array(shard[32...]), fecWord: fecWord(index: sources + offset))))
+        }
+        return packets
+    }
+
     static func frames(_ events: [NvstReceiveEvent]) -> [NvstAccessUnit] {
         events.compactMap { if case .frame(let unit) = $0 { return unit } else { return nil } }
     }

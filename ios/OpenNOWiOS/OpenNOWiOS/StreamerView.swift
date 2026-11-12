@@ -3715,7 +3715,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             interruption: interruptionPhase, pipActive: isPictureInPictureActive && latestScenePhase == .active,
             pipFrames: pip.frames, pipConvertMs: pip.milliseconds,
             networkSilences: sample.networkSilences.count,
-            longestNetworkSilenceMs: sample.networkSilences.longestMilliseconds))
+            longestNetworkSilenceMs: sample.networkSilences.longestMilliseconds,
+            transportDetail: sample.detail))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }

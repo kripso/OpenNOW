@@ -216,6 +216,8 @@ struct StreamRuntimeSample: Equatable {
     /// Stretches of 30 ms or more in which the network socket received nothing.
     var networkSilences: Int? = nil
     var longestNetworkSilenceMs: Double? = nil
+    /// The transport's own running counters as one line of text: loss, repairs, keyframe requests.
+    var transportDetail: String? = nil
 
     var carriesReportableValues: Bool {
         pingMs != nil
@@ -512,6 +514,8 @@ struct SessionReport: Identifiable, Equatable, Encodable {
     var timesAway = 0
     /// How often the stream was closed and reopened without ending the session.
     var reconnects = 0
+    /// The transport's counters as they stood at the last reading, for a report that is sent.
+    var transportDetail: String? = nil
     /// The part of `frameDelivery` measured while latency sat well above the session's best.
     var frameDeliveryRaisedLatency: SessionFrameDelivery? = nil
     /// The session second by second, for a report that is sent rather than shown.
@@ -576,6 +580,7 @@ final class StreamSessionReportAccumulator {
     private var frameDeliveryAfterReturn = SessionFrameDelivery()
     private var timesAway = 0
     private var reconnects = 0
+    private var transportDetail: String?
     private var lastInterruption = StreamInterruptionPhase.none
     /// Latency counts as raised once it sits this far above the lowest the session has seen.
     /// The lowest is only trusted after a few readings, so a slow first second is not the bar.
@@ -670,6 +675,7 @@ final class StreamSessionReportAccumulator {
             }
         }
         lastInterruption = sample.interruption
+        if let detail = sample.transportDetail, !detail.isEmpty { transportDetail = detail }
         consecutiveDecoderOverloadSamples = Self.isDecoderOverloadSample(
             sample,
             requestedFps: launchProfile.initialProfile.fps
@@ -816,6 +822,7 @@ final class StreamSessionReportAccumulator {
             frameDeliveryAfterReturn: frameDeliveryAfterReturn.hasReadings ? frameDeliveryAfterReturn : nil,
             timesAway: timesAway,
             reconnects: reconnects,
+            transportDetail: transportDetail,
             frameDeliveryRaisedLatency: frameDeliveryRaisedLatency.hasReadings ? frameDeliveryRaisedLatency : nil,
             timeline: timeline
         )

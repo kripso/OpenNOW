@@ -5979,12 +5979,15 @@ final class OpenNOWiOSParityTests: XCTestCase {
 
     func testAReconnectKeepsTheReportAndCountsIt() throws {
         let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
-        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25))
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, transportDetail: "loss[events=1]"))
         accumulator.recordReconnect()
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 27, transportDetail: "loss[events=3]"))
         accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 27))
         let report = try XCTUnwrap(accumulator.finish())
         XCTAssertEqual(report.reconnects, 1)
-        XCTAssertEqual(report.sampleCount, 2)
+        XCTAssertEqual(report.sampleCount, 3)
+        // The transport's counters are kept as they last stood.
+        XCTAssertEqual(report.transportDetail, "loss[events=3]")
     }
 
     func testReturningCountsAsOneTimeAwayEvenWithNoReadingTakenWhileAway() throws {

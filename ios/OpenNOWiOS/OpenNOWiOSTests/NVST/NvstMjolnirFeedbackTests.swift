@@ -146,6 +146,70 @@ struct NvstMjolnirFeedbackTests {
         #expect(emitted[0].bytes == Data([0x00, 0x00, 0x00, 0x01, 0x65, 0xbb, 0xcc]))
     }
 
+    /// The windows that hold a gap open are counted in packets. One lost packet of a two-packet
+    /// frame used to hold back every frame behind it until the whole window had gone by; nothing
+    /// can still fill the gap once a frame two past it has started.
+    @Test func aLostPacketStopsHoldingFramesBackOnceTwoLaterFramesHaveStarted() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 32)
+        let receiver = try NvstVideoReceiver(handoff: handoff)
+        func deliver(_ sequence: UInt16, frame: UInt32, start: Bool) throws -> [NvstReceiveEvent] {
+            let media: [UInt8] = start ? [0x00, 0x00, 0x00, 0x01, 0x65] : [0xcc]
+            return receiver.process(datagram: try NvstReceiverFixtures.seal(
+                NvstReceiverFixtures.packet(sequence: sequence, frameIndex: frame, flags: start ? 0x05 : 0x03, media: media),
+                sequence: sequence, handoff: handoff))
+        }
+        _ = try deliver(1, frame: 1, start: true)
+        #expect(NvstReceiverFixtures.frames(try deliver(2, frame: 1, start: false)).count == 1)
+        // Frame 2 loses its first packet (sequence 3).
+        #expect(NvstReceiverFixtures.frames(try deliver(4, frame: 2, start: false)).isEmpty)
+        // Frame 3 arrives whole, but one frame of slack is kept for a late packet.
+        _ = try deliver(5, frame: 3, start: true)
+        let held = try deliver(6, frame: 3, start: false)
+        #expect(NvstReceiverFixtures.frames(held).isEmpty)
+        #expect(NvstReceiverFixtures.recoveries(held) == 0)
+        // Frame 4 starting ends the wait: the loss is reported and frame 3 is released.
+        let released = try deliver(7, frame: 4, start: true)
+        #expect(NvstReceiverFixtures.recoveries(released) == 1)
+        #expect(NvstReceiverFixtures.frames(released).map(\.frameIndex) == [3])
+        #expect(receiver.snapshot.finalizedLossPackets == 1)
+        #expect(NvstReceiverFixtures.frames(try deliver(8, frame: 4, start: false)).map(\.frameIndex) == [4])
+    }
+
+    /// With repair data on, the hold is 1,200 packets — about a second of a 12 Mb/s stream. A loss
+    /// the repair data can fix must still be fixed; one it cannot fix must not wait that long.
+    @Test func repairDataFixesOneLossAndAnUnfixableLossIsGivenUpAfterTwoFrames() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff()
+        let receiver = try NvstVideoReceiver(handoff: handoff)
+        func deliver(frame: UInt32, dropping lost: Set<Int> = []) throws -> [NvstReceiveEvent] {
+            let packets = NvstReceiverFixtures.protectedFrame(frameIndex: frame, firstSequence: UInt16((frame - 1) * 5 + 1))
+            return try packets.enumerated().filter { !lost.contains($0.offset) }.flatMap { _, entry in
+                receiver.process(datagram: try NvstReceiverFixtures.seal(entry.packet, sequence: entry.sequence, handoff: handoff))
+            }
+        }
+        // Four clean frames prove the repair scheme on this stream, which switches it on.
+        for frame in 1...4 {
+            #expect(NvstReceiverFixtures.frames(try deliver(frame: UInt32(frame))).count == 1)
+        }
+        #expect(receiver.fecFindings.isArmed)
+
+        // One packet lost out of four, one repair packet: rebuilt, no recovery needed.
+        let repaired = try deliver(frame: 5, dropping: [1])
+        #expect(NvstReceiverFixtures.frames(repaired).map(\.frameIndex) == [5])
+        #expect(NvstReceiverFixtures.recoveries(repaired) == 0)
+        #expect(receiver.snapshot.recoveredPackets == 1)
+
+        // Two lost: beyond repair. The next frame is held for one frame of slack...
+        #expect(NvstReceiverFixtures.frames(try deliver(frame: 6, dropping: [1, 2])).isEmpty)
+        let held = try deliver(frame: 7)
+        #expect(NvstReceiverFixtures.frames(held).isEmpty)
+        #expect(NvstReceiverFixtures.recoveries(held) == 0)
+        // ...and released when the frame after it starts, long before 1,200 packets have passed.
+        let released = try deliver(frame: 8)
+        #expect(NvstReceiverFixtures.recoveries(released) == 1)
+        #expect(NvstReceiverFixtures.frames(released).map(\.frameIndex) == [7, 8])
+        #expect(receiver.snapshot.finalizedLossPackets == 2)
+    }
+
     @Test func fecRepairPacketsAreCountedNotDecoded() throws {
         let handoff = NvstReceiverFixtures.makeHandoff()
         let receiver = try NvstVideoReceiver(handoff: handoff)
