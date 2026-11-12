@@ -5855,8 +5855,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
         var timeline = SessionTimeline()
         for second in 0..<(SessionTimeline.maxRows * 2) {
             timeline.record(StreamRuntimeSample(
-                timestamp: 0, pingMs: second == 7 ? 180 : 25, receivedFps: second == 9 ? 31 : 60,
-                packetsLostDelta: 1,
+                timestamp: 0, pingMs: second == 7 ? 180 : 25, jitterMs: second == 7 ? 0.42 : 0.05,
+                receivedFps: second == 9 ? 31 : 60, packetsLostDelta: 1,
                 arrivedCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: second == 8 ? 90 : 17, longGaps: 1),
                 interruption: second == 6 ? .away : .none, networkSilences: 2
             ), offsetSeconds: second)
@@ -5869,6 +5869,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         // A folded row keeps the worst of what it covers.
         XCTAssertEqual(timeline.rows[3].offsetSeconds, 6)
         XCTAssertEqual(timeline.rows[3].peakPingMs, 180)
+        XCTAssertEqual(timeline.rows[3].peakJitterUs, 420)
         XCTAssertEqual(timeline.rows[3].phase, 2)
         XCTAssertEqual(timeline.rows[4].longestDecoderGapMs, 90)
         XCTAssertEqual(timeline.rows[4].lowestReceivedFps, 31)

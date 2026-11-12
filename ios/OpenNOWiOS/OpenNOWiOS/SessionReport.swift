@@ -369,20 +369,25 @@ struct SessionTimelineRow: Equatable {
     var longestScreenGapMs = 0
     var framesNeverShown = 0
     var lateDisplayTicks = 0
+    /// Arrival jitter in microseconds. The native transport sends this same figure to the server
+    /// as its delay reading, which the server's bitrate control acts on.
+    var peakJitterUs: Int?
     /// 0 in front since the start, 1 back after being away, 2 away.
     var phase = 0
 
     static let columns = [
         "offsetSeconds", "samples", "peakPingMs", "lowestReceivedFps", "lowestDecodedFps", "lowestShownFps",
         "lowestBitrateKbps", "packetsLost", "networkSilences", "longestNetworkSilenceMs", "decoderStutters",
-        "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks", "phase"
+        "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks",
+        "peakJitterUs", "phase"
     ]
 
     /// In the order of `columns`; -1 stands for a reading the stretch did not have.
     var values: [Int] {
         [offsetSeconds, samples, peakPingMs ?? -1, lowestReceivedFps ?? -1, lowestDecodedFps ?? -1, lowestShownFps ?? -1,
          lowestBitrateKbps ?? -1, packetsLost, networkSilences, longestNetworkSilenceMs, decoderStutters,
-         longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks, phase]
+         longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks,
+         peakJitterUs ?? -1, phase]
     }
 
     init(_ sample: StreamRuntimeSample, offsetSeconds: Int) {
@@ -401,6 +406,7 @@ struct SessionTimelineRow: Equatable {
         longestScreenGapMs = Int((sample.shownCadence?.longestGapMs ?? 0).rounded())
         framesNeverShown = sample.arrivedCadence?.replaced ?? 0
         lateDisplayTicks = sample.shownCadence?.lateTicks ?? 0
+        peakJitterUs = sample.jitterMs.map { Int(($0 * 1_000).rounded()) }
         switch sample.interruption {
         case .none: phase = 0
         case .returned: phase = 1
@@ -429,6 +435,7 @@ struct SessionTimelineRow: Equatable {
         longestScreenGapMs = max(longestScreenGapMs, next.longestScreenGapMs)
         framesNeverShown += next.framesNeverShown
         lateDisplayTicks += next.lateDisplayTicks
+        peakJitterUs = worst(peakJitterUs, next.peakJitterUs, max)
         phase = max(phase, next.phase)
     }
 }
