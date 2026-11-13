@@ -222,6 +222,8 @@ struct StreamRuntimeSample: Equatable {
     var longestLateReceiveWakeUpMs: Double? = nil
     /// Packets on the device's network interfaces this second (see `NetworkInterfaceActivity`).
     var interfaces: NetworkInterfaceActivity? = nil
+    /// How long frames were being held back to smooth over Wi-Fi pauses, in milliseconds.
+    var smoothingDelayMs: Int? = nil
     /// The transport's own running counters as one line of text: loss, repairs, keyframe requests.
     var transportDetail: String? = nil
 
@@ -383,6 +385,7 @@ struct SessionTimelineRow: Equatable {
     var wifiPackets: Int?
     var peerToPeerPackets: Int?
     var lowLatencyLinkPackets: Int?
+    var smoothingDelayMs: Int?
     /// 0 in front since the start, 1 back after being away, 2 away.
     var phase = 0
 
@@ -391,7 +394,7 @@ struct SessionTimelineRow: Equatable {
         "lowestBitrateKbps", "packetsLost", "networkSilences", "longestNetworkSilenceMs", "decoderStutters",
         "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks",
         "peakJitterUs", "lateReceiveWakeUps", "longestLateReceiveWakeUpMs",
-        "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "phase"
+        "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "smoothingDelayMs", "phase"
     ]
 
     /// In the order of `columns`; -1 stands for a reading the stretch did not have.
@@ -400,7 +403,7 @@ struct SessionTimelineRow: Equatable {
          lowestBitrateKbps ?? -1, packetsLost, networkSilences, longestNetworkSilenceMs, decoderStutters,
          longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks,
          peakJitterUs ?? -1, lateReceiveWakeUps, longestLateReceiveWakeUpMs,
-         wifiPackets ?? -1, peerToPeerPackets ?? -1, lowLatencyLinkPackets ?? -1, phase]
+         wifiPackets ?? -1, peerToPeerPackets ?? -1, lowLatencyLinkPackets ?? -1, smoothingDelayMs ?? -1, phase]
     }
 
     init(_ sample: StreamRuntimeSample, offsetSeconds: Int) {
@@ -425,6 +428,7 @@ struct SessionTimelineRow: Equatable {
         wifiPackets = sample.interfaces?.wifiPackets
         peerToPeerPackets = sample.interfaces?.peerToPeerPackets
         lowLatencyLinkPackets = sample.interfaces?.lowLatencyLinkPackets
+        smoothingDelayMs = sample.smoothingDelayMs
         switch sample.interruption {
         case .none: phase = 0
         case .returned: phase = 1
@@ -460,6 +464,7 @@ struct SessionTimelineRow: Equatable {
         wifiPackets = sum(wifiPackets, next.wifiPackets)
         peerToPeerPackets = sum(peerToPeerPackets, next.peerToPeerPackets)
         lowLatencyLinkPackets = sum(lowLatencyLinkPackets, next.lowLatencyLinkPackets)
+        smoothingDelayMs = worst(smoothingDelayMs, next.smoothingDelayMs, max)
         phase = max(phase, next.phase)
     }
 }

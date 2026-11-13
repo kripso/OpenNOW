@@ -67,6 +67,12 @@ func nativeStreamWaitingFrameCapacity(streamFPS: Int, displayMaximumFPS: Int) ->
     Double(displayMaximumFPS) >= Double(max(1, streamFPS)) * 1.5 ? 2 : 1
 }
 
+/// How many frames may wait while they are being held back by `delay`: every frame of the hold,
+/// plus a burst's worth arriving at once after a pause.
+func nativeStreamHeldFrameCapacity(delay: TimeInterval, streamFPS: Int) -> Int {
+    Int(((delay + 0.15) * Double(max(1, streamFPS))).rounded(.up)) + 2
+}
+
 /// Picks the candidate pair the stream is actually using out of a statistics report.
 ///
 /// A report lists every pair that ever succeeded, and more appear during a session as the device
@@ -3271,6 +3277,20 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var nativeNVSTFinished = false
 
     private let networkMonitor = NWPathMonitor()
+    private var wifiPauseSmoothing = NativeStreamWiFiPauseSmoothing()
+    /// The hold the renderer is applying now, in milliseconds.
+    private var appliedPlayoutDelayMs = 0
+
+    private func updateWiFiPauseSmoothing(longestSilenceMilliseconds: Double) {
+        let wanted = Int(wifiPauseSmoothing.record(longestSilenceMilliseconds: longestSilenceMilliseconds).rounded())
+        guard wanted != appliedPlayoutDelayMs else { return }
+        let applied = renderer?.setPlayoutDelay(Double(wanted) / 1_000) ?? false
+        let effective = applied ? wanted : 0
+        if (effective > 0) != (appliedPlayoutDelayMs > 0) {
+            logger.notice("Wi-Fi pause smoothing \(effective > 0 ? "on, holding frames \(effective) ms" : "off", privacy: .public)")
+        }
+        appliedPlayoutDelayMs = effective
+    }
     private var lastInterfaceCounters: NetworkInterfaceActivity.Counters?
     /// Packets per interface since the previous stats sample; nil on the first.
     private func drainInterfaceActivity() -> NetworkInterfaceActivity? {
@@ -3715,6 +3735,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         statsSnapshot.effects = renderer?.videoEffectsStatus ?? ""
         statsSnapshot.presentationRates = renderer?.presentationRates
         if decoded > 0 { handleDecodedVideoProgress(framesDecoded: decoded); raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution) }
+        updateWiFiPauseSmoothing(longestSilenceMilliseconds: sample.networkSilences.longestMilliseconds)
         let cadence = renderer?.drainFrameCadence()
         let pip = pictureInPictureBridge.drainConversionCost()
         onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
@@ -3732,6 +3753,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             lateReceiveWakeUps: sample.networkSilences.lateWakeUps,
             longestLateReceiveWakeUpMs: sample.networkSilences.longestLateMilliseconds,
             interfaces: drainInterfaceActivity(),
+            smoothingDelayMs: appliedPlayoutDelayMs,
             transportDetail: sample.detail))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
@@ -6911,6 +6933,18 @@ private final class NativeStreamRenderView: UIView {
         filteredRendererActive ? filteredMetalView?.drainFrameCadence() : nil
     }
 
+    /// Holds frames back to smooth over pauses. Only the filtered renderer paces its own frames;
+    /// returns false when it is not the one in use.
+    @discardableResult
+    func setPlayoutDelay(_ seconds: TimeInterval) -> Bool {
+        rendererStateLock.lock()
+        let active = filteredRendererActive
+        let filtered = filteredMetalView
+        rendererStateLock.unlock()
+        filtered?.setPlayoutDelay(active ? seconds : 0)
+        return active && filtered != nil
+    }
+
     func setVideoCodec(_ codec: NativeStreamVideoCodec) {
         rendererStateLock.lock()
         videoCodec = codec
@@ -7168,8 +7202,13 @@ final class NativeStreamFramePixelBufferBridge {
 final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
     struct Entry {
         let frame: Frame
+        /// When the frame may be shown, on the `CACurrentMediaTime` clock. Zero means at once.
+        var due: TimeInterval = 0
     }
 
+    /// While frames are held back, the most already-due frames kept waiting: a longer backlog is
+    /// shown late anyway, so its oldest are dropped.
+    private let dueBacklog = 2
     private let lock = NSLock()
     private let maximumInFlight: Int
     private var pending: [Entry] = []
@@ -7192,10 +7231,10 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
 
     /// Whether the frame pushed out one that was still waiting to be shown.
     @discardableResult
-    func offer(_ frame: Frame) -> Bool {
+    func offer(_ frame: Frame, due: TimeInterval = 0) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        pending.append(Entry(frame: frame))
+        pending.append(Entry(frame: frame, due: due))
         guard pending.count > capacity else { return false }
         pending.removeFirst(pending.count - capacity)
         return true
@@ -7206,11 +7245,25 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
         return !pending.isEmpty
     }
 
-    /// The oldest waiting frame.
-    func take() -> Entry? {
+    /// Whether the oldest waiting frame may be shown at `now`.
+    func hasDue(at now: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pending.first.map { $0.due <= now } ?? false
+    }
+
+    /// Lets every held frame be shown at once, for when holding stops.
+    func releaseHeldFrames() {
+        lock.lock(); defer { lock.unlock() }
+        for index in pending.indices { pending[index].due = 0 }
+    }
+
+    /// The oldest waiting frame that may be shown at `now`.
+    func take(now: TimeInterval = .infinity) -> Entry? {
         lock.lock()
         defer { lock.unlock() }
-        guard inFlight < maximumInFlight, !pending.isEmpty else { return nil }
+        guard inFlight < maximumInFlight, let first = pending.first, first.due <= now else { return nil }
+        let dueCount = pending.prefix { $0.due <= now }.count
+        if dueCount > dueBacklog { pending.removeFirst(dueCount - dueBacklog) }
         inFlight += 1
         return pending.removeFirst()
     }
@@ -7220,6 +7273,75 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
         precondition(inFlight > 0)
         inFlight -= 1
         lock.unlock()
+    }
+}
+
+/// When to show a frame so that frames reaching the device in bursts are shown at the pace they
+/// were captured.
+///
+/// A frame is due `delay` after the moment it would have arrived had it come as quickly as the
+/// quickest frame lately: its capture time (the stream's 90 kHz timestamp) plus the shortest
+/// capture-to-arrival time of the last two seconds. That is never later than `delay` after its
+/// own arrival, and with no delay never later than its arrival, so it is then shown at once.
+struct NativeStreamPlayoutSchedule {
+    static let window: TimeInterval = 2
+    static let clockRate = 90_000.0
+
+    private var mediaTicks: Int64 = 0
+    private var lastTimestamp: UInt32?
+    /// Arrivals in the window whose capture-to-arrival time no later arrival has beaten, in order:
+    /// the first is the window's shortest.
+    private var transits: [(arrival: TimeInterval, transit: TimeInterval)] = []
+
+    mutating func due(arrival: TimeInterval, timestamp: UInt32, delay: TimeInterval) -> TimeInterval {
+        if let lastTimestamp { mediaTicks += Int64(Int32(bitPattern: timestamp &- lastTimestamp)) }
+        lastTimestamp = timestamp
+        let media = Double(mediaTicks) / Self.clockRate
+        let transit = arrival - media
+        while let last = transits.last, last.transit >= transit { transits.removeLast() }
+        transits.append((arrival, transit))
+        while let first = transits.first, first.arrival < arrival - Self.window { transits.removeFirst() }
+        return media + transits[0].transit + delay
+    }
+}
+
+/// Decides when to hold frames back to smooth over Wi-Fi pauses, and by how much.
+///
+/// Apple's peer-to-peer Wi-Fi, once something nearby starts it, takes the radio off the network's
+/// channel about twice a second for ~100 ms, for a minute or so. Frames then arrive in bursts and
+/// most of a burst is never shown. Holding frames back by a little more than the pauses shows
+/// them evenly instead. That costs the same amount of latency, so it is only done while pauses
+/// keep happening: from the second second in a row with one, until five quiet seconds.
+struct NativeStreamWiFiPauseSmoothing {
+    static let pauseMilliseconds = 80.0
+    static let engageAfterSeconds = 2
+    static let releaseAfterSeconds = 5
+    static let marginMilliseconds = 15.0
+    static let delayRange = 60.0...150.0
+
+    private(set) var delayMilliseconds = 0.0
+    private var secondsWithPauses = 0
+    private var quietSeconds = 0
+    private var longestPause = 0.0
+
+    /// One second of readings: the longest stretch the socket received nothing. Returns the delay
+    /// to hold frames by, in milliseconds; zero when not smoothing.
+    mutating func record(longestSilenceMilliseconds: Double) -> Double {
+        if longestSilenceMilliseconds >= Self.pauseMilliseconds {
+            secondsWithPauses += 1
+            quietSeconds = 0
+            longestPause = max(longestPause, longestSilenceMilliseconds)
+            if delayMilliseconds > 0 || secondsWithPauses >= Self.engageAfterSeconds {
+                delayMilliseconds = min(max(longestPause + Self.marginMilliseconds, Self.delayRange.lowerBound),
+                                        Self.delayRange.upperBound)
+            }
+        } else {
+            quietSeconds += 1
+            secondsWithPauses = 0
+            if delayMilliseconds > 0, quietSeconds >= Self.releaseAfterSeconds { delayMilliseconds = 0 }
+            if delayMilliseconds == 0 { longestPause = 0 }
+        }
+        return delayMilliseconds
     }
 }
 
@@ -7298,6 +7420,20 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var streamFPS = 60
     private var displayLink: CADisplayLink?
     private lazy var displayClock = DisplayClock(owner: self)
+    private let playoutLock = NSLock()
+    private var playout = NativeStreamPlayoutSchedule()
+    private var playoutDelay: TimeInterval = 0
+    /// When the frame drawn now will reach the screen; frames due by then may be drawn.
+    private var nextPresentationTime: CFTimeInterval = 0
+
+    /// Holds each frame back by `seconds` behind its capture pace; zero shows frames at once.
+    func setPlayoutDelay(_ seconds: TimeInterval) {
+        playoutLock.lock()
+        let wasHolding = playoutDelay > 0
+        playoutDelay = max(0, seconds)
+        playoutLock.unlock()
+        if wasHolding, seconds <= 0 { frames.releaseHeldFrames() }
+    }
 
     private final class DisplayClock: NSObject {
         weak var owner: NativeStreamFilteredMetalView?
@@ -7400,7 +7536,13 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private func displayTick(_ link: CADisplayLink) {
         let interval = link.targetTimestamp - link.timestamp
         presentations.cadence.noteTick(time: CACurrentMediaTime(), interval: interval)
-        if interval > 0 {
+        nextPresentationTime = link.targetTimestamp
+        playoutLock.lock()
+        let delay = playoutDelay
+        playoutLock.unlock()
+        if delay > 0 {
+            frames.setCapacity(nativeStreamHeldFrameCapacity(delay: delay, streamFPS: streamFPS))
+        } else if interval > 0 {
             // From the rate the clock is really running at: the system can hold a 120 Hz panel
             // to 60 Hz (Low Power Mode, heat), and a second waiting frame would then only add delay.
             frames.setCapacity(nativeStreamWaitingFrameCapacity(
@@ -7411,7 +7553,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     func display(frame: RTCVideoFrame?) {
         guard let frame else { return }
-        arrivals.observe(time: CACurrentMediaTime(), replacedPending: frames.offer(frame))
+        let now = CACurrentMediaTime()
+        playoutLock.lock()
+        let due = playout.due(arrival: now, timestamp: UInt32(bitPattern: frame.timeStamp), delay: playoutDelay)
+        let holding = playoutDelay > 0
+        playoutLock.unlock()
+        arrivals.observe(time: now, replacedPending: frames.offer(frame, due: holding ? due : 0))
     }
 
     /// Frame gaps since the last call: out of the decoder, and onto the screen.
@@ -7425,7 +7572,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         guard !isHidden, window != nil else { return }
         let drawStarted = CACurrentMediaTime()
         guard gpuAdmission.wait(timeout: .now()) == .success else {
-            if frames.hasPending { presentations.cadence.noteHeldBack() }
+            if frames.hasDue(at: nextPresentationTime) { presentations.cadence.noteHeldBack() }
             return
         }
         var submitted = false
@@ -7436,8 +7583,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 gpuAdmission.signal()
             }
         }
-        guard let entry = frames.take() else {
-            if frames.hasPending { presentations.cadence.noteHeldBack() }
+        guard let entry = frames.take(now: nextPresentationTime) else {
+            if frames.hasDue(at: nextPresentationTime) { presentations.cadence.noteHeldBack() }
             return
         }
         defer {

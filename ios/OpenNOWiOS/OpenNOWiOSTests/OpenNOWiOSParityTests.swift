@@ -2946,6 +2946,126 @@ final class OpenNOWiOSParityTests: XCTestCase {
         mailbox.complete()
     }
 
+    func testFramesThatArriveInABurstAreDueAtTheirCapturePace() {
+        var schedule = NativeStreamPlayoutSchedule()
+        let tick: UInt32 = 1_500 // one 60 fps frame on the 90 kHz clock
+        let frame = 1.0 / 60
+        // Starts just below the wrap of the 32-bit timestamp, which must not disturb the pace.
+        var timestamp = UInt32.max - 4 * tick
+        var dues: [TimeInterval] = []
+        // Six frames on time, then nothing for 100 ms, then the five held back all at once.
+        for index in 0..<6 {
+            dues.append(schedule.due(arrival: 10 + Double(index) * frame, timestamp: timestamp, delay: 0.115))
+            timestamp &+= tick
+        }
+        let burstArrival = 10 + 5 * frame + 0.1
+        for _ in 0..<5 {
+            dues.append(schedule.due(arrival: burstArrival, timestamp: timestamp, delay: 0.115))
+            timestamp &+= tick
+        }
+        // Every frame is due 115 ms after it would have arrived on time: one frame apart.
+        for (index, due) in dues.enumerated() {
+            XCTAssertEqual(due, 10 + Double(index) * frame + 0.115, accuracy: 0.000_1)
+        }
+        // With no hold a frame is never due later than its arrival.
+        XCTAssertLessThanOrEqual(schedule.due(arrival: burstArrival + 0.01, timestamp: timestamp, delay: 0), burstArrival + 0.01)
+    }
+
+    /// The case from real reports: a 60 fps stream while the radio leaves the channel for ~100 ms
+    /// twice a second, shown on a 120 Hz panel. Without a hold most of each burst is never shown and
+    /// the picture stops for the length of each pause; holding frames by a little more than the pause
+    /// shows every frame, evenly.
+    func testHoldingFramesShowsABurstyStreamEvenly() {
+        struct Outcome { var shown = 0; var longestGap = 0.0 }
+        func play(delay: TimeInterval) -> Outcome {
+            let fps = 60, frame = 1.0 / 60, tick = 1.0 / 120
+            let mailbox = NativeStreamLatestFrameMailbox<Int>(maximumInFlight: 3)
+            mailbox.setCapacity(delay > 0 ? nativeStreamHeldFrameCapacity(delay: delay, streamFPS: fps)
+                                          : nativeStreamWaitingFrameCapacity(streamFPS: fps, displayMaximumFPS: 120))
+            var schedule = NativeStreamPlayoutSchedule()
+            // Arrival of each of 300 frames (5 s): on time, except that the radio is away for
+            // 100 ms at 0.2 s and 0.7 s into every second, and what was sent meanwhile lands at once.
+            let arrivals: [TimeInterval] = (0..<300).map { index in
+                let sent = Double(index) * frame
+                let second = sent.rounded(.down), within = sent - second
+                for start in [0.2, 0.7] where within >= start && within < start + 0.1 {
+                    return second + start + 0.1
+                }
+                return sent
+            }
+            var outcome = Outcome()
+            var lastShown: TimeInterval?
+            var next = 0
+            var now = 0.0
+            while now < 5.5 {
+                while next < arrivals.count, arrivals[next] <= now {
+                    let due = schedule.due(arrival: arrivals[next], timestamp: UInt32(next * 1_500), delay: delay)
+                    mailbox.offer(next, due: delay > 0 ? due : 0)
+                    next += 1
+                }
+                if mailbox.take(now: now) != nil {
+                    mailbox.complete()
+                    outcome.shown += 1
+                    if let lastShown, now < 5 { outcome.longestGap = max(outcome.longestGap, now - lastShown) }
+                    lastShown = now
+                }
+                now += tick
+            }
+            return outcome
+        }
+        let unsmoothed = play(delay: 0)
+        let smoothed = play(delay: 0.115)
+        XCTAssertLessThan(unsmoothed.shown, 260)
+        XCTAssertGreaterThan(unsmoothed.longestGap, 0.09)
+        XCTAssertEqual(smoothed.shown, 300)
+        XCTAssertLessThan(smoothed.longestGap, 0.03)
+    }
+
+    func testWiFiPauseSmoothingOnlyHoldsFramesWhilePausesKeepHappening() {
+        var smoothing = NativeStreamWiFiPauseSmoothing()
+        // Ordinary small gaps, and one pause on its own, change nothing.
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 40), 0)
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 104), 0)
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 0), 0)
+        // Two seconds in a row with a pause turn it on, a little longer than the longest pause.
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 98), 0)
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 104), 119)
+        // It follows the longest pause, within its range.
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 679), 150)
+        // It stays on through four quiet seconds and turns off on the fifth.
+        for _ in 0..<4 { XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 0), 150) }
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 0), 0)
+        // And it starts over from scratch.
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 85), 0)
+        XCTAssertEqual(smoothing.record(longestSilenceMilliseconds: 85), 100)
+    }
+
+    func testTheMailboxHoldsAFrameUntilItIsDue() {
+        let mailbox = NativeStreamLatestFrameMailbox<Int>(maximumInFlight: 4)
+        mailbox.setCapacity(8)
+        mailbox.offer(1, due: 1.0)
+        mailbox.offer(2, due: 1.1)
+        XCTAssertFalse(mailbox.hasDue(at: 0.9))
+        XCTAssertNil(mailbox.take(now: 0.9))
+        XCTAssertEqual(mailbox.take(now: 1.0)?.frame, 1)
+        mailbox.complete()
+        // Late: of the frames already due only the newest two are kept.
+        mailbox.offer(3, due: 1.2); mailbox.offer(4, due: 1.3); mailbox.offer(5, due: 2.0)
+        XCTAssertEqual(mailbox.take(now: 1.5)?.frame, 3)
+        mailbox.complete()
+        XCTAssertEqual(mailbox.take(now: 1.5)?.frame, 4)
+        mailbox.complete()
+        XCTAssertNil(mailbox.take(now: 1.5))
+        // Releasing the hold makes everything waiting due at once.
+        mailbox.releaseHeldFrames()
+        XCTAssertEqual(mailbox.take(now: 0)?.frame, 5)
+        mailbox.complete()
+        // Without due times it behaves as before: oldest first, whenever asked.
+        mailbox.offer(6); mailbox.offer(7)
+        XCTAssertEqual(mailbox.take()?.frame, 6)
+        mailbox.complete()
+    }
+
     func testASocketThatGoesQuietForAFramesTurnIsCountedAsANetworkSilence() throws {
         var meter = NvstSocketSilenceMeter()
         let ms: UInt64 = 1_000_000
@@ -3041,6 +3161,10 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(row[columns.firstIndex(of: "wifiPackets")!], 3_200)
         XCTAssertEqual(row[columns.firstIndex(of: "peerToPeerPackets")!], 40)
         XCTAssertEqual(row[columns.firstIndex(of: "lowLatencyLinkPackets")!], -1)
+        XCTAssertEqual(row[columns.firstIndex(of: "smoothingDelayMs")!], -1)
+        var smoothed = SessionTimelineRow(StreamRuntimeSample(timestamp: 0, smoothingDelayMs: 0), offsetSeconds: 0)
+        smoothed.absorb(SessionTimelineRow(StreamRuntimeSample(timestamp: 1, smoothingDelayMs: 119), offsetSeconds: 1))
+        XCTAssertEqual(smoothed.smoothingDelayMs, 119)
     }
 
     func testLateReadsReachTheSessionTimeline() throws {
