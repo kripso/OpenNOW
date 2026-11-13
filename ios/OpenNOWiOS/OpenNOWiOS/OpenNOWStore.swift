@@ -1966,6 +1966,11 @@ enum StreamSettingsResolver {
         .init(value: "1024x768", aspectRatio: "4:3", tier: "768", requiredPlan: .free),
         .init(value: "1112x834", aspectRatio: "4:3", tier: "834", requiredPlan: .free),
         .init(value: "1600x1200", aspectRatio: "4:3", tier: "1080", requiredPlan: .free),
+        // 4:3 had nothing above 1200 lines, so an iPad's own shape could not get a 1440-class or
+        // 4K-class picture. Fewer pixels than 2560x1440 and 3840x2160 respectively.
+        .init(value: "1920x1440", aspectRatio: "4:3", tier: "1440", requiredPlan: .priority),
+        .init(value: "2048x1536", aspectRatio: "4:3", tier: "1440", requiredPlan: .priority),
+        .init(value: "2880x2160", aspectRatio: "4:3", tier: "2160", requiredPlan: .ultimate),
         .init(value: "1280x1024", aspectRatio: "5:4", tier: "1050", requiredPlan: .free),
         .init(value: "1600x720", aspectRatio: "20:9", tier: "720", requiredPlan: .free),
         .init(value: "1680x720", aspectRatio: "21:9", tier: "720", requiredPlan: .free),
@@ -2479,8 +2484,8 @@ enum StreamSettingsResolver {
         "900": ["16:9": "1600x900", "16:10": "1440x900"],
         "1050": ["16:10": "1680x1050", "5:4": "1280x1024"],
         "1080": ["16:9": "1920x1080", "16:10": "1920x1200", "4:3": "1600x1200", "20:9": "2400x1080", "21:9": "2560x1080", "32:9": "3840x1080"],
-        "1440": ["16:9": "2560x1440", "16:10": "2560x1600", "20:9": "3200x1440", "21:9": "3440x1440", "24:10": "3840x1600", "32:9": "5120x1440"],
-        "2160": ["16:9": "3840x2160", "16:10": "3456x2160", "20:9": "4800x2160", "21:9": "5120x2160"],
+        "1440": ["16:9": "2560x1440", "16:10": "2560x1600", "4:3": "2048x1536", "20:9": "3200x1440", "21:9": "3440x1440", "24:10": "3840x1600", "32:9": "5120x1440"],
+        "2160": ["16:9": "3840x2160", "16:10": "3456x2160", "4:3": "2880x2160", "20:9": "4800x2160", "21:9": "5120x2160"],
         "2880": ["16:9": "5120x2880"]
     ]
 }
