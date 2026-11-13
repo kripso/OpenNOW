@@ -51,9 +51,11 @@ final class NvstRtspSocketTests: XCTestCase {
         XCTAssertLessThan(cancelledAt.duration(to: .now), .seconds(2))
     }
 
-    /// The deadline for tests that need CONNECT/UPGRADE to succeed. The one deadline covers the TCP
-    /// connect and the WebSocket upgrade too, and in a freshly launched test host those took longer
-    /// than 250 ms often enough to fail these tests with `timedOut("CONNECT/UPGRADE")`.
+    /// The deadline for tests that need CONNECT/UPGRADE to succeed. The one deadline covers the
+    /// loopback TCP connect and the WebSocket upgrade. Across 18 setups in six full-suite runs the
+    /// TCP connect alone took up to 224 ms (median 15) and the whole setup up to 239 ms, while the
+    /// upgrade never took more than 27 ms, so 250 ms failed about one full run in three with
+    /// `timedOut("CONNECT/UPGRADE")`.
     private static let deadlineConnectMustBeat: Duration = .seconds(2)
 
     func testSilentRtspResponseTimesOut() async throws {
