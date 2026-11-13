@@ -224,6 +224,10 @@ struct StreamRuntimeSample: Equatable {
     var interfaces: NetworkInterfaceActivity? = nil
     /// How long frames were being held back to smooth over Wi-Fi pauses, in milliseconds.
     var smoothingDelayMs: Int? = nil
+    /// Frames that came out of the decoder a 120 Hz refresh or more behind the stream's own pace,
+    /// and the latest of them.
+    var lateFrames: Int? = nil
+    var longestFrameLatenessMs: Double? = nil
     /// The transport's own running counters as one line of text: loss, repairs, keyframe requests.
     var transportDetail: String? = nil
 
@@ -386,6 +390,10 @@ struct SessionTimelineRow: Equatable {
     var peerToPeerPackets: Int?
     var lowLatencyLinkPackets: Int?
     var smoothingDelayMs: Int?
+    /// Display refreshes in the stretch, per sample: how fast the screen's clock really ran.
+    var displayTicks: Int?
+    var lateFrames: Int?
+    var longestFrameLatenessMs: Int?
     /// 0 in front since the start, 1 back after being away, 2 away.
     var phase = 0
 
@@ -394,7 +402,7 @@ struct SessionTimelineRow: Equatable {
         "lowestBitrateKbps", "packetsLost", "networkSilences", "longestNetworkSilenceMs", "decoderStutters",
         "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks",
         "peakJitterUs", "lateReceiveWakeUps", "longestLateReceiveWakeUpMs",
-        "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "smoothingDelayMs", "phase"
+        "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "smoothingDelayMs", "displayTicks", "lateFrames", "longestFrameLatenessMs", "phase"
     ]
 
     /// In the order of `columns`; -1 stands for a reading the stretch did not have.
@@ -403,7 +411,8 @@ struct SessionTimelineRow: Equatable {
          lowestBitrateKbps ?? -1, packetsLost, networkSilences, longestNetworkSilenceMs, decoderStutters,
          longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks,
          peakJitterUs ?? -1, lateReceiveWakeUps, longestLateReceiveWakeUpMs,
-         wifiPackets ?? -1, peerToPeerPackets ?? -1, lowLatencyLinkPackets ?? -1, smoothingDelayMs ?? -1, phase]
+         wifiPackets ?? -1, peerToPeerPackets ?? -1, lowLatencyLinkPackets ?? -1, smoothingDelayMs ?? -1,
+         displayTicks ?? -1, lateFrames ?? -1, longestFrameLatenessMs ?? -1, phase]
     }
 
     init(_ sample: StreamRuntimeSample, offsetSeconds: Int) {
@@ -429,6 +438,9 @@ struct SessionTimelineRow: Equatable {
         peerToPeerPackets = sample.interfaces?.peerToPeerPackets
         lowLatencyLinkPackets = sample.interfaces?.lowLatencyLinkPackets
         smoothingDelayMs = sample.smoothingDelayMs
+        displayTicks = sample.shownCadence?.ticks
+        lateFrames = sample.lateFrames
+        longestFrameLatenessMs = sample.longestFrameLatenessMs.map { Int($0.rounded()) }
         switch sample.interruption {
         case .none: phase = 0
         case .returned: phase = 1
@@ -465,6 +477,10 @@ struct SessionTimelineRow: Equatable {
         peerToPeerPackets = sum(peerToPeerPackets, next.peerToPeerPackets)
         lowLatencyLinkPackets = sum(lowLatencyLinkPackets, next.lowLatencyLinkPackets)
         smoothingDelayMs = worst(smoothingDelayMs, next.smoothingDelayMs, max)
+        // Per sample, so the slowest second the stretch had shows rather than a sum.
+        displayTicks = worst(displayTicks, next.displayTicks, min)
+        lateFrames = sum(lateFrames, next.lateFrames)
+        longestFrameLatenessMs = worst(longestFrameLatenessMs, next.longestFrameLatenessMs, max)
         phase = max(phase, next.phase)
     }
 }

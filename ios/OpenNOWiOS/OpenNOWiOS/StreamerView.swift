@@ -67,6 +67,10 @@ func nativeStreamWaitingFrameCapacity(streamFPS: Int, displayMaximumFPS: Int) ->
     Double(displayMaximumFPS) >= Double(max(1, streamFPS)) * 1.5 ? 2 : 1
 }
 
+/// A frame this much later than the stream's pace misses the refresh it was meant for on a 120 Hz
+/// screen.
+let nativeStreamLateFrameSeconds: TimeInterval = 1.0 / 120
+
 /// How many frames may wait while they are being held back by `delay`: every frame of the hold,
 /// plus a burst's worth arriving at once after a pause.
 func nativeStreamHeldFrameCapacity(delay: TimeInterval, streamFPS: Int) -> Int {
@@ -3737,6 +3741,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         if decoded > 0 { handleDecodedVideoProgress(framesDecoded: decoded); raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution) }
         updateWiFiPauseSmoothing(longestSilenceMilliseconds: sample.networkSilences.longestMilliseconds)
         let cadence = renderer?.drainFrameCadence()
+        let late = renderer?.drainLateFrames()
         let pip = pictureInPictureBridge.drainConversionCost()
         onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
             bitrateKbps: bitrate, jitterMs: sample.jitterMilliseconds, fps: decodedFPS, receivedFps: receivedFPS,
@@ -3754,6 +3759,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             longestLateReceiveWakeUpMs: sample.networkSilences.longestLateMilliseconds,
             interfaces: drainInterfaceActivity(),
             smoothingDelayMs: appliedPlayoutDelayMs,
+            lateFrames: late?.count, longestFrameLatenessMs: late?.longestMs,
             transportDetail: sample.detail))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
@@ -6933,6 +6939,10 @@ private final class NativeStreamRenderView: UIView {
         filteredRendererActive ? filteredMetalView?.drainFrameCadence() : nil
     }
 
+    func drainLateFrames() -> (count: Int, longestMs: Double)? {
+        filteredRendererActive ? filteredMetalView?.drainLateFrames() : nil
+    }
+
     /// Holds frames back to smooth over pauses. Only the filtered renderer paces its own frames;
     /// returns false when it is not the one in use.
     @discardableResult
@@ -7289,6 +7299,8 @@ struct NativeStreamPlayoutSchedule {
 
     private var mediaTicks: Int64 = 0
     private var lastTimestamp: UInt32?
+    /// How much later than the quickest frame of the window the last frame arrived.
+    private(set) var lastLateness: TimeInterval = 0
     /// Arrivals in the window whose capture-to-arrival time no later arrival has beaten, in order:
     /// the first is the window's shortest.
     private var transits: [(arrival: TimeInterval, transit: TimeInterval)] = []
@@ -7301,6 +7313,7 @@ struct NativeStreamPlayoutSchedule {
         while let last = transits.last, last.transit >= transit { transits.removeLast() }
         transits.append((arrival, transit))
         while let first = transits.first, first.arrival < arrival - Self.window { transits.removeFirst() }
+        lastLateness = transit - transits[0].transit
         return media + transits[0].transit + delay
     }
 }
@@ -7423,8 +7436,19 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let playoutLock = NSLock()
     private var playout = NativeStreamPlayoutSchedule()
     private var playoutDelay: TimeInterval = 0
+    /// Frames out of the decoder at least one 120 Hz refresh later than the stream's own pace, and
+    /// the latest of them, since the last drain.
+    private var lateFrames = 0
+    private var longestLateness: TimeInterval = 0
     /// When the frame drawn now will reach the screen; frames due by then may be drawn.
     private var nextPresentationTime: CFTimeInterval = 0
+
+    /// Frames that came out of the decoder late against the stream's pace, since the last call.
+    func drainLateFrames() -> (count: Int, longestMs: Double) {
+        playoutLock.lock(); defer { playoutLock.unlock() }
+        defer { lateFrames = 0; longestLateness = 0 }
+        return (lateFrames, longestLateness * 1_000)
+    }
 
     /// Holds each frame back by `seconds` behind its capture pace; zero shows frames at once.
     func setPlayoutDelay(_ seconds: TimeInterval) {
@@ -7557,6 +7581,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         playoutLock.lock()
         let due = playout.due(arrival: now, timestamp: UInt32(bitPattern: frame.timeStamp), delay: playoutDelay)
         let holding = playoutDelay > 0
+        if playout.lastLateness >= nativeStreamLateFrameSeconds { lateFrames += 1 }
+        longestLateness = max(longestLateness, playout.lastLateness)
         playoutLock.unlock()
         arrivals.observe(time: now, replacedPending: frames.offer(frame, due: holding ? due : 0))
     }

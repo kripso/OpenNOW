@@ -2967,6 +2967,9 @@ final class OpenNOWiOSParityTests: XCTestCase {
         for (index, due) in dues.enumerated() {
             XCTAssertEqual(due, 10 + Double(index) * frame + 0.115, accuracy: 0.000_1)
         }
+        // The last of the burst was the closest to on time: it was due five frames after the last
+        // on-time one, and arrived 100 ms after that.
+        XCTAssertEqual(schedule.lastLateness, 0.1 - 5 * frame, accuracy: 0.000_1)
         // With no hold a frame is never due later than its arrival.
         XCTAssertLessThanOrEqual(schedule.due(arrival: burstArrival + 0.01, timestamp: timestamp, delay: 0), burstArrival + 0.01)
     }
@@ -3162,6 +3165,17 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(row[columns.firstIndex(of: "peerToPeerPackets")!], 40)
         XCTAssertEqual(row[columns.firstIndex(of: "lowLatencyLinkPackets")!], -1)
         XCTAssertEqual(row[columns.firstIndex(of: "smoothingDelayMs")!], -1)
+        var display = SessionTimelineRow(StreamRuntimeSample(
+            timestamp: 0, shownCadence: NativeStreamFrameCadence(frames: 60, ticks: 120),
+            lateFrames: 3, longestFrameLatenessMs: 9.6), offsetSeconds: 0)
+        display.absorb(SessionTimelineRow(StreamRuntimeSample(
+            timestamp: 1, shownCadence: NativeStreamFrameCadence(frames: 60, ticks: 61),
+            lateFrames: 14, longestFrameLatenessMs: 12.2), offsetSeconds: 1))
+        // The slowest second's refresh count, all late frames, the latest of them.
+        XCTAssertEqual(display.displayTicks, 61)
+        XCTAssertEqual(display.lateFrames, 17)
+        XCTAssertEqual(display.longestFrameLatenessMs, 12)
+        XCTAssertEqual(SessionTimelineRow.columns.suffix(4), ["displayTicks", "lateFrames", "longestFrameLatenessMs", "phase"])
         var smoothed = SessionTimelineRow(StreamRuntimeSample(timestamp: 0, smoothingDelayMs: 0), offsetSeconds: 0)
         smoothed.absorb(SessionTimelineRow(StreamRuntimeSample(timestamp: 1, smoothingDelayMs: 119), offsetSeconds: 1))
         XCTAssertEqual(smoothed.smoothingDelayMs, 119)
