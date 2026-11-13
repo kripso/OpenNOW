@@ -51,11 +51,16 @@ final class NvstRtspSocketTests: XCTestCase {
         XCTAssertLessThan(cancelledAt.duration(to: .now), .seconds(2))
     }
 
+    /// The deadline for tests that need CONNECT/UPGRADE to succeed. The one deadline covers the TCP
+    /// connect and the WebSocket upgrade too, and in a freshly launched test host those took longer
+    /// than 250 ms often enough to fail these tests with `timedOut("CONNECT/UPGRADE")`.
+    private static let deadlineConnectMustBeat: Duration = .seconds(2)
+
     func testSilentRtspResponseTimesOut() async throws {
         let seat = try NvstLoopbackControlSeat(upgrade: .complete)
         let port = try await seat.start()
         defer { seat.stop() }
-        let client = NvstRtspConnection(target: .init(host: "localhost", port: port.rawValue), timeout: .milliseconds(250))
+        let client = NvstRtspConnection(target: .init(host: "localhost", port: port.rawValue), timeout: Self.deadlineConnectMustBeat)
         try await client.connect(connection: seat.client(port: port), sessionID: "test-session")
         do {
             _ = try await client.request(method: "DESCRIBE", uri: "rtsps://localhost", headers: [])
@@ -91,7 +96,7 @@ final class NvstRtspSocketTests: XCTestCase {
         let seat = try NvstLoopbackControlSeat(upgrade: .complete, answersRequests: true)
         let port = try await seat.start()
         defer { seat.stop() }
-        let client = NvstRtspConnection(target: .init(host: "localhost", port: port.rawValue), timeout: .milliseconds(250))
+        let client = NvstRtspConnection(target: .init(host: "localhost", port: port.rawValue), timeout: Self.deadlineConnectMustBeat)
         let connecting = expectation(description: "TCP/TLS stage")
         let upgrading = expectation(description: "WebSocket stage")
         let options = expectation(description: "OPTIONS stage")
@@ -104,7 +109,8 @@ final class NvstRtspSocketTests: XCTestCase {
             }
         }
         try await client.connect(connection: seat.client(port: port), sessionID: "test-session")
-        try await Task.sleep(for: .milliseconds(350))
+        // Outlive the connect deadline, so a deadline left armed would have cancelled the connection.
+        try await Task.sleep(for: Self.deadlineConnectMustBeat + .milliseconds(100))
         let response = try await client.request(method: "OPTIONS", uri: "rtsps://localhost", headers: [])
         XCTAssertEqual(response.statusCode, 200)
         await fulfillment(of: [connecting, upgrading, options], timeout: 2)
