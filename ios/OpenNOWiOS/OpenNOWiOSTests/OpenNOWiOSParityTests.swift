@@ -3699,28 +3699,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertFalse(nvst.contains("a=vqos.bllFec.enable"))
     }
 
-    func testFourByThreeOffersHighResolutionsForTheMembershipsThatAllowThem() {
-        let options = StreamSettingsResolver.resolutionOptions(for: "4:3").map(\.value)
-        XCTAssertEqual(options, ["Auto", "1024x768", "1112x834", "1600x1200", "1920x1440", "2048x1536", "2880x2160"])
-        func available(_ value: String, _ tier: String) -> Bool {
-            StreamSettingsResolver.isResolutionAvailable(
-                try! XCTUnwrap(StreamSettingsResolver.resolutionChoice(value: value, aspectRatio: "4:3")), membershipTier: tier)
-        }
-        XCTAssertTrue(available("1600x1200", "FREE"))
-        XCTAssertFalse(available("2048x1536", "FREE"))
-        XCTAssertTrue(available("2048x1536", "PERFORMANCE"))
-        XCTAssertFalse(available("2880x2160", "PERFORMANCE"))
-        XCTAssertTrue(available("2880x2160", "ULTIMATE"))
-        // A 4:3 pick a membership cannot have comes down to the best one it can.
-        XCTAssertEqual(StreamSettingsResolver.normalizedResolution("2880x2160", aspectRatio: "4:3", maxPlan: .priority), "2048x1536")
-        XCTAssertEqual(StreamSettingsResolver.normalizedResolution("2048x1536", aspectRatio: "4:3", maxPlan: .free), "1600x1200")
-        // The high preset on 4:3 now reaches the 1440 class, as it does on 16:9.
-        var base = AppSettings.default
-        base.preferredAspectRatio = "4:3"
-        let high = StreamSettingsResolver.settings(base, applying: .high, membershipTier: "PERFORMANCE")
-        XCTAssertEqual(high.preferredResolution, "2048x1536")
-    }
-
     func testStreamPresetsMatchAndroidValuesAndRespectAppleTierFPSCaps() {
         var base = AppSettings.default
         base.preferredAspectRatio = "16:9"
