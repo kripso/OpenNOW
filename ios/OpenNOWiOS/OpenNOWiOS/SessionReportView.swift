@@ -329,12 +329,6 @@ struct SessionReportView: View {
                         shown: raised.shown?.longGaps ?? 0, arrived: raised.arrived?.longGaps ?? 0,
                         seconds: raised.cadenceSeconds)
                 }
-                if delivery.pipFrames > 0 {
-                    measurementRow("Picture in picture", primary: "\(delivery.pipFrames) frames",
-                        secondary: String(format: "%.1f ms each · on in the app %d s",
-                                          delivery.pipConvertMs / Double(delivery.pipFrames), delivery.pipSecondsInApp),
-                        level: delivery.pipSecondsInApp > 0 ? .fair : .good)
-                }
                 measurementRow("Codec", primary: report.deliveredCodec ?? report.requestedCodec,
                     secondary: delivery.renderer, level: .good, showsDivider: false)
             }

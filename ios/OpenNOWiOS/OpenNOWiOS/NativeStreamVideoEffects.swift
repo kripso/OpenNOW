@@ -204,6 +204,33 @@ struct NativeStreamFrameCadence: Equatable, Encodable {
     var draws = 0
     var drawMs = 0.0
     var longestDrawMs = 0.0
+    /// Frames by how many display refreshes after the one before they were shown; the last
+    /// entry counts that many or more. A 60 fps stream on a 120 Hz screen is even when every
+    /// frame is at 2: a frame at 3 stayed a refresh too long and one at 1 was cut short.
+    var gapsInRefreshes = [Int](repeating: 0, count: NativeStreamFrameCadence.gapBuckets)
+    /// Gaps that were not the stream's own number of refreshes.
+    var unevenGaps = 0
+    /// Frames by how many refreshes after the one they were drawn for they reached the screen;
+    /// the last entry counts that many or more.
+    var presentedLate = [Int](repeating: 0, count: NativeStreamFrameCadence.lateBuckets)
+    /// Frames held one refresh so that they follow the frame before at the stream's pace.
+    var paced = 0
+    /// Gaps the frames already had when the server captured them: the game or the server sent
+    /// fewer frames, which no network or device delay explains.
+    var sourceLongGaps = 0
+    /// How long after the refresh it belongs to the display clock's callback ran.
+    var tickDelayMs = 0.0
+    var longestTickDelayMs = 0.0
+    /// Waits for a free drawable of two milliseconds or more.
+    var drawableWaits = 0
+    var longestDrawableWaitMs = 0.0
+    /// From the start of drawing a frame until the GPU had finished it.
+    var gpuFrames = 0
+    var gpuMs = 0.0
+    var longestGpuMs = 0.0
+
+    static let gapBuckets = 6
+    static let lateBuckets = 4
 
     /// Adds another window: counts add up, worst cases stay the worst.
     mutating func add(_ other: NativeStreamFrameCadence) {
@@ -218,6 +245,18 @@ struct NativeStreamFrameCadence: Equatable, Encodable {
         longestGapMs = max(longestGapMs, other.longestGapMs)
         longestTickGapMs = max(longestTickGapMs, other.longestTickGapMs)
         longestDrawMs = max(longestDrawMs, other.longestDrawMs)
+        gapsInRefreshes = zip(gapsInRefreshes, other.gapsInRefreshes).map(+)
+        unevenGaps += other.unevenGaps
+        presentedLate = zip(presentedLate, other.presentedLate).map(+)
+        paced += other.paced
+        sourceLongGaps += other.sourceLongGaps
+        tickDelayMs += other.tickDelayMs
+        longestTickDelayMs = max(longestTickDelayMs, other.longestTickDelayMs)
+        drawableWaits += other.drawableWaits
+        longestDrawableWaitMs = max(longestDrawableWaitMs, other.longestDrawableWaitMs)
+        gpuFrames += other.gpuFrames
+        gpuMs += other.gpuMs
+        longestGpuMs = max(longestGpuMs, other.longestGpuMs)
     }
 }
 
@@ -230,36 +269,63 @@ final class NativeStreamFrameCadenceMeter: @unchecked Sendable {
     private var last: Double?
     private var lastTick: Double?
     private var nominalInterval = 1.0 / 60
+    /// How far apart the screen refreshes, once the display clock has said; zero before.
+    private var refreshInterval = 0.0
     private var window = NativeStreamFrameCadence()
 
     func setStreamFrameRate(_ fps: Int) {
         lock.lock(); nominalInterval = 1.0 / Double(max(1, fps)); lock.unlock()
     }
 
-    func observe(time: Double, replacedPending: Bool = false) {
+    /// One frame at `time`. `target` is the refresh it was drawn for, where that is known.
+    func observe(time: Double, replacedPending: Bool = false, target: Double? = nil) {
         lock.lock(); defer { lock.unlock() }
         if replacedPending { window.replaced += 1 }
+        if let target, refreshInterval > 0 {
+            let late = Int(((time - target) / refreshInterval).rounded())
+            window.presentedLate[min(max(late, 0), NativeStreamFrameCadence.lateBuckets - 1)] += 1
+        }
         defer { last = time }
         guard let last, time > last, time - last < Self.pauseSeconds else { return }
         let gap = time - last
         window.frames += 1
         window.longestGapMs = max(window.longestGapMs, gap * 1_000)
         if gap >= nominalInterval * Self.longGapRatio { window.longGaps += 1 }
+        guard refreshInterval > 0 else { return }
+        let refreshes = Int((gap / refreshInterval).rounded())
+        window.gapsInRefreshes[min(max(refreshes, 0), NativeStreamFrameCadence.gapBuckets - 1)] += 1
+        if refreshes != max(1, Int((nominalInterval / refreshInterval).rounded())) { window.unevenGaps += 1 }
     }
 
     func noteHeldBack() {
         lock.lock(); window.heldBack += 1; lock.unlock()
     }
 
-    /// One callback of the display clock, `interval` being how far apart the screen asks for them.
-    func noteTick(time: Double, interval: Double) {
+    func notePaced() {
+        lock.lock(); window.paced += 1; lock.unlock()
+    }
+
+    /// A gap of `seconds` between two frames' capture times.
+    func noteSourceGap(seconds: Double) {
         lock.lock(); defer { lock.unlock() }
+        if seconds >= nominalInterval * Self.longGapRatio, seconds < Self.pauseSeconds { window.sourceLongGaps += 1 }
+    }
+
+    /// One callback of the display clock, `interval` being how far apart the screen asks for
+    /// them and `delay` how long after its refresh the callback ran.
+    func noteTick(time: Double, interval: Double, delay: Double = 0) {
+        lock.lock(); defer { lock.unlock() }
+        if interval > 0 { refreshInterval = interval }
         defer { lastTick = time }
         guard let lastTick, time > lastTick, time - lastTick < Self.pauseSeconds else { return }
         let gap = time - lastTick
         window.ticks += 1
         window.longestTickGapMs = max(window.longestTickGapMs, gap * 1_000)
         if interval > 0, gap >= interval * Self.longGapRatio { window.lateTicks += 1 }
+        if delay > 0, delay < Self.pauseSeconds {
+            window.tickDelayMs += delay * 1_000
+            window.longestTickDelayMs = max(window.longestTickDelayMs, delay * 1_000)
+        }
     }
 
     func noteDraw(milliseconds: Double) {
@@ -267,6 +333,19 @@ final class NativeStreamFrameCadenceMeter: @unchecked Sendable {
         window.draws += 1
         window.drawMs += milliseconds
         window.longestDrawMs = max(window.longestDrawMs, milliseconds)
+    }
+
+    func noteDrawableWait(milliseconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        if milliseconds >= 2 { window.drawableWaits += 1 }
+        window.longestDrawableWaitMs = max(window.longestDrawableWaitMs, milliseconds)
+    }
+
+    func noteGPU(milliseconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        window.gpuFrames += 1
+        window.gpuMs += milliseconds
+        window.longestGpuMs = max(window.longestGpuMs, milliseconds)
     }
 
     /// The window since the last call. The next window still measures from the last frame.
@@ -287,8 +366,8 @@ final class NativeStreamPresentationTracker: @unchecked Sendable {
         return meter.snapshot(now: now)
     }
     func resetRates() { lock.lock(); meter = NativeStreamPresentationRateMeter(); lock.unlock() }
-    func recordPresentation(at time: Double) {
-        cadence.observe(time: time)
+    func recordPresentation(at time: Double, target: Double? = nil) {
+        cadence.observe(time: time, target: target)
         lock.lock(); defer { lock.unlock() }
         meter.observe(time: time)
     }

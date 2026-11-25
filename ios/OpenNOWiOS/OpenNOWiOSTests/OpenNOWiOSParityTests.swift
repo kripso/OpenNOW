@@ -2303,11 +2303,11 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertTrue(roundTrip.hdrEnabled)
     }
 
-    func testPointerCaptureReleasesForControlsPiPAndInactiveScene() {
+    func testPointerCaptureReleasesForControlsAndInactiveScene() {
         func capture(video: Bool = true, active: Bool = true, controls: Bool = false,
-                     editing: Bool = false, guidance: Bool = false, pip: Bool = false) -> Bool {
+                     editing: Bool = false, guidance: Bool = false) -> Bool {
             NativeStreamPointerCapturePolicy.shouldCapture(videoActive: video, sceneActive: active,
-                controlsVisible: controls, editing: editing, guidanceVisible: guidance, pipActive: pip)
+                controlsVisible: controls, editing: editing, guidanceVisible: guidance)
         }
         XCTAssertTrue(capture())
         XCTAssertFalse(capture(video: false))
@@ -2315,7 +2315,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertFalse(capture(controls: true))
         XCTAssertFalse(capture(editing: true))
         XCTAssertFalse(capture(guidance: true))
-        XCTAssertFalse(capture(pip: true))
     }
 
     @MainActor
@@ -2324,14 +2323,15 @@ final class OpenNOWiOSParityTests: XCTestCase {
         // Check the scene's actual status bar, in the app's main window.
         let window = try XCTUnwrap(scene.windows.first(where: \.isKeyWindow))
         let priorController = window.rootViewController
-        // A preceding rendering test may leave the simulator in landscape, where iPhone
-        // intentionally hides its status bar. Start in portrait to verify restoration.
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
-        for _ in 0..<30 {
-            if scene.interfaceOrientation.isPortrait { break }
-            try await Task.sleep(nanoseconds: 100_000_000)
+        // iPhone hides its status bar in landscape. iPad can show it in either orientation.
+        if window.traitCollection.userInterfaceIdiom == .phone {
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
+            for _ in 0..<30 {
+                if scene.interfaceOrientation.isPortrait { break }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            XCTAssertTrue(scene.interfaceOrientation.isPortrait)
         }
-        XCTAssertTrue(scene.interfaceOrientation.isPortrait)
         func waitForStatusBar(hidden: Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
             // UIKit updates the scene asynchronously, including its visibility animation.
             for _ in 0..<40 {
@@ -2340,6 +2340,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
             }
             XCTAssertEqual(scene.statusBarManager?.isStatusBarHidden, hidden, file: file, line: line)
         }
+        try await waitForStatusBar(hidden: false)
         let presenter = NativeStreamPresentationController(content: AnyView(
             Color.black.background(NativeStreamPresentationPreferences(
                 pointerCaptureRequested: true))))
@@ -2374,47 +2375,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertFalse(presenter.host.prefersPointerLocked)
         XCTAssertFalse(presenter.host.prefersStatusBarHidden)
         try await waitForStatusBar(hidden: false)
-    }
-
-    func testPiPSamplesUseHostClockAndBoundedAspectCorrectSurfaces() {
-        XCTAssertEqual(NativeStreamPiPFrameConverter.outputSize(width: 3840, height: 2160), CGSize(width: 1280, height: 720))
-        XCTAssertEqual(NativeStreamPiPFrameConverter.outputSize(width: 2160, height: 3840), CGSize(width: 405, height: 720))
-        XCTAssertEqual(NativeStreamPiPFrameConverter.outputSize(width: 0, height: 100), .zero)
-        let now = CMClockGetTime(CMClockGetHostTimeClock())
-        let sample = NativeStreamPiPSampleTiming.make(at: now)
-        XCTAssertEqual(CMTimeCompare(sample.presentationTimeStamp, now), 0)
-        XCTAssertEqual(CMTimeGetSeconds(sample.duration), 1.0 / 30.0, accuracy: 0.00001)
-        XCTAssertFalse(sample.decodeTimeStamp.isValid)
-    }
-
-    func testPiPConvertsTenBitHDRIntoIndependentVisibleSurface() throws {
-        var created: CVPixelBuffer?
-        XCTAssertEqual(CVPixelBufferCreate(nil, 16, 8, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
-            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &created), kCVReturnSuccess)
-        let source = try XCTUnwrap(created)
-        CVPixelBufferLockBaseAddress(source, [])
-        for plane in 0..<2 {
-            let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(source, plane)).assumingMemoryBound(to: UInt16.self)
-            let words = CVPixelBufferGetBytesPerRowOfPlane(source, plane) / 2 * CVPixelBufferGetHeightOfPlane(source, plane)
-            for i in 0..<words { base[i] = UInt16(plane == 0 ? 601 : 512) << 6 }
-        }
-        CVPixelBufferUnlockBaseAddress(source, [])
-        CVBufferSetAttachment(source, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
-        CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
-        CVBufferSetAttachment(source, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
-        let converter = NativeStreamPiPFrameConverter()
-        let output = try XCTUnwrap(converter.convert(source))
-        XCTAssertFalse(output === source)
-        XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), kCVPixelFormatType_32BGRA)
-        XCTAssertEqual(CVPixelBufferGetPixelFormatType(source), kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
-        XCTAssertEqual(NativeStreamHDRTransfer.detect(in: source), .pq)
-        CVPixelBufferLockBaseAddress(output, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
-        let pixels = try XCTUnwrap(CVPixelBufferGetBaseAddress(output)).assumingMemoryBound(to: UInt8.self)
-        XCTAssertGreaterThan(pixels[0], 20)
-        XCTAssertGreaterThan(pixels[1], 20)
-        XCTAssertGreaterThan(pixels[2], 20)
-        XCTAssertEqual(pixels[3], 255)
     }
 
     func testDecodeCompletionHandlesEarlyReorderedAndFailedOutputsWithoutShiftingTiming() {
@@ -3024,6 +2984,152 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertLessThan(smoothed.longestGap, 0.03)
     }
 
+    /// Runs frames arriving at `arrivals` through a 120 Hz display clock and returns the gaps
+    /// between the frames shown, in refreshes, and how many times a frame was made to wait.
+    private func refreshGaps(arrivals: [TimeInterval], paced: Bool, refresh: TimeInterval = 1.0 / 120,
+                             frame: TimeInterval = 1.0 / 60) -> (gaps: [Int], waits: Int) {
+        var pacer = NativeStreamFramePacer()
+        var waiting: [TimeInterval] = []
+        var next = 0
+        var shown: [Int] = []
+        var waits = 0
+        let last = Int(((arrivals.last ?? 0) / refresh).rounded(.up)) + 4
+        for tick in 0...last {
+            let now = Double(tick) * refresh
+            while next < arrivals.count, arrivals[next] <= now {
+                waiting.append(arrivals[next])
+                next += 1
+            }
+            // The renderer keeps two waiting frames on a screen this much faster than the stream.
+            if waiting.count > 2 { waiting.removeFirst(waiting.count - 2) }
+            guard !waiting.isEmpty else { continue }
+            let target = now + refresh
+            if paced, !pacer.shouldShow(target: target, refresh: refresh, frame: frame, waiting: waiting.count,
+                                        age: now - waiting[0]) {
+                waits += 1
+                continue
+            }
+            waiting.removeFirst()
+            pacer.shown(target: target)
+            shown.append(tick)
+        }
+        return (zip(shown.dropFirst(), shown).map { $0 - $1 }, waits)
+    }
+
+    func testFramesThatStraddleARefreshAreShownEvenlyOnlyWhenPaced() {
+        let refresh = 1.0 / 120
+        // A 60 fps stream whose frames land a millisecond before and after a refresh in turn.
+        let arrivals = (0..<120).map { Double($0) * 2 * refresh + 0.05 + ($0.isMultiple(of: 2) ? 0.001 : -0.001) }
+        let unpaced = refreshGaps(arrivals: arrivals, paced: false)
+        XCTAssertEqual(Set(unpaced.gaps), [1, 3])
+        let paced = refreshGaps(arrivals: arrivals, paced: true)
+        XCTAssertEqual(Set(paced.gaps), [2])
+        XCTAssertEqual(paced.gaps.count, arrivals.count - 1)
+    }
+
+    func testPacingDoesNotDelayFramesThatAreOnTimeLateOrBackedUp() {
+        let refresh = 1.0 / 120
+        // Frames that land mid-refresh at the stream's pace never wait.
+        let steady = (0..<60).map { Double($0) * 2 * refresh + 0.054 }
+        XCTAssertEqual(refreshGaps(arrivals: steady, paced: true).waits, 0)
+
+        // A game running at 40 fps sends a frame every three refreshes: none is early.
+        let slow = (0..<40).map { Double($0) * 3 * refresh + 0.054 }
+        let slowResult = refreshGaps(arrivals: slow, paced: true)
+        XCTAssertEqual(slowResult.waits, 0)
+        XCTAssertEqual(Set(slowResult.gaps), [3])
+
+        // One frame a whole frame late, arriving together with the one behind it: the late one is
+        // shown at once and so is the one that queued behind it, so the picture does not stay a
+        // frame behind. The frames after them are even again.
+        var burst = (0..<30).map { Double($0) * 2 * refresh + 0.054 }
+        burst[10] = burst[11]
+        let unpaced = refreshGaps(arrivals: burst, paced: false)
+        let paced = refreshGaps(arrivals: burst, paced: true)
+        XCTAssertEqual(Array(unpaced.gaps[8...12]), [2, 4, 1, 1, 2])
+        XCTAssertEqual(Array(paced.gaps[8...12]), [2, 4, 1, 2, 2])
+        XCTAssertEqual(Set(paced.gaps[11...]), [2])
+
+        // On a screen no faster than the stream there is nothing to pace.
+        var pacer = NativeStreamFramePacer()
+        pacer.shown(target: 1)
+        XCTAssertTrue(pacer.shouldShow(target: 1 + 1.0 / 60, refresh: 1.0 / 60, frame: 1.0 / 60, waiting: 1, age: 0))
+    }
+
+    func testPacingGivesBackItsDelayOnceEveryFrameHasBeenEarly() {
+        let refresh = 1.0 / 120
+        // One late frame moves the schedule a refresh later; every frame after it is then early.
+        var arrivals = (0..<600).map { Double($0) * 2 * refresh + 0.054 }
+        arrivals[5] += refresh
+        let result = refreshGaps(arrivals: arrivals, paced: true)
+        XCTAssertEqual(result.gaps[4], 3)
+        // Held evenly for the recovery period, then one short frame and no more waiting.
+        let short = try? XCTUnwrap(result.gaps.firstIndex(of: 1))
+        let expected = 5 + Int((NativeStreamFramePacer.recoverAfter * 60).rounded(.up))
+        XCTAssertEqual(short, expected)
+        XCTAssertEqual(result.gaps.filter { $0 != 2 }, [3, 1])
+        XCTAssertEqual(result.waits, expected - 5)
+    }
+
+    func testShownFramesAreCountedByRefreshesAndBySlip() {
+        let meter = NativeStreamFrameCadenceMeter()
+        meter.setStreamFrameRate(60)
+        let refresh = 1.0 / 120
+        meter.noteTick(time: 10, interval: refresh)
+        meter.noteTick(time: 10 + refresh, interval: refresh, delay: 0.004)
+        // Shown 2, 3, 1 and 4 refreshes apart; the last reached the screen a refresh after its own.
+        var time = 20.0
+        meter.observe(time: time, target: time)
+        for (gap, slip) in [(2, 0), (3, 0), (1, 0), (4, 1)] {
+            time += Double(gap) * refresh
+            meter.observe(time: time, target: time - Double(slip) * refresh)
+        }
+        meter.notePaced()
+        meter.noteDrawableWait(milliseconds: 1)
+        meter.noteDrawableWait(milliseconds: 6)
+        meter.noteGPU(milliseconds: 3)
+        var window = meter.drain()
+        XCTAssertEqual(window.gapsInRefreshes, [0, 1, 1, 1, 1, 0])
+        XCTAssertEqual(window.unevenGaps, 3)
+        XCTAssertEqual(window.presentedLate, [4, 1, 0, 0])
+        XCTAssertEqual(window.paced, 1)
+        XCTAssertEqual(window.longestTickDelayMs, 4, accuracy: 0.001)
+        XCTAssertEqual(window.drawableWaits, 1)
+        XCTAssertEqual(window.longestDrawableWaitMs, 6)
+        XCTAssertEqual(window.longestGpuMs, 3)
+
+        // Frames the server captured late are told apart from frames that arrived late.
+        var schedule = NativeStreamPlayoutSchedule()
+        _ = schedule.due(arrival: 1, timestamp: 0, delay: 0)
+        XCTAssertEqual(schedule.lastCaptureGap, 0)
+        _ = schedule.due(arrival: 1.05, timestamp: 3_000, delay: 0)
+        XCTAssertEqual(schedule.lastCaptureGap, 1.0 / 30, accuracy: 0.000_01)
+        let arrivals = NativeStreamFrameCadenceMeter()
+        arrivals.setStreamFrameRate(60)
+        arrivals.noteSourceGap(seconds: 1.0 / 60)
+        arrivals.noteSourceGap(seconds: schedule.lastCaptureGap)
+        let arrived = arrivals.drain()
+        XCTAssertEqual(arrived.sourceLongGaps, 1)
+
+        var total = NativeStreamFrameCadence()
+        total.add(window)
+        window.presentedLate = [0, 0, 2, 1]
+        total.add(window)
+        XCTAssertEqual(total.gapsInRefreshes, [0, 2, 2, 2, 2, 0])
+        let row = SessionTimelineRow(StreamRuntimeSample(timestamp: 0, arrivedCadence: arrived, shownCadence: window),
+                                     offsetSeconds: 0)
+        let columns = SessionTimelineRow.columns
+        func value(_ name: String) -> Int { row.values[columns.firstIndex(of: name)!] }
+        XCTAssertEqual(value("sourceStutters"), 1)
+        XCTAssertEqual(value("unevenFrames"), 3)
+        XCTAssertEqual(value("presentedOneLate"), 0)
+        XCTAssertEqual(value("presentedTwoLate"), 3)
+        XCTAssertEqual(value("pacedFrames"), 1)
+        XCTAssertEqual(value("longestTickDelayMs"), 4)
+        XCTAssertEqual(value("longestDrawableWaitMs"), 6)
+        XCTAssertEqual(value("longestGpuMs"), 3)
+    }
+
     func testWiFiPauseSmoothingOnlyHoldsFramesWhilePausesKeepHappening() {
         var smoothing = NativeStreamWiFiPauseSmoothing()
         // Ordinary small gaps, and one pause on its own, change nothing.
@@ -3544,6 +3650,51 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(sink.reliablePackets.count, packetCount)
     }
 
+    func testPointerMovementIsSentAtOnceAndOnlyMergedWhenItComesFasterThanTheSendInterval() {
+        let bridge = NativeStreamInputBridge()
+        let sink = RecordingNativeStreamInputSink()
+        bridge.sink = sink
+        func travel() -> [Int] {
+            sink.partiallyReliablePackets.map { packet in
+                let move = packet.suffix(22)
+                return Int(Int16(bitPattern: UInt16(move[move.startIndex + 4]) << 8 | UInt16(move[move.startIndex + 5])))
+            }
+        }
+        func wait(_ seconds: TimeInterval) {
+            let elapsed = expectation(description: "waited")
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { elapsed.fulfill() }
+            self.wait(for: [elapsed], timeout: seconds + 5)
+        }
+
+        // The first movement leaves in the same call, not after a fixed delay.
+        bridge.sendTouchMouseMove(dx: 10, dy: 0)
+        let first = travel()
+        guard first.count == 1, first[0] > 0 else { return XCTFail("nothing was sent at once: \(first)") }
+        let perMove = first[0]
+
+        // Two more right behind it wait for the interval and leave as one packet.
+        bridge.sendTouchMouseMove(dx: 10, dy: 0)
+        bridge.sendTouchMouseMove(dx: 10, dy: 0)
+        let whileWaiting = travel().count
+        wait(0.05)
+        XCTAssertEqual(whileWaiting, 1)
+        XCTAssertEqual(travel().count, 2)
+        XCTAssertEqual(Double(travel().last ?? 0), Double(perMove * 2), accuracy: 2)
+
+        // After a pause the next one is immediate again.
+        bridge.sendTouchMouseMove(dx: 10, dy: 0)
+        XCTAssertEqual(travel().count, 3)
+
+        // Movement of less than one count at a time adds up instead of rounding away.
+        wait(0.02)
+        let before = travel().reduce(0, +)
+        for _ in 0..<20 {
+            bridge.sendTouchMouseMove(dx: 0.2, dy: 0)
+            wait(NativeStreamInputBridge.mouseSendInterval * 2)
+        }
+        XCTAssertEqual(Double(travel().reduce(0, +) - before), Double(perMove) * 0.4, accuracy: 1)
+    }
+
     func testHapticsAvailabilityIsReadvertisedAfterAndroidParityInterval() {
         let bridge = NativeStreamInputBridge()
         let sink = RecordingNativeStreamInputSink()
@@ -3711,6 +3862,37 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertTrue(highBitrate.contains("a=vqos.bw.maximumBitrateKbps:75000\n"))
         XCTAssertFalse(nvst.contains("a=vqos.drc.minRequiredBitrateCheckEnabled"))
         XCTAssertFalse(nvst.contains("a=vqos.bllFec.enable"))
+    }
+
+    func testFourByThreeOffersHighResolutionsForTheMembershipsThatAllowThem() {
+        let options = StreamSettingsResolver.resolutionOptions(for: "4:3").map(\.value)
+        XCTAssertEqual(options, ["Auto", "1024x768", "1112x834", "1600x1200", "1920x1440", "2048x1536", "2880x2160"])
+        func available(_ value: String, _ tier: String) -> Bool {
+            StreamSettingsResolver.isResolutionAvailable(
+                try! XCTUnwrap(StreamSettingsResolver.resolutionChoice(value: value, aspectRatio: "4:3")), membershipTier: tier)
+        }
+        XCTAssertTrue(available("1600x1200", "FREE"))
+        XCTAssertFalse(available("2048x1536", "FREE"))
+        XCTAssertTrue(available("2048x1536", "PERFORMANCE"))
+        XCTAssertFalse(available("2880x2160", "PERFORMANCE"))
+        XCTAssertTrue(available("2880x2160", "ULTIMATE"))
+        // A 4:3 pick a membership cannot have comes down to the best one it can.
+        XCTAssertEqual(StreamSettingsResolver.normalizedResolution("2880x2160", aspectRatio: "4:3", maxPlan: .priority), "2048x1536")
+        XCTAssertEqual(StreamSettingsResolver.normalizedResolution("2048x1536", aspectRatio: "4:3", maxPlan: .free), "1600x1200")
+        // The high preset on 4:3 now reaches the 1440 class, as it does on 16:9.
+        var base = AppSettings.default
+        base.preferredAspectRatio = "4:3"
+        let high = StreamSettingsResolver.settings(base, applying: .high, membershipTier: "PERFORMANCE")
+        XCTAssertEqual(high.preferredResolution, "2048x1536")
+        // The chosen size is what the session request asks the server for.
+        var ultimatePick = AppSettings.default
+        ultimatePick.preferredAspectRatio = "4:3"
+        ultimatePick.preferredResolution = "2880x2160"
+        let requested = StreamSettingsResolver.profile(
+            for: ultimatePick, nativeBounds: CGRect(x: 0, y: 0, width: 2064, height: 2752),
+            nativeScale: 2, userInterfaceIdiom: .pad, membershipTier: "ULTIMATE")
+        XCTAssertEqual(requested.width, 2880)
+        XCTAssertEqual(requested.height, 2160)
     }
 
     func testStreamPresetsMatchAndroidValuesAndRespectAppleTierFPSCaps() {
@@ -6017,17 +6199,16 @@ final class OpenNOWiOSParityTests: XCTestCase {
 
     func testSessionReportSeparatesStuttersAfterReturningToTheAppAndIgnoresTimeAway() throws {
         let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
-        func second(_ phase: StreamInterruptionPhase, stutters: Int, replaced: Int = 0,
-                    pipActive: Bool = false, pipFrames: Int? = nil, pipMs: Double? = nil) -> StreamRuntimeSample {
+        func second(_ phase: StreamInterruptionPhase, stutters: Int, replaced: Int = 0) -> StreamRuntimeSample {
             StreamRuntimeSample(timestamp: 0, pingMs: 20,
                 arrivedCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 20, longGaps: 0, replaced: replaced),
                 shownCadence: NativeStreamFrameCadence(frames: 60, longestGapMs: 30, longGaps: stutters, replaced: 0),
-                interruption: phase, pipActive: pipActive, pipFrames: pipFrames, pipConvertMs: pipMs)
+                interruption: phase)
         }
-        for _ in 0..<3 { accumulator.record(second(.none, stutters: 0, pipFrames: 2, pipMs: 6)) }
+        for _ in 0..<3 { accumulator.record(second(.none, stutters: 0)) }
         // Away: every frame is "never shown" while nothing draws. None of it may count.
-        for _ in 0..<2 { accumulator.record(second(.away, stutters: 9, replaced: 60, pipFrames: 30, pipMs: 90)) }
-        for _ in 0..<3 { accumulator.record(second(.returned, stutters: 2, pipActive: true, pipFrames: 30, pipMs: 120)) }
+        for _ in 0..<2 { accumulator.record(second(.away, stutters: 9, replaced: 60)) }
+        for _ in 0..<3 { accumulator.record(second(.returned, stutters: 2)) }
         // Away a second time, then back.
         accumulator.record(second(.away, stutters: 9, replaced: 60))
         accumulator.record(second(.returned, stutters: 1))
@@ -6041,9 +6222,12 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(all.arrived?.replaced, 0)
         XCTAssertEqual(after.cadenceSeconds, 4)
         XCTAssertEqual(after.shown?.longGaps, 7)
-        XCTAssertEqual(all.pipFrames, 3 * 2 + 3 * 30)
-        XCTAssertEqual(all.pipConvertMs, 3 * 6 + 3 * 120, accuracy: 0.001)
-        XCTAssertEqual(all.pipSecondsInApp, 3)
+        let serializedDelivery = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(all)) as? [String: Any]
+        )
+        XCTAssertEqual(serializedDelivery["pipFrames"] as? Int, 0)
+        XCTAssertEqual(serializedDelivery["pipConvertMs"] as? Double, 0)
+        XCTAssertEqual(serializedDelivery["pipSecondsInApp"] as? Int, 0)
 
         // The display clock, the cost of drawing and the network route are carried the same way.
         let clock = NativeStreamFrameCadenceMeter()
@@ -6236,6 +6420,69 @@ final class OpenNOWiOSParityTests: XCTestCase {
     }
 
     // MARK: Report and stream sharing the screen
+
+    func testReportRecordsEachReopenWithWhatWasAskedForAndWhatArrived() throws {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, decodedFps: 120, resolution: "1600x1200"))
+        accumulator.recordReconnect()
+        accumulator.recordReopen(
+            changeRequested: true, requested: StreamVideoProfile(width: 2048, height: 1536, fps: 120, maxBitrateKbps: 75_000),
+            serverRecordResolution: "1600x1200", serverRecordFps: 120)
+        // A sample before any frame is decoded only repeats what was asked for.
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, decodedFps: 0, resolution: "2048x1536"))
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, decodedFps: 118, resolution: "1600x1200"))
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, decodedFps: 119, resolution: "1600x1200"))
+        let report = try XCTUnwrap(accumulator.finish())
+        XCTAssertEqual(report.reopens.count, 1)
+        let reopen = try XCTUnwrap(report.reopens.first)
+        XCTAssertTrue(reopen.changeRequested)
+        XCTAssertEqual(reopen.requestedResolution, "2048x1536")
+        XCTAssertEqual(reopen.requestedFps, 120)
+        XCTAssertEqual(reopen.serverRecordResolution, "1600x1200")
+        XCTAssertEqual(reopen.deliveredResolution, "1600x1200")
+        let asked = try XCTUnwrap(report.downgrades.first { $0.title == "Asked for a new resolution mid-session" })
+        XCTAssertTrue(asked.detail.contains("2048x1536 at 120 FPS"))
+        XCTAssertTrue(asked.detail.contains("decoder received 1600x1200"))
+        // The mid-session pick, not the launch request, is what the delivered size is held against.
+        let different = try XCTUnwrap(report.downgrades.first { $0.title == "Delivered a different resolution" })
+        XCTAssertTrue(different.detail.contains("requested 2048x1536"))
+    }
+
+    @MainActor
+    func testMidSessionResolutionPickReopensTheStreamWithThatSize() {
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredAspectRatio = "4:3"
+        settings.preferredResolution = "1600x1200"
+        settings.preferredFPS = 120
+        var reopens = 0
+        var requested: (String, Int)?
+        let coordinator = NativeStreamCoordinator(
+            session: Self.makeActiveSession(game: Self.makeGame(title: "Resolution", controls: []), status: 3),
+            settings: settings, membershipTier: "ULTIMATE", sessionHistory: nil,
+            onTouchLayoutChange: { _, _ in }, onStreamerPreferencesChange: { _ in },
+            onStreamSharpeningChange: { _, _ in }, onFingerMouseEnabledChange: { _ in },
+            onPhoneRumbleFallbackChange: { _ in }, onStreamTutorialCompleted: {},
+            onControllerTouchPromptDismissed: {}, onStatsOverlayChange: { _ in },
+            onTransportStable: {}, onStreamTermination: { _ in }, onTransportFailure: {},
+            onSelectedVideoProfileRetry: { _ in }, onRuntimeSample: { _ in },
+            onSettingsChange: { _ in }, onBuildBugReportDeck: { BugReportPreflightDeck() },
+            onSubmitBugReport: { _, _ in .failure(BugReportError.invalid("Test")) }, onClose: {}, onRetry: nil,
+            onReopen: { reopens += 1 }, onVideoRequest: { requested = ($0, $1) })
+        XCTAssertTrue(coordinator.liveResolutionChangeAvailable)
+        XCTAssertTrue(coordinator.liveResolutionChoices.contains("2880x2160"))
+        XCTAssertEqual(coordinator.liveFPSChoices, [30, 60, 120])
+
+        // Asking for what is already streaming does nothing; a size the plan lacks is refused.
+        coordinator.applyLiveResolution(coordinator.liveStreamResolution, fps: coordinator.liveStreamFPS)
+        coordinator.applyLiveResolution("5120x2880", fps: 120)
+        XCTAssertEqual(reopens, 0)
+
+        coordinator.applyLiveResolution("2048x1536", fps: 120)
+        XCTAssertEqual(reopens, 1)
+        XCTAssertEqual(requested?.0, "2048x1536")
+        XCTAssertEqual(requested?.1, 120)
+    }
 
     func testAReconnectKeepsTheReportAndCountsIt() throws {
         let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())

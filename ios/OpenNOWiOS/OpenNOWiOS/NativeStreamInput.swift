@@ -59,6 +59,27 @@ final class NativeStreamRumbleDiagnostics {
     }
 }
 
+/// Session totals only. Times are measured on the device's monotonic clock.
+struct NativeStreamInputTiming {
+    private(set) var count = 0
+    private var total: TimeInterval = 0
+    private var longest: TimeInterval = 0
+    private var over16ms = 0
+
+    mutating func record(_ seconds: TimeInterval) {
+        count += 1
+        total += seconds
+        longest = max(longest, seconds)
+        if seconds > 0.016 { over16ms += 1 }
+    }
+
+    var summary: String {
+        let mean = count == 0 ? 0 : total / Double(count)
+        return String(format: "n=%d meanMs=%.2f maxMs=%.2f over16ms=%d",
+                      count, mean * 1000, longest * 1000, over16ms)
+    }
+}
+
 protocol NativeStreamInputSink: AnyObject {
     func sendReliableInput(_ data: Data)
     func sendPartiallyReliableInput(_ data: Data)
@@ -178,6 +199,7 @@ final class NativeStreamInputEncoder {
         static let heartbeat: UInt32 = 2
         static let keyDown: UInt32 = 3
         static let keyUp: UInt32 = 4
+        static let mouseAbsolute: UInt32 = 5
         static let mouseRelative: UInt32 = 7
         static let mouseButtonDown: UInt32 = 8
         static let mouseButtonUp: UInt32 = 9
@@ -237,10 +259,24 @@ final class NativeStreamInputEncoder {
         return wrapSingle(Data(bytes))
     }
 
-    func encodeMouseWheel(delta: Int) -> Data {
+    /// Places the pointer at a point of a surface `width` by `height` across.
+    func encodeMouseAbsolute(x: UInt16, y: UInt16, width: UInt16, height: UInt16) -> Data {
+        var bytes = [UInt8](repeating: 0, count: 26)
+        Self.writeUInt32LE(EventType.mouseAbsolute, to: &bytes, at: 0)
+        Self.writeUInt16BE(x, to: &bytes, at: 4)
+        Self.writeUInt16BE(y, to: &bytes, at: 6)
+        Self.writeUInt16BE(0, to: &bytes, at: 8)
+        Self.writeUInt16BE(width, to: &bytes, at: 10)
+        Self.writeUInt16BE(height, to: &bytes, at: 12)
+        Self.writeUInt32BE(0, to: &bytes, at: 14)
+        Self.writeUInt64BE(Self.timestampUs(), to: &bytes, at: 18)
+        return wrapMouseMove(Data(bytes))
+    }
+
+    func encodeMouseWheel(delta: Int, horizontal: Int = 0) -> Data {
         var bytes = [UInt8](repeating: 0, count: 22)
         Self.writeUInt32LE(EventType.mouseWheel, to: &bytes, at: 0)
-        Self.writeInt16BE(0, to: &bytes, at: 4)
+        Self.writeInt16BE(Self.clampInt16(horizontal), to: &bytes, at: 4)
         Self.writeInt16BE(Self.clampInt16(delta), to: &bytes, at: 6)
         Self.writeUInt16BE(0, to: &bytes, at: 8)
         Self.writeUInt32BE(0, to: &bytes, at: 10)
@@ -501,6 +537,15 @@ enum NativeStreamKeyboardMapper {
         mappingByKey[keyCode]
     }
 
+    /// The mapping for a key named by its virtual-key code, as controller layouts store it.
+    /// Where two keys share a code, such as Enter and keypad Enter, the main key is used.
+    static func mapping(forVirtualKey virtualKey: UInt16) -> NativeStreamKeyboardMapping {
+        NativeStreamKeyboardMapping(virtualKey: virtualKey, scanCode: scanCodesByVirtualKey[virtualKey] ?? 0)
+    }
+
+    private static let scanCodesByVirtualKey = Dictionary(
+        mappingByKey.values.map { ($0.virtualKey, $0.scanCode) }, uniquingKeysWith: min)
+
     static func modifiers(for keyboardInput: GCKeyboardInput, changedKey: GCKeyCode, pressed: Bool) -> UInt16 {
         var flags: UInt16 = 0
         if isPressed(.leftShift, or: .rightShift, in: keyboardInput, changedKey: changedKey, pressed: pressed) { flags |= 0x01 }
@@ -701,6 +746,12 @@ final class NativeStreamInputBridge {
     var onPhysicalKeyboardMouseAvailabilityChanged: ((Bool) -> Void)?
     var onControllerShortcut: ((NativeStreamControllerShortcutAction) -> Void)?
     var onControllerHUDCommand: ((NativeStreamControllerHUDCommand) -> Void)?
+    #if os(iOS)
+    /// The radial and touch menus a Steam Controller layout has open, for drawing over the game.
+    var onSteamControllerMenus: (([SteamInputEngine.Menu]) -> Void)?
+    /// The action set a Steam Controller layout switched to, for telling the player.
+    var onSteamControllerActionSet: ((String) -> Void)?
+    #endif
     private var controllerShortcuts = NativeStreamControllerShortcuts()
     private var controllerHUDActive = false
     private var blockedButtons: Set<ObjectIdentifier> = []
@@ -763,6 +814,16 @@ final class NativeStreamInputBridge {
     }
     private var controllersBySlot: [Int: GCController] = [:]
     private var controllerSlots: [ObjectIdentifier: Int] = [:]
+    #if os(iOS)
+    /// A Steam Controller read over its own Bluetooth service. It takes a player slot like any
+    /// other pad, but its state comes from the player's layout rather than from GameController.
+    private let steamController = SteamControllerInputSource()
+    var steamInputTiming: String { steamController.timingSummary }
+    private var steamSlot: Int?
+    private var steamPad = SteamInputEngine.Pad()
+    private var steamHUDButtons: SteamControllerButtons = []
+    private var steamMouseRemainder = CGPoint.zero
+    #endif
     private var lastGamepadStates: [Int: NativeStreamGamepadState] = [:]
     private var gamepadKeepaliveTimer: Timer?
     private var heartbeatTimer: Timer?
@@ -774,6 +835,10 @@ final class NativeStreamInputBridge {
     private var lastHapticsAdvertisementAt: TimeInterval = -.infinity
     private var mouseAccumulator = CGPoint.zero
     private var mouseFlushScheduled = false
+    private var lastMouseSendAt: TimeInterval = -.infinity
+    /// The shortest time between two pointer packets. A mouse that reports faster than this has
+    /// its movements added together; a slower one, such as a Bluetooth mouse, is never held.
+    static let mouseSendInterval: TimeInterval = 0.004
     private var mouseSensitivity: CGFloat = 1
     private var mouseScrollSensitivity: CGFloat = 30
     private var mouseAccelerationLevel = 1
@@ -858,8 +923,22 @@ final class NativeStreamInputBridge {
             stopAllControllerRumble(shutdown: false)
         }
         physicalControllerPassthroughEnabled = enabled
+        updateSteamControllerSuspension()
         attachControllers()
         advertiseHaptics(force: true)
+    }
+
+    /// Turns the direct Steam Controller connection on or off and sets what its controls do.
+    func configureSteamController(enabled: Bool, config: SteamInputConfig, tuning: SteamControllerTuning) {
+        #if os(iOS)
+        steamController.configure(enabled: enabled, config: config, tuning: tuning)
+        #endif
+    }
+
+    private func updateSteamControllerSuspension() {
+        #if os(iOS)
+        steamController.suspended = controllerHUDActive || !physicalControllerPassthroughEnabled
+        #endif
     }
 
     func setPhoneRumbleFallback(_ enabled: Bool) {
@@ -884,6 +963,7 @@ final class NativeStreamInputBridge {
         guard controllerHUDActive != active else { return }
         controllerHUDActive = active
         hudDirection = nil
+        updateSteamControllerSuspension()
         if active {
             updateEmulatedMouseButton(0, pressed: false)
             updateEmulatedMouseButton(1, pressed: false)
@@ -966,6 +1046,24 @@ final class NativeStreamInputBridge {
             name: NSNotification.Name.GCControllerDidDisconnect,
             object: nil
         )
+        #if os(iOS)
+        steamController.onReport = { [weak self] report, output in
+            self?.handleSteamController(report, output)
+        }
+        steamController.onMenusChanged = { [weak self] menus in
+            self?.onSteamControllerMenus?(menus)
+        }
+        steamController.onActionSetChanged = { [weak self] title in
+            self?.onSteamControllerActionSet?(title)
+        }
+        steamController.onConnectionChanged = { [weak self] connected in
+            self?.sink?.logInputEvent("Steam Controller \(connected ? "connected" : "disconnected")")
+            self?.attachControllers()
+            self?.advertiseHaptics(force: true)
+        }
+        updateSteamControllerSuspension()
+        steamController.attach()
+        #endif
         refreshDevices()
         startTimers()
     }
@@ -987,6 +1085,18 @@ final class NativeStreamInputBridge {
         keyboard = nil
         mice = []
         hardwareHeldMouseButtons.removeAll()
+        #if os(iOS)
+        // The report handler stays until the source has let go of what it was holding.
+        steamController.onConnectionChanged = nil
+        steamController.detach()
+        steamController.onReport = nil
+        steamController.onMenusChanged = nil
+        steamController.onActionSetChanged = nil
+        steamSlot = nil
+        steamPad = SteamInputEngine.Pad()
+        steamHUDButtons = []
+        steamMouseRemainder = .zero
+        #endif
         controllersBySlot.removeAll(keepingCapacity: true)
         controllerSlots.removeAll(keepingCapacity: true)
         lastGamepadStates.removeAll(keepingCapacity: true)
@@ -1073,12 +1183,15 @@ final class NativeStreamInputBridge {
         now: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
         guard force || now - lastHapticsAdvertisementAt >= 5 else { return }
-        let controllerAvailable = physicalControllerPassthroughEnabled && controllersBySlot.values.contains {
+        var controllerAvailable = physicalControllerPassthroughEnabled && controllersBySlot.values.contains {
             #if os(iOS)
             if NativeStreamGameSirRumbler.isTargetController($0) { return gameSirRumbler.canHandleController($0) }
             #endif
             return $0.haptics != nil
         }
+        #if os(iOS)
+        if physicalControllerPassthroughEnabled, steamSlot != nil { controllerAvailable = true }
+        #endif
         #if canImport(CoreHaptics)
         let phoneAvailable = phoneRumbleFallbackEnabled && Self.phoneHapticsSupported
         #else
@@ -1154,6 +1267,14 @@ final class NativeStreamInputBridge {
                 "lastActiveWeakMagnitude": String(weakMagnitude), "lastActiveStrongMagnitude": String(strongMagnitude),
                 "lastActiveIntensity": String(profile.intensity), "controllerStartup": "unmuted-preconfigured"])
         }
+        #if os(iOS)
+        if physicalControllerPassthroughEnabled, controllerId == steamSlot {
+            steamController.setRumble(strongMagnitude: strongMagnitude, weakMagnitude: weakMagnitude,
+                                      gain: controllerRumbleStrength)
+            stopPhoneRumble(shutdown: false)
+            return
+        }
+        #endif
         if profile.isStopped {
             stopControllerRumble(slot: controllerId, shutdown: false)
             stopPhoneRumble(shutdown: false)
@@ -1452,19 +1573,38 @@ final class NativeStreamInputBridge {
 
     private func coalesceMouse(dx: CGFloat, dy: CGFloat) {
         let adjusted = adjustedMouseDelta(dx: dx, dy: dy)
-        mouseAccumulator.x += adjusted.x
-        mouseAccumulator.y += adjusted.y
+        queueMouse(dx: adjusted.x, dy: adjusted.y)
+    }
+
+    /// Queues pointer travel as it is, for sources that apply their own sensitivity.
+    ///
+    /// Movement is sent at once. Only when the last packet left less than `mouseSendInterval` ago
+    /// does it wait, until that interval is over, together with whatever else arrives meanwhile.
+    private func queueMouse(dx: CGFloat, dy: CGFloat) {
+        mouseAccumulator.x += dx
+        mouseAccumulator.y += dy
         guard !mouseFlushScheduled else { return }
-        mouseFlushScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.006) { [weak self] in
-            guard let self else { return }
-            let dx = Int(self.mouseAccumulator.x.rounded())
-            let dy = Int(self.mouseAccumulator.y.rounded())
-            self.mouseAccumulator = .zero
-            self.mouseFlushScheduled = false
-            guard dx != 0 || dy != 0 else { return }
-            self.sink?.sendPartiallyReliableInput(self.encoder.encodeMouseMove(dx: dx, dy: dy))
+        let wait = lastMouseSendAt + Self.mouseSendInterval - ProcessInfo.processInfo.systemUptime
+        guard wait > 0 else {
+            flushMouse()
+            return
         }
+        mouseFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+            self?.mouseFlushScheduled = false
+            self?.flushMouse()
+        }
+    }
+
+    /// Sends the whole counts travelled and keeps the fraction, so slow movement is not lost.
+    private func flushMouse() {
+        let dx = Int(mouseAccumulator.x.rounded())
+        let dy = Int(mouseAccumulator.y.rounded())
+        guard dx != 0 || dy != 0 else { return }
+        mouseAccumulator.x -= CGFloat(dx)
+        mouseAccumulator.y -= CGFloat(dy)
+        lastMouseSendAt = ProcessInfo.processInfo.systemUptime
+        sink?.sendPartiallyReliableInput(encoder.encodeMouseMove(dx: dx, dy: dy))
     }
 
     private func adjustedMouseDelta(dx: CGFloat, dy: CGFloat) -> CGPoint {
@@ -1497,7 +1637,9 @@ final class NativeStreamInputBridge {
             NativeStreamControllerButtonNames.buttons($0).forEach { $0.1.pressedChangedHandler = nil }
         }
 
-        let connectedControllers = GCController.controllers().filter { $0.extendedGamepad != nil }
+        let connectedControllers = GCController.controllers().filter {
+            $0.extendedGamepad != nil && !isShadowedBySteamController($0)
+        }
         let connectedIdentifiers = Set(connectedControllers.map { ObjectIdentifier($0) })
         let disconnectedIdentifiers = controllerSlots.keys.filter { !connectedIdentifiers.contains($0) }
         for identifier in disconnectedIdentifiers {
@@ -1509,13 +1651,28 @@ final class NativeStreamInputBridge {
             }
         }
 
+        var steamSlots: Set<Int> = []
+        #if os(iOS)
+        if steamController.connected {
+            if steamSlot == nil {
+                let usedSlots = Set(controllerSlots.values)
+                steamSlot = (0..<4).first { !usedSlots.contains($0) }
+            }
+        } else if let slot = steamSlot {
+            steamSlot = nil
+            steamPad = SteamInputEngine.Pad()
+            if physicalControllerPassthroughEnabled { disconnectGamepad(slot: slot) }
+        }
+        if let steamSlot { steamSlots.insert(steamSlot) }
+        #endif
+
         for controller in connectedControllers {
             let identifier = ObjectIdentifier(controller)
             if let slot = controllerSlots[identifier] {
                 controllersBySlot[slot] = controller
                 continue
             }
-            let usedSlots = Set(controllerSlots.values)
+            let usedSlots = Set(controllerSlots.values).union(steamSlots)
             guard let slot = (0..<4).first(where: { !usedSlots.contains($0) }) else { continue }
             controllerSlots[identifier] = slot
             controllersBySlot[slot] = controller
@@ -1523,7 +1680,8 @@ final class NativeStreamInputBridge {
 
         refreshShortcutButtonIDs()
         blockedAxesSlots.formIntersection(Set(controllersBySlot.keys))
-        let hasActivePhysicalController = physicalControllerPassthroughEnabled && !controllersBySlot.isEmpty
+        let hasActivePhysicalController = physicalControllerPassthroughEnabled
+            && (!controllersBySlot.isEmpty || !steamSlots.isEmpty)
         onPhysicalControllerAvailabilityChanged?(hasActivePhysicalController)
         for (slot, controller) in controllersBySlot {
             controller.handlerQueue = .main
@@ -1546,7 +1704,7 @@ final class NativeStreamInputBridge {
 
     private func sendCurrentGamepads(force: Bool) {
         if physicalControllerPassthroughEnabled {
-            for slot in controllersBySlot.keys.sorted() {
+            for slot in physicalControllerSlots.sorted() {
                 sendGamepad(slot: slot, force: force)
             }
         }
@@ -1554,7 +1712,7 @@ final class NativeStreamInputBridge {
             sendGamepadState(virtualGamepadState(connected: true), force: force)
         }
         let activeControllerIDs: Set<Int> = {
-            var ids = physicalControllerPassthroughEnabled ? Set(controllersBySlot.keys) : []
+            var ids = physicalControllerPassthroughEnabled ? physicalControllerSlots : []
             if virtualControllerEnabled, primaryPhysicalControllerSlot == nil { ids.insert(0) }
             return ids
         }()
@@ -1569,6 +1727,12 @@ final class NativeStreamInputBridge {
     }
 
     private func sendGamepad(slot: Int, force: Bool) {
+        #if os(iOS)
+        if slot == steamSlot {
+            sendSteamGamepad(slot: slot, force: force)
+            return
+        }
+        #endif
         guard let gamepad = controllersBySlot[slot]?.extendedGamepad else { return }
         let mapped = shortcutButtonIDsBySlot[slot] ?? []
         func allowed(_ button: GCControllerButtonInput) -> Bool {
@@ -1633,8 +1797,107 @@ final class NativeStreamInputBridge {
 
     private var primaryPhysicalControllerSlot: Int? {
         guard physicalControllerPassthroughEnabled else { return nil }
-        return controllersBySlot.keys.min()
+        return physicalControllerSlots.min()
     }
+
+    /// The slots held by pads of either kind.
+    private var physicalControllerSlots: Set<Int> {
+        var slots = Set(controllersBySlot.keys)
+        #if os(iOS)
+        if let steamSlot { slots.insert(steamSlot) }
+        #endif
+        return slots
+    }
+
+    /// iOS may also list a Steam Controller as an ordinary pad. While it is read directly that
+    /// second copy is left out, or the game would see two controllers moving together.
+    private func isShadowedBySteamController(_ controller: GCController) -> Bool {
+        #if os(iOS)
+        return steamController.connected && (controller.vendorName ?? "").localizedCaseInsensitiveContains("steam")
+        #else
+        return false
+        #endif
+    }
+
+    #if os(iOS)
+    private func sendSteamGamepad(slot: Int, force: Bool) {
+        let physicalState = NativeStreamGamepadState(
+            controllerId: slot,
+            buttons: steamPad.buttons,
+            leftTrigger: steamPad.leftTrigger,
+            rightTrigger: steamPad.rightTrigger,
+            leftStickX: steamPad.leftStickX,
+            leftStickY: steamPad.leftStickY,
+            rightStickX: steamPad.rightStickX,
+            rightStickY: steamPad.rightStickY,
+            connected: true
+        )
+        let state = virtualControllerEnabled && slot == primaryPhysicalControllerSlot
+            ? NativeStreamGamepadMixer.merging(physical: physicalState, virtual: virtualGamepadInputState)
+            : physicalState
+        sendGamepadState(state, force: force)
+    }
+
+    private func handleSteamController(_ report: SteamControllerReport, _ output: SteamInputEngine.Output) {
+        if controllerHUDActive {
+            updateSteamControllerHUD(report)
+        } else {
+            steamHUDButtons = report.buttons
+        }
+        for key in output.keys {
+            sendKey(mapping: NativeStreamKeyboardMapper.mapping(forVirtualKey: key.virtualKey),
+                    pressed: key.pressed, modifiers: key.modifiers)
+        }
+        for button in output.mouseButtons {
+            sendMouseButton(button.button, pressed: button.pressed)
+        }
+        // Whole counts are sent and the fraction is kept, so slow gyro or trackpad travel is not lost.
+        let travel = CGPoint(x: steamMouseRemainder.x + output.mouse.x, y: steamMouseRemainder.y + output.mouse.y)
+        let whole = CGPoint(x: travel.x.rounded(.towardZero), y: travel.y.rounded(.towardZero))
+        steamMouseRemainder = CGPoint(x: travel.x - whole.x, y: travel.y - whole.y)
+        if whole != .zero { queueMouse(dx: whole.x, dy: whole.y) }
+        if let point = output.absolute {
+            // A surface 65535 units across is the finest the packet can carry.
+            let scale = Double(UInt16.max)
+            sink?.sendPartiallyReliableInput(encoder.encodeMouseAbsolute(
+                x: UInt16(point.x * scale), y: UInt16(point.y * scale), width: .max, height: .max))
+        }
+        if output.wheel != 0 || output.wheelX != 0 {
+            sink?.sendReliableInput(encoder.encodeMouseWheel(delta: output.wheel, horizontal: output.wheelX))
+        }
+        if output.pad != steamPad {
+            steamPad = output.pad
+            if physicalControllerPassthroughEnabled, let steamSlot { sendGamepad(slot: steamSlot, force: false) }
+        }
+        // Last, because opening the stream controls releases everything sent above.
+        guard !NativeStreamControllerShortcutCapture.learning else { return }
+        for action in output.shortcuts {
+            if action == .controls { setControllerHUDActive(!controllerHUDActive) }
+            NativeStreamRumbleDiagnostics.shared.record("controllerShortcut", details: [
+                "shortcutInput": "Steam Controller", "shortcutAction": action.rawValue])
+            onControllerShortcut?(action)
+        }
+    }
+
+    /// Lets the pad drive the stream controls the way any other pad does: D-pad or left stick to
+    /// move, A to select, B to go back.
+    private func updateSteamControllerHUD(_ report: SteamControllerReport) {
+        let pressed = report.buttons.subtracting(steamHUDButtons)
+        steamHUDButtons = report.buttons
+        guard !NativeStreamControllerShortcutCapture.learning else { return }
+        if pressed.contains(.a) { onControllerHUDCommand?(.activate) }
+        if pressed.contains(.b) { onControllerHUDCommand?(.back) }
+        func axis(_ positive: SteamControllerButtons, _ negative: SteamControllerButtons) -> Float {
+            report.buttons.contains(positive) ? 1 : (report.buttons.contains(negative) ? -1 : 0)
+        }
+        let dpad = NativeStreamControllerHUDRouting.direction(x: axis(.dpadRight, .dpadLeft), y: axis(.dpadUp, .dpadDown))
+        let next = dpad ?? NativeStreamControllerHUDRouting.direction(x: report.leftStick.x, y: report.leftStick.y)
+        guard next != hudDirection else { return }
+        hudDirection = next
+        hudRepeatAt = ProcessInfo.processInfo.systemUptime + 0.35
+        if let next { onControllerHUDCommand?(next) }
+    }
+    #endif
 
     private func disconnectGamepad(slot: Int) {
         guard lastGamepadStates[slot]?.connected == true else {
@@ -1886,6 +2149,7 @@ final class NativeStreamInputBridge {
         #if os(iOS)
         gameSirLastRumble = nil
         gameSirRumbler.stopAndClose()
+        steamController.setRumble(strongMagnitude: 0, weakMagnitude: 0, gain: 0)
         #endif
         #if canImport(CoreHaptics)
         if shutdown {
@@ -1948,6 +2212,7 @@ final class NativeStreamInputBridge {
     func setControllerMouseEmulation(_ enabled: Bool) {}
     var isControllerMouseEmulationEnabled: Bool { false }
     func setPhysicalControllerPassthrough(_ enabled: Bool) {}
+    func configureSteamController(enabled: Bool, config: SteamInputConfig, tuning: SteamControllerTuning) {}
     func setPhoneRumbleFallback(_ enabled: Bool) {}
     func attach() {}
     func detach() {}

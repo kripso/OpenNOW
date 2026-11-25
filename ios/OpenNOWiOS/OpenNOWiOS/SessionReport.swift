@@ -207,10 +207,6 @@ struct StreamRuntimeSample: Equatable {
     var receiveBufferMs: Double? = nil
     /// Whether the app has been left during this session, and whether it is away right now.
     var interruption: StreamInterruptionPhase = .none
-    /// Picture in picture: whether it is on, and what its frame conversion cost this window.
-    var pipActive = false
-    var pipFrames: Int? = nil
-    var pipConvertMs: Double? = nil
     /// The kind of network route the stream is on, without addresses.
     var route: String? = nil
     /// Stretches of 30 ms or more in which the network socket received nothing.
@@ -279,9 +275,9 @@ struct SessionFrameDelivery: Equatable, Encodable {
     private(set) var shown: NativeStreamFrameCadence?
     /// Seconds that measured the gaps between frames, for rates per minute.
     private(set) var cadenceSeconds = 0
+    /// Historical report fields retained for deployed report serialization compatibility.
     private(set) var pipFrames = 0
     private(set) var pipConvertMs = 0.0
-    /// Seconds picture in picture stayed on while the app itself was in front.
     private(set) var pipSecondsInApp = 0
     private var displayedSeconds = 0
     private var displayedTotal = 0.0
@@ -329,9 +325,6 @@ struct SessionFrameDelivery: Equatable, Encodable {
         arrived = Self.adding(sample.arrivedCadence, to: arrived)
         shown = Self.adding(sample.shownCadence, to: shown)
         if sample.shownCadence != nil { cadenceSeconds += 1 }
-        pipFrames += max(0, sample.pipFrames ?? 0)
-        pipConvertMs += max(0, sample.pipConvertMs ?? 0)
-        if sample.pipActive { pipSecondsInApp += 1 }
         if let ping = sample.pingMs, ping >= 0 {
             pingSamples += 1
             pingTotal += ping
@@ -390,6 +383,18 @@ struct SessionTimelineRow: Equatable {
     var peerToPeerPackets: Int?
     var lowLatencyLinkPackets: Int?
     var smoothingDelayMs: Int?
+    /// Gaps the frames already had when the server captured them.
+    var sourceStutters: Int?
+    /// Frames shown some other number of refreshes after the one before than the stream's own.
+    var unevenFrames: Int?
+    /// Frames that reached the screen one refresh, and two or more, after the one drawn for.
+    var presentedOneLate: Int?
+    var presentedTwoLate: Int?
+    /// Frames held one refresh to keep the pace even.
+    var pacedFrames: Int?
+    var longestTickDelayMs: Int?
+    var longestDrawableWaitMs: Int?
+    var longestGpuMs: Int?
     /// Display refreshes in the stretch, per sample: how fast the screen's clock really ran.
     var displayTicks: Int?
     var lateFrames: Int?
@@ -402,7 +407,10 @@ struct SessionTimelineRow: Equatable {
         "lowestBitrateKbps", "packetsLost", "networkSilences", "longestNetworkSilenceMs", "decoderStutters",
         "longestDecoderGapMs", "screenStutters", "longestScreenGapMs", "framesNeverShown", "lateDisplayTicks",
         "peakJitterUs", "lateReceiveWakeUps", "longestLateReceiveWakeUpMs",
-        "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "smoothingDelayMs", "displayTicks", "lateFrames", "longestFrameLatenessMs", "phase"
+        "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "smoothingDelayMs",
+        "sourceStutters", "unevenFrames", "presentedOneLate", "presentedTwoLate", "pacedFrames",
+        "longestTickDelayMs", "longestDrawableWaitMs", "longestGpuMs",
+        "displayTicks", "lateFrames", "longestFrameLatenessMs", "phase"
     ]
 
     /// In the order of `columns`; -1 stands for a reading the stretch did not have.
@@ -412,6 +420,8 @@ struct SessionTimelineRow: Equatable {
          longestDecoderGapMs, screenStutters, longestScreenGapMs, framesNeverShown, lateDisplayTicks,
          peakJitterUs ?? -1, lateReceiveWakeUps, longestLateReceiveWakeUpMs,
          wifiPackets ?? -1, peerToPeerPackets ?? -1, lowLatencyLinkPackets ?? -1, smoothingDelayMs ?? -1,
+         sourceStutters ?? -1, unevenFrames ?? -1, presentedOneLate ?? -1, presentedTwoLate ?? -1, pacedFrames ?? -1,
+         longestTickDelayMs ?? -1, longestDrawableWaitMs ?? -1, longestGpuMs ?? -1,
          displayTicks ?? -1, lateFrames ?? -1, longestFrameLatenessMs ?? -1, phase]
     }
 
@@ -438,6 +448,16 @@ struct SessionTimelineRow: Equatable {
         peerToPeerPackets = sample.interfaces?.peerToPeerPackets
         lowLatencyLinkPackets = sample.interfaces?.lowLatencyLinkPackets
         smoothingDelayMs = sample.smoothingDelayMs
+        sourceStutters = sample.arrivedCadence?.sourceLongGaps
+        if let shown = sample.shownCadence {
+            unevenFrames = shown.unevenGaps
+            presentedOneLate = shown.presentedLate[1]
+            presentedTwoLate = shown.presentedLate[2...].reduce(0, +)
+            pacedFrames = shown.paced
+            longestTickDelayMs = Int(shown.longestTickDelayMs.rounded())
+            longestDrawableWaitMs = Int(shown.longestDrawableWaitMs.rounded())
+            longestGpuMs = Int(shown.longestGpuMs.rounded())
+        }
         displayTicks = sample.shownCadence?.ticks
         lateFrames = sample.lateFrames
         longestFrameLatenessMs = sample.longestFrameLatenessMs.map { Int($0.rounded()) }
@@ -477,6 +497,14 @@ struct SessionTimelineRow: Equatable {
         peerToPeerPackets = sum(peerToPeerPackets, next.peerToPeerPackets)
         lowLatencyLinkPackets = sum(lowLatencyLinkPackets, next.lowLatencyLinkPackets)
         smoothingDelayMs = worst(smoothingDelayMs, next.smoothingDelayMs, max)
+        sourceStutters = sum(sourceStutters, next.sourceStutters)
+        unevenFrames = sum(unevenFrames, next.unevenFrames)
+        presentedOneLate = sum(presentedOneLate, next.presentedOneLate)
+        presentedTwoLate = sum(presentedTwoLate, next.presentedTwoLate)
+        pacedFrames = sum(pacedFrames, next.pacedFrames)
+        longestTickDelayMs = worst(longestTickDelayMs, next.longestTickDelayMs, max)
+        longestDrawableWaitMs = worst(longestDrawableWaitMs, next.longestDrawableWaitMs, max)
+        longestGpuMs = worst(longestGpuMs, next.longestGpuMs, max)
         // Per sample, so the slowest second the stretch had shows rather than a sum.
         displayTicks = worst(displayTicks, next.displayTicks, min)
         lateFrames = sum(lateFrames, next.lateFrames)
@@ -526,6 +554,21 @@ struct SessionReportTrendPoint: Identifiable, Equatable, Encodable {
     var id: Int { offsetSeconds }
 }
 
+/// One reopen of the stream within a session: what the client asked CloudMatch for, what the
+/// server's session record then said, and what the decoder produced. Only the decoder's size shows
+/// what was really streamed: the record can simply repeat the request back.
+struct SessionReopen: Equatable, Encodable {
+    let offsetSeconds: Int
+    /// The player picked a new resolution or frame rate in the stream panel for this reopen.
+    let changeRequested: Bool
+    let requestedResolution: String
+    let requestedFps: Int
+    let serverRecordResolution: String?
+    let serverRecordFps: Int?
+    /// The first size the decoder reported after the reopen.
+    var deliveredResolution: String? = nil
+}
+
 struct SessionReport: Identifiable, Equatable, Encodable {
     let id = UUID()
     let gameTitle: String
@@ -566,6 +609,8 @@ struct SessionReport: Identifiable, Equatable, Encodable {
     var timesAway = 0
     /// How often the stream was closed and reopened without ending the session.
     var reconnects = 0
+    /// Each reopen's request and outcome, in order.
+    var reopens: [SessionReopen] = []
     /// The transport's counters as they stood at the last reading, for a report that is sent.
     var transportDetail: String? = nil
     /// The part of `frameDelivery` measured while latency sat well above the session's best.
@@ -632,6 +677,7 @@ final class StreamSessionReportAccumulator {
     private var frameDeliveryAfterReturn = SessionFrameDelivery()
     private var timesAway = 0
     private var reconnects = 0
+    private var reopens: [SessionReopen] = []
     private var transportDetail: String?
     private var lastInterruption = StreamInterruptionPhase.none
     /// Latency counts as raised once it sits this far above the lowest the session has seen.
@@ -756,6 +802,10 @@ final class StreamSessionReportAccumulator {
 
         if let resolution = sample.resolution, parsedResolution(resolution) != nil {
             lastResolution = resolution
+            // Only a sample with decoded frames carries the decoder's own size, not the one asked for.
+            if let last = reopens.indices.last, reopens[last].deliveredResolution == nil, (sample.decodedFps ?? 0) > 0 {
+                reopens[last].deliveredResolution = resolution
+            }
         }
         if let codec = sample.codec, !codec.isEmpty {
             lastCodec = codec
@@ -764,6 +814,14 @@ final class StreamSessionReportAccumulator {
     }
 
     func recordReconnect() { reconnects += 1 }
+
+    func recordReopen(changeRequested: Bool, requested: StreamVideoProfile, serverRecordResolution: String?, serverRecordFps: Int?,
+                      at time: Date = Date()) {
+        reopens.append(SessionReopen(
+            offsetSeconds: max(0, Int(time.timeIntervalSince(startedAt))), changeRequested: changeRequested,
+            requestedResolution: requested.resolutionString, requestedFps: requested.fps,
+            serverRecordResolution: serverRecordResolution, serverRecordFps: serverRecordFps))
+    }
 
     func recordRecovery(reason: String, profile: StreamVideoProfile, codec: String) {
         let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -854,7 +912,8 @@ final class StreamSessionReportAccumulator {
                 finalCodec: finalCodec,
                 deliveredResolution: deliveredResolution,
                 deliveredCodec: deliveredCodec,
-                recoveryReason: recoveryReason
+                recoveryReason: recoveryReason,
+                reopens: reopens
             ),
             recommendations: Self.buildRecommendations(
                 averagePingMs: averagePingMs,
@@ -874,6 +933,7 @@ final class StreamSessionReportAccumulator {
             frameDeliveryAfterReturn: frameDeliveryAfterReturn.hasReadings ? frameDeliveryAfterReturn : nil,
             timesAway: timesAway,
             reconnects: reconnects,
+            reopens: reopens,
             transportDetail: transportDetail,
             frameDeliveryRaisedLatency: frameDeliveryRaisedLatency.hasReadings ? frameDeliveryRaisedLatency : nil,
             timeline: timeline
@@ -923,9 +983,21 @@ final class StreamSessionReportAccumulator {
         finalCodec: String,
         deliveredResolution: String?,
         deliveredCodec: String?,
-        recoveryReason: String?
+        recoveryReason: String?,
+        reopens: [SessionReopen] = []
     ) -> [SessionReportFinding] {
         var findings: [SessionReportFinding] = []
+
+        for reopen in reopens where reopen.changeRequested {
+            let record = reopen.serverRecordResolution.map { "\($0) at \(reopen.serverRecordFps.map(String.init) ?? "?") FPS" } ?? "nothing"
+            let delivered = reopen.deliveredResolution.flatMap(normalizedResolutionLabel) ?? "no decoded frames"
+            findings.append(SessionReportFinding(
+                title: "Asked for a new resolution mid-session",
+                detail: "At \(reopen.offsetSeconds / 60):\(String(format: "%02d", reopen.offsetSeconds % 60)) the reconnect asked for "
+                    + "\(reopen.requestedResolution) at \(reopen.requestedFps) FPS. GeForce NOW's session record then listed \(record), "
+                    + "and the decoder received \(delivered).",
+                kind: .info))
+        }
 
         if launchProfile.selectedProfile != launchProfile.eligibleProfile {
             findings.append(
@@ -985,7 +1057,9 @@ final class StreamSessionReportAccumulator {
             reportedRecovery = finalProfile.resolutionString != launchProfile.initialProfile.resolutionString
         }
 
-        let requestedResolution = launchProfile.initialProfile.resolutionString
+        // A size picked mid-session replaces the launch request as what the stream should be.
+        let requestedResolution = reopens.last(where: \.changeRequested)?.requestedResolution
+            ?? launchProfile.initialProfile.resolutionString
         if let delivered = deliveredResolution.flatMap(normalizedResolutionLabel),
            delivered != requestedResolution,
            !reportedRecovery {

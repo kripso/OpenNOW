@@ -59,7 +59,7 @@ struct NativeStreamNVSTSample: Sendable {
 protocol NativeStreamNVSTTransport: AnyObject, Sendable {
     func start() async throws
     func close() async
-    func send(_ data: Data) async -> Bool
+    func send(_ data: Data, enqueuedAt: TimeInterval) async -> Bool
     func setAudioMuted(_ muted: Bool) async
 }
 
@@ -105,6 +105,8 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
     private var udpKeyframeRequests = 0
     private var videoLiveness = NativeStreamVideoLiveness(now: DispatchTime.now().uptimeNanoseconds)
     private var didFinish = false
+    private var gamepadSendTime = NativeStreamInputTiming()
+    private var controlSendTime = NativeStreamInputTiming()
     private var touchPacketsSent = 0
     private var touchRecordsSent = 0
     private var touchSendFailures = 0
@@ -338,7 +340,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         NativeStreamRumbleDiagnostics.shared.record("nvstEnableSent", details: ["enableSendAccepted": String(hapticsSent)])
     }
 
-    func send(_ data: Data) -> Bool {
+    func send(_ data: Data, enqueuedAt: TimeInterval) -> Bool {
         guard !stopped, activatedInput, let bundle else { return false }
         inputSequence &+= 1
         do {
@@ -369,6 +371,15 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
                         leftStickX: pad.leftStickX, leftStickY: pad.leftStickY, rightStickX: pad.rightStickX, rightStickY: pad.rightStickY,
                         gamepadIndex: pad.gamepadIndex, connectedBitmap: pad.connectedBitmap)
                     sent = bundle.sendInput(try sequenced.command.encoded) && sent
+                }
+            }
+            // Includes waiting for the main and transport actors and submitting to local SCTP.
+            // Count an encoded event once, including text events split across several commands.
+            if sent, let first = outputs.first {
+                switch first {
+                case .gamepad: gamepadSendTime.record(ProcessInfo.processInfo.systemUptime - enqueuedAt)
+                case .control: controlSendTime.record(ProcessInfo.processInfo.systemUptime - enqueuedAt)
+                case .heartbeat, .touch: break
                 }
             }
             return sent
@@ -410,7 +421,10 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         if ping < 0, let rtsp { ping = await rtsp.controlRoundTripMilliseconds() }
         guard !stopped else { return }
         let state = pipeline.snapshot
-        let detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) bitstream=\(decoder.bitstreamFormat?.summary ?? "pending") requestedColor=\(StreamSettingsResolver.colorQuality(for: settings).rawValue) requestedHDR=\(settings.hdrEnabled) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) recovery[requests=\(keyframeRequests) control=\(controlKeyframeRequests) udp=\(udpKeyframeRequests) keyframes=\(stats.keyframesEmitted) feedback=\(bundle?.isFeedbackChannelOpen == true)] buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) loss[events=\(stats.recoveries) packets=\(stats.finalizedLossPackets) burst=\(stats.maxLossBurst) reorderDepth=\(stats.maxReorderDepth) late=\(stats.latePackets)] \(receiver.silenceTotals.summary) \(receiver.fecFindings.summary) \(state.timingSummary)"
+        var detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) bitstream=\(decoder.bitstreamFormat?.summary ?? "pending") requestedColor=\(StreamSettingsResolver.colorQuality(for: settings).rawValue) requestedHDR=\(settings.hdrEnabled) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) recovery[requests=\(keyframeRequests) control=\(controlKeyframeRequests) udp=\(udpKeyframeRequests) keyframes=\(stats.keyframesEmitted) feedback=\(bundle?.isFeedbackChannelOpen == true)] buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) loss[events=\(stats.recoveries) packets=\(stats.finalizedLossPackets) burst=\(stats.maxLossBurst) reorderDepth=\(stats.maxReorderDepth) late=\(stats.latePackets)] \(receiver.silenceTotals.summary) \(receiver.fecFindings.summary) \(state.timingSummary)"
+        if gamepadSendTime.count > 0 || controlSendTime.count > 0 {
+            detail += " localGamepadSend[\(gamepadSendTime.summary)] localControlSend[\(controlSendTime.summary)]"
+        }
         onSample(NativeStreamNVSTSample(received: counters.framesEmitted, decoded: decoded, bytes: counters.bytesReceived,
             lost: stats.finalizedLossPackets, packets: stats.authenticatedPackets, resolution: decoder.decodedResolution,
             decodeMilliseconds: state.decodeP50Milliseconds, pingMilliseconds: ping >= 0 ? ping : nil,

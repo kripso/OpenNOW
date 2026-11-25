@@ -751,6 +751,9 @@ struct MainTabView: View {
                 presentedStreamerSession = nil
                 store.dismissStreamer(reconnecting: true)
                 store.scheduleStreamerReopen()
+            },
+            onVideoRequest: { resolution, fps in
+                store.requestVideoOnNextReopen(resolution: resolution, fps: fps)
             }
         )
         .ignoresSafeArea()

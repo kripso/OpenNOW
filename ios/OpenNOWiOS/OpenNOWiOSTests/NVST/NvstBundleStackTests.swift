@@ -209,6 +209,21 @@ import Testing
         }
     }
 
+    @Test func theInputSocketIsMarkedAsInteractiveTraffic() throws {
+        let reservation = try NvstUdpPortReservation.bindEphemeral()
+        let descriptor = reservation.takeDescriptor()
+        let identity = try NvstDtlsIdentity()
+        let transport = try NvstDtlsTransport(
+            handshake: try NvstDtlsHandshake(role: .client, identity: identity, expectedPeerFingerprint: identity.fingerprint),
+            descriptor: descriptor, localAddress: "127.0.0.1", localPort: reservation.port,
+            peerAddress: "127.0.0.1", peerPort: 9)
+        var serviceType: Int32 = -1
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        #expect(getsockopt(descriptor, SOL_SOCKET, SO_NET_SERVICE_TYPE, &serviceType, &length) == 0)
+        #expect(serviceType == NET_SERVICE_TYPE_VI)
+        withExtendedLifetime(transport) {}
+    }
+
     private static func microphoneTone() -> [Int16] {
         (0..<(240 * 2)).map { index in
             let value = sin(2 * Double.pi * 440 * Double(index / 2) / 48_000) * 0.5

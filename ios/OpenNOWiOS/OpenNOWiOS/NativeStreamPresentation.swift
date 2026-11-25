@@ -219,7 +219,7 @@ struct NativeStreamPresentationPreferences: UIViewControllerRepresentable {
 
 enum NativeStreamPointerCapturePolicy {
     static func shouldCapture(videoActive: Bool, sceneActive: Bool, controlsVisible: Bool,
-                              editing: Bool, guidanceVisible: Bool, pipActive: Bool) -> Bool {
-        videoActive && sceneActive && !controlsVisible && !editing && !guidanceVisible && !pipActive
+                              editing: Bool, guidanceVisible: Bool) -> Bool {
+        videoActive && sceneActive && !controlsVisible && !editing && !guidanceVisible
     }
 }

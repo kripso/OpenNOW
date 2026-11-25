@@ -8,7 +8,6 @@ import UIKit
 #if os(iOS) && canImport(WebRTC)
 import AVFoundation
 import Accelerate
-import AVKit
 import CoreImage
 import MetalKit
 import Network
@@ -688,7 +687,8 @@ struct StreamerView: View {
         },
         onClose: @escaping () -> Void,
         onRetry: (() -> Void)? = nil,
-        onReopen: (() -> Void)? = nil
+        onReopen: (() -> Void)? = nil,
+        onVideoRequest: ((String, Int) -> Void)? = nil
     ) {
         _coordinator = StateObject(
             wrappedValue: NativeStreamCoordinator(
@@ -714,7 +714,8 @@ struct StreamerView: View {
                 onSubmitBugReport: onSubmitBugReport,
                 onClose: onClose,
                 onRetry: onRetry,
-                onReopen: onReopen
+                onReopen: onReopen,
+                onVideoRequest: onVideoRequest
             )
         )
         _ = onNativeFallbackRequiresFreshEndpoint
@@ -726,8 +727,7 @@ struct StreamerView: View {
             videoActive: coordinator.videoActive && !coordinator.showStatusOverlay,
             sceneActive: scenePhase == .active, controlsVisible: coordinator.controlsPanelVisible,
             editing: coordinator.touchLayoutEditing,
-            guidanceVisible: coordinator.presentedGuidanceSheet != nil || coordinator.inputModePrompt != nil,
-            pipActive: coordinator.isPictureInPictureActive)
+            guidanceVisible: coordinator.presentedGuidanceSheet != nil || coordinator.inputModePrompt != nil)
     }
 
     var body: some View {
@@ -937,15 +937,6 @@ struct StreamerView: View {
 
     private var streamOverlayButtons: some View {
         HStack(spacing: 10) {
-            if coordinator.pictureInPictureAvailable {
-                NativeStreamOverlayButton(
-                    systemImage: coordinator.isPictureInPictureActive ? "pip.exit" : "pip.enter",
-                    label: coordinator.isPictureInPictureActive ? "Stop Picture in Picture" : "Start Picture in Picture"
-                ) {
-                    coordinator.togglePictureInPicture()
-                }
-            }
-
             NativeStreamOverlayButton(systemImage: "slider.horizontal.3", label: "Stream controls") {
                 coordinator.toggleControlsPanel()
             }
@@ -1539,7 +1530,7 @@ private struct NativeStreamTutorialSheet: View {
                             .foregroundStyle(.tint)
                         Text("Open Stream Controls")
                             .font(.title2.bold())
-                        Text("Stream controls let you manage audio, video, input, Picture in Picture, and your touch layout without ending the session.")
+                        Text("Stream controls let you manage audio, video, input, and your touch layout without ending the session.")
                             .foregroundStyle(.secondary)
                     }
 
@@ -1671,8 +1662,11 @@ private struct NativeStreamControlsPanel: View {
     @State private var keyboardPresented = false
     @State private var bugReportDeck: BugReportPreflightDeck?
     @State private var controllerMappingsPresented = false
+    @State private var steamControllerPresented = false
     @State private var draftBitrateMbps: Int?
     @State private var draftCodec: String?
+    @State private var draftResolution: String?
+    @State private var draftFPS: Int?
     @StateObject private var controllerNavigator = NativeStreamControllerHUDNavigator()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -1757,10 +1751,11 @@ private struct NativeStreamControlsPanel: View {
             if input.command == .back {
                 if keyboardPresented { keyboardPresented = false }
                 else if controllerMappingsPresented { controllerMappingsPresented = false }
+                else if steamControllerPresented { steamControllerPresented = false }
                 else if bugReportDeck != nil { bugReportDeck = nil }
                 else if tab != .quick { tab = .quick }
                 else { coordinator.finishControlsPanel() }
-            } else if !keyboardPresented && !controllerMappingsPresented && bugReportDeck == nil {
+            } else if !keyboardPresented && !controllerMappingsPresented && !steamControllerPresented && bugReportDeck == nil {
                 controllerNavigator.handle(input.command)
             }
         }
@@ -1769,6 +1764,20 @@ private struct NativeStreamControlsPanel: View {
                 NativeStreamControllerShortcutsView(settings: Binding(get: { coordinator.liveSettings },
                     set: { next in coordinator.updateLiveSettings { $0.controllerShortcuts = next.controllerShortcuts } }))
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { controllerMappingsPresented = false } } }
+            }
+        }
+        .sheet(isPresented: $steamControllerPresented) {
+            NavigationStack {
+                SteamControllerSettingsView(settings: Binding(get: { coordinator.liveSettings },
+                    set: { next in coordinator.updateLiveSettings {
+                        $0.steamControllerEnabled = next.steamControllerEnabled
+                        $0.steamControllerLayout = next.steamControllerLayout
+                        $0.steamControllerActiveLayout = next.steamControllerActiveLayout
+                        $0.steamControllerGameLayouts = next.steamControllerGameLayouts
+                        $0.steamControllerTuning = next.steamControllerTuning
+                        $0.steamControllerLayoutRevision = next.steamControllerLayoutRevision
+                    } }), gameTitle: coordinator.gameTitle)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { steamControllerPresented = false } } }
             }
         }
         // Fixed dark: this sits on live video, where the system's light grouped colour would put
@@ -1887,7 +1896,7 @@ private struct NativeStreamControlsPanel: View {
             NativeStreamPanelSection(
                 title: "Toggles",
                 minimumColumnWidth: 104,
-                maximumColumns: coordinator.pictureInPictureAvailable ? 6 : 5
+                maximumColumns: 5
             ) {
                 NativeStreamTile(
                     title: "Audio",
@@ -1919,15 +1928,6 @@ private struct NativeStreamControlsPanel: View {
                     isOn: coordinator.liveSettings.showAntiAfkIndicator
                 ) {
                     coordinator.updateLiveSettings { $0.showAntiAfkIndicator.toggle() }
-                }
-                if coordinator.pictureInPictureAvailable {
-                    NativeStreamTile(
-                        title: "Picture in Picture",
-                        systemImage: coordinator.isPictureInPictureActive ? "pip.exit" : "pip.enter",
-                        isOn: coordinator.isPictureInPictureActive
-                    ) {
-                        coordinator.togglePictureInPicture()
-                    }
                 }
             }
 
@@ -2020,12 +2020,67 @@ private struct NativeStreamControlsPanel: View {
                 }
             }
 
+            if coordinator.liveResolutionChangeAvailable {
+                liveResolutionSection
+            }
+
             NativeStreamPanelSection(title: "Fixed for this session") {
                 NativeStreamInfoRow(title: "Resolution", value: coordinator.profileLabel)
                 NativeStreamInfoRow(title: "Color", value: coordinator.sessionColorLabel)
                 NativeStreamInfoRow(title: "Connection", value: coordinator.connectionLabel)
                 NativeStreamInfoRow(title: "Server", value: coordinator.serverLabel)
                 NativeStreamPanelNote("GeForce NOW sets resolution, frame rate, color, HDR, connection type, L4S, keyboard layout, language and server when it starts the session. Change them in Settings for your next session.")
+            }
+        }
+    }
+
+    /// Experimental: asks GeForce NOW for another size or frame rate on a reconnect. Whether the
+    /// server honours a resume with new geometry is what this is here to find out.
+    private var liveResolutionSection: some View {
+        let resolutions = coordinator.liveResolutionChoices
+        let fpsChoices = coordinator.liveFPSChoices
+        let resolution = draftResolution ?? coordinator.liveStreamResolution
+        let fps = draftFPS ?? coordinator.liveStreamFPS
+        let changed = resolution != coordinator.liveStreamResolution || fps != coordinator.liveStreamFPS
+        return NativeStreamPanelSection(title: "Experimental") {
+            NativeStreamChoiceRow(
+                title: "Resolution \(resolution.replacingOccurrences(of: "x", with: " × "))",
+                options: resolutions.map { value in
+                    let height = value.split(separator: "x").last.map(String.init) ?? value
+                    let shared = resolutions.filter { $0.hasSuffix("x\(height)") }.count > 1
+                    return (label: shared ? value.replacingOccurrences(of: "x", with: "×") : height, value: value)
+                },
+                selection: resolution,
+                onSelect: { draftResolution = $0 }
+            )
+            NativeStreamChoiceRow(
+                title: "Frame rate",
+                options: fpsChoices.map { (label: "\($0)", value: $0) },
+                selection: fps,
+                onSelect: { draftFPS = $0 }
+            )
+            if changed {
+                HStack(spacing: 10) {
+                    Text("Reconnects and asks GeForce NOW for this size. The server may keep the old one; the session report records what arrived.")
+                        .font(StreamPanelStyle.supporting)
+                        .foregroundStyle(StreamPanelStyle.supportingColor)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    NativeStreamPanelPillButton(action: {
+                        draftResolution = nil
+                        draftFPS = nil
+                    }) {
+                        Text("Reset")
+                    }
+                    NativeStreamPanelPillButton(prominent: true, action: {
+                        coordinator.applyLiveResolution(resolution, fps: fps)
+                        draftResolution = nil
+                        draftFPS = nil
+                    }) {
+                        Text("Apply")
+                    }
+                }
+                .streamPanelRow()
+                .panelFullWidth()
             }
         }
     }
@@ -2075,6 +2130,10 @@ private struct NativeStreamControlsPanel: View {
                     value: coordinator.liveSettings.metal4Enabled ? "On" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.metal4Enabled },
                         set: { value in coordinator.updateLiveSettings { $0.metal4Enabled = value } }))
+                NativeStreamToggleRow(title: "Even frame pacing",
+                    value: coordinator.liveSettings.evenFramePacing ? "Steadier motion" : "Each frame as soon as it arrives",
+                    isOn: Binding(get: { coordinator.liveSettings.evenFramePacing },
+                        set: { value in coordinator.updateLiveSettings { $0.evenFramePacing = value } }))
                 if let rates = coordinator.statsSnapshot.presentationRates {
                     NativeStreamInfoRow(title: "Presented", value: rates.label)
                 }
@@ -2124,6 +2183,9 @@ private struct NativeStreamControlsPanel: View {
                 )
                 NativeStreamActionRow(title: "Back button shortcuts", value: "Learn buttons and choose HUD actions", actionLabel: "Configure") {
                     controllerMappingsPresented = true
+                }
+                NativeStreamActionRow(title: "Steam Controller", value: "Trackpads, back buttons and gyro", actionLabel: "Configure") {
+                    steamControllerPresented = true
                 }
             }
         }
@@ -3219,8 +3281,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     @Published fileprivate var phoneRumbleFallbackEnabled: Bool
     @Published fileprivate var deviceStatus = NativeStreamDeviceStatus.current()
     @Published var touchLayout: TouchControlLayout
-    @Published fileprivate var pictureInPictureAvailable = false
-    @Published fileprivate var isPictureInPictureActive = false
+    @Published var steamControllerMenus: [SteamInputEngine.Menu] = []
+    @Published var steamControllerActionSet: String?
     @Published fileprivate var physicalControllerConnected = false
     @Published fileprivate var inputModePrompt: NativeStreamInputModePrompt?
     @Published fileprivate var showTouchControlsWithPhysicalController = false
@@ -3264,6 +3326,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     /// Reopens the stream on the same cloud session. The native receiver negotiates its
     /// connection once, so a new bitrate or codec reaches it only through a reopen.
     private let onReopen: (() -> Void)?
+    /// Experimental: hands the store a resolution and frame rate to ask for on the next reopen.
+    private let onVideoRequest: ((String, Int) -> Void)?
     private let onBuildBugReportDeck: () -> BugReportPreflightDeck
     private let onSubmitBugReport: (BugReportDraft, BugReportPreflightDeck) async -> Result<String, Error>
     private let onClose: () -> Void
@@ -3338,7 +3402,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var reliableInputChannel: RTCDataChannel?
     private var partiallyReliableInputChannel: RTCDataChannel?
     private var controlChannel: RTCDataChannel?
-    private let pictureInPictureBridge = NativeStreamPictureInPictureBridge()
     private weak var renderer: NativeStreamRenderView?
     private let videoSink = NativeStreamVideoSink()
     private var videoTrack: RTCVideoTrack?
@@ -3390,7 +3453,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var audioSessionObservers: [NSObjectProtocol] = []
     private var audioSessionRecoveryTask: Task<Void, Never>?
     private var latestScenePhase: ScenePhase = .active
-    private var backgroundPictureInPictureStartPending = false
     private var needsForegroundReconnect = false
     @Published fileprivate var videoActive = false
     private var streamTutorialCompleted: Bool
@@ -3427,7 +3489,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         onSubmitBugReport: @escaping (BugReportDraft, BugReportPreflightDeck) async -> Result<String, Error>,
         onClose: @escaping () -> Void,
         onRetry: (() -> Void)?,
-        onReopen: (() -> Void)? = nil
+        onReopen: (() -> Void)? = nil,
+        onVideoRequest: ((String, Int) -> Void)? = nil
     ) {
         let resolvedSessionLimit = streamSessionLimit(for: membershipTier)
         let resolvedTouchLayoutProfile = streamTouchLayoutProfile(
@@ -3484,6 +3547,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         self.onRetry = onRetry
         self.membershipTier = membershipTier
         self.onReopen = onReopen
+        self.onVideoRequest = onVideoRequest
         self.streamProfile = Self.effectiveProfile(for: session, settings: settings, membershipTier: membershipTier)
         self.requestedProfile = StreamSettingsResolver.profile(for: settings, membershipTier: membershipTier)
         self.showStatsOverlay = settings.showStatsOverlay
@@ -3508,6 +3572,21 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             controllerRumbleStrength: settings.controllerRumbleStrength
         )
         inputBridge.setControllerShortcuts(settings.controllerShortcuts)
+        inputBridge.configureSteamController(
+            enabled: settings.steamControllerEnabled,
+            config: settings.steamControllerConfig(forGame: session.game.title),
+            tuning: settings.steamControllerTuning)
+        inputBridge.onSteamControllerMenus = { [weak self] menus in
+            self?.steamControllerMenus = menus
+        }
+        inputBridge.onSteamControllerActionSet = { [weak self] title in
+            guard let self else { return }
+            self.steamControllerActionSet = title
+            // Shown briefly, like Steam's own notice; a later switch restarts the wait.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                if self?.steamControllerActionSet == title { self?.steamControllerActionSet = nil }
+            }
+        }
         inputBridge.onControllerShortcut = { [weak self] action in
             Task { @MainActor in
                 guard let self else { return }
@@ -3538,24 +3617,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         videoSink.onFrame = { [weak self] count, size, colorMode in
             Task { @MainActor in
                 self?.noteRenderedFrame(count: count, size: size, colorMode: colorMode)
-            }
-        }
-        videoSink.onPictureInPictureFrame = { [weak pictureInPictureBridge] frame in
-            pictureInPictureBridge?.enqueue(frame: frame)
-        }
-        pictureInPictureBridge.onAvailabilityChanged = { [weak self] available in
-            Task { @MainActor in
-                self?.pictureInPictureAvailable = available
-            }
-        }
-        pictureInPictureBridge.onActiveChanged = { [weak self] active in
-            Task { @MainActor in
-                self?.handlePictureInPictureActiveChanged(active)
-            }
-        }
-        pictureInPictureBridge.onLog = { [weak self] message in
-            Task { @MainActor in
-                self?.log(message)
             }
         }
     }
@@ -3742,7 +3803,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         updateWiFiPauseSmoothing(longestSilenceMilliseconds: sample.networkSilences.longestMilliseconds)
         let cadence = renderer?.drainFrameCadence()
         let late = renderer?.drainLateFrames()
-        let pip = pictureInPictureBridge.drainConversionCost()
         onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
             bitrateKbps: bitrate, jitterMs: sample.jitterMilliseconds, fps: decodedFPS, receivedFps: receivedFPS,
             decodedFps: decodedFPS, decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
@@ -3751,8 +3811,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             displayedFps: statsSnapshot.presentationRates?.displayedFPS,
             renderer: "Native NVST · \(statsSnapshot.effects)",
             arrivedCadence: cadence?.arrived, shownCadence: cadence?.shown,
-            interruption: interruptionPhase, pipActive: isPictureInPictureActive && latestScenePhase == .active,
-            pipFrames: pip.frames, pipConvertMs: pip.milliseconds,
+            interruption: interruptionPhase,
             networkSilences: sample.networkSilences.count,
             longestNetworkSilenceMs: sample.networkSilences.longestMilliseconds,
             lateReceiveWakeUps: sample.networkSilences.lateWakeUps,
@@ -3760,7 +3819,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             interfaces: drainInterfaceActivity(),
             smoothingDelayMs: appliedPlayoutDelayMs,
             lateFrames: late?.count, longestFrameLatenessMs: late?.longestMs,
-            transportDetail: sample.detail))
+            transportDetail: sample.detail + inputBridge.steamInputTiming))
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }
@@ -3781,17 +3840,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             refreshDeviceStatus()
             if let historyRecord { sessionHistory?.update(historyRecord, force: true) }
         }
-        switch phase {
-        case .active:
-            backgroundPictureInPictureStartPending = false
+        if phase == .active {
             reconnectAfterBackgroundIfNeeded()
             scheduleGuidancePresentation()
-        case .inactive:
-            startPictureInPictureForBackground(reason: "scene inactive")
-        case .background:
-            startPictureInPictureForBackground(reason: "scene background")
-        @unknown default:
-            break
         }
     }
 
@@ -3799,7 +3850,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         latestScenePhase = scenePhase
         guard scenePhase == .active else {
             log("Preserving native stream during \(String(describing: scenePhase)) scene transition")
-            startPictureInPictureForBackground(reason: "view disappeared while app was not active")
             return
         }
         stop()
@@ -3870,6 +3920,36 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         var quality = settings
         quality.maxBitrateMbps = StreamSettingsResolver.normalizedBitratePreset(preset)
         return Self.effectiveProfile(for: session, settings: quality, membershipTier: membershipTier).maxBitrateKbps / 1_000
+    }
+
+    /// The mid-session resolution request needs the native receiver's reopen, which re-claims the seat.
+    var liveResolutionChangeAvailable: Bool {
+        usesNativeReceiver && onReopen != nil && onVideoRequest != nil && !stopped
+    }
+
+    var liveStreamResolution: String { streamProfile.resolutionString }
+    var liveStreamFPS: Int { streamProfile.fps }
+
+    /// The sizes this plan allows in the session's aspect ratio, plus the one being streamed.
+    var liveResolutionChoices: [String] {
+        var choices = StreamSettingsResolver.choices(forAspectRatio: liveSettings.preferredAspectRatio)
+            .filter { StreamSettingsResolver.isResolutionAvailable($0, membershipTier: membershipTier) }
+            .map(\.value)
+        if !choices.contains(liveStreamResolution) { choices.append(liveStreamResolution) }
+        return choices
+    }
+
+    var liveFPSChoices: [Int] {
+        StreamSettingsResolver.plan(for: membershipTier) >= .ultimate ? [30, 60, 120] : [30, 60]
+    }
+
+    func applyLiveResolution(_ resolution: String, fps: Int) {
+        guard liveResolutionChangeAvailable, liveResolutionChoices.contains(resolution), liveFPSChoices.contains(fps) else { return }
+        guard resolution != liveStreamResolution || fps != liveStreamFPS else { return }
+        onVideoRequest?(resolution, fps)
+        log("In-stream resolution request through reopen resolution=\(resolution) fps=\(fps) from=\(profileLabel)")
+        updateStatus("Requesting \(resolution) at \(fps) FPS", detail: "Reopening the stream on this session")
+        onReopen?()
     }
 
     func applyLiveStreamQuality(maxBitrateMbps: Int, codec: String) {
@@ -3951,8 +4031,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     fileprivate var nativeTouchCaptureEnabled: Bool {
         nativeTouchActive &&
             !controlsPanelVisible &&
-            presentedGuidanceSheet == nil &&
-            !isPictureInPictureActive
+            presentedGuidanceSheet == nil
     }
 
     fileprivate var fingerMouseCaptureEnabled: Bool {
@@ -4126,6 +4205,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         liveSettings = next
         statsMetrics = next.streamStatsMetrics
         renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled, metal4: next.metal4Enabled)
+        renderer?.setEvenFramePacing(next.evenFramePacing)
         inputBridge.configureUserPreferences(
             mouseSensitivity: next.mouseSensitivity,
             mouseAcceleration: next.mouseAcceleration,
@@ -4136,6 +4216,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             controllerRumbleStrength: next.controllerRumbleStrength
         )
         inputBridge.setControllerShortcuts(next.controllerShortcuts)
+        inputBridge.configureSteamController(
+            enabled: next.steamControllerEnabled, config: next.steamControllerConfig(forGame: session.game.title),
+            tuning: next.steamControllerTuning)
         if mediaTransportConnected, (antiAfkTimer != nil) != next.showAntiAfkIndicator {
             setAntiAfkEnabled(next.showAntiAfkIndicator)
         }
@@ -4225,14 +4308,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             }
         }
         renderedVideoSize = size
-    }
-
-    func togglePictureInPicture() {
-        if pictureInPictureBridge.isPictureInPictureActive {
-            pictureInPictureBridge.stop()
-        } else if !pictureInPictureBridge.start() {
-            updateStatus("Picture in Picture unavailable", detail: "Waiting for a hardware-decoded video frame")
-        }
     }
 
     func setAudioEnabled(_ enabled: Bool) {
@@ -4490,8 +4565,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
               latestScenePhase == .active,
               presentedGuidanceSheet == nil,
               !controlsPanelVisible,
-              !touchLayoutEditing,
-              !isPictureInPictureActive else {
+              !touchLayoutEditing else {
             return
         }
         if !streamTutorialCompleted {
@@ -4522,7 +4596,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             renderer.setStreamSharpening(enabled: streamSharpeningEnabled, amount: streamSharpeningAmount)
             renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
             videoSink.attach(renderView: renderer)
-            pictureInPictureBridge.attach(displayLayer: renderer.pictureInPictureDisplayLayer)
         }
         self.renderer = renderer
         renderer.setStreamFrameRate(streamProfile.fps)
@@ -4531,6 +4604,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         renderer.setStreamSharpening(enabled: streamSharpeningEnabled, amount: streamSharpeningAmount)
         renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
         renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled)
+        renderer.setEvenFramePacing(liveSettings.evenFramePacing)
         attachCurrentVideoSinkIfNeeded()
     }
 
@@ -4593,9 +4667,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         signalingHeartbeat = nil
         statsTimer?.cancel()
         statsTimer = nil
-        pictureInPictureBridge.detach()
-        pictureInPictureAvailable = false
-        isPictureInPictureActive = false
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         signalingSession?.invalidateAndCancel()
@@ -5607,7 +5678,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         }
 
         let cadence = renderer?.drainFrameCadence()
-        let pip = pictureInPictureBridge.drainConversionCost()
         onRuntimeSample(
             StreamRuntimeSample(
                 timestamp: now,
@@ -5636,9 +5706,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 shownCadence: cadence?.shown,
                 receiveBufferMs: receiverCounters.bufferMs(since: lastStatsReceiverCounters),
                 interruption: interruptionPhase,
-                pipActive: isPictureInPictureActive && latestScenePhase == .active,
-                pipFrames: pip.frames,
-                pipConvertMs: pip.milliseconds,
                 route: selectedIceRoute(pair: selectedPairValues, candidates: candidateStats),
                 interfaces: drainInterfaceActivity()
             )
@@ -6044,7 +6111,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 
     private func observeAppState() {
         // Only real leaving and returning move the phase. Resigning active alone (Control Center,
-        // a notification pulled down) is left out: it would start Picture in Picture over the game.
+        // a notification pulled down) is left out of the away-time measurement.
         let events: [(Notification.Name, String, ScenePhase?)] = [
             (UIApplication.willResignActiveNotification, "inactive", nil),
             (UIApplication.didEnterBackgroundNotification, "background", .background),
@@ -6088,25 +6155,6 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             deadline: .now() + NativeStreamTransportPolicy.iceDisconnectedGrace,
             execute: item
         )
-    }
-
-    private func handlePictureInPictureActiveChanged(_ active: Bool) {
-        isPictureInPictureActive = active
-        if active || latestScenePhase == .active {
-            backgroundPictureInPictureStartPending = false
-        }
-    }
-
-    private func startPictureInPictureForBackground(reason: String) {
-        guard !stopped else { return }
-        guard !pictureInPictureBridge.isPictureInPictureActive else { return }
-        guard !backgroundPictureInPictureStartPending else { return }
-        guard pictureInPictureBridge.start() else {
-            log("Picture in Picture background start skipped for \(reason); waiting for PiP availability")
-            return
-        }
-        backgroundPictureInPictureStartPending = true
-        log("Requested Picture in Picture for \(reason)")
     }
 
     private func reconnectAfterBackgroundIfNeeded() {
@@ -6276,9 +6324,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 
 extension NativeStreamCoordinator: NativeStreamInputSink {
     nonisolated func sendReliableInput(_ data: Data) {
+        let enqueuedAt = ProcessInfo.processInfo.systemUptime
         Task { @MainActor in
             if let nativeNVST = self.nativeNVST {
-                if await nativeNVST.send(data) { self.reliableInputPackets += 1 }
+                if await nativeNVST.send(data, enqueuedAt: enqueuedAt) { self.reliableInputPackets += 1 }
                 return
             }
             guard self.reliableInputChannel?.readyState == .open else { return }
@@ -6289,9 +6338,10 @@ extension NativeStreamCoordinator: NativeStreamInputSink {
     }
 
     nonisolated func sendPartiallyReliableInput(_ data: Data) {
+        let enqueuedAt = ProcessInfo.processInfo.systemUptime
         Task { @MainActor in
             if let nativeNVST = self.nativeNVST {
-                if await nativeNVST.send(data) { self.partiallyReliableInputPackets += 1 }
+                if await nativeNVST.send(data, enqueuedAt: enqueuedAt) { self.partiallyReliableInputPackets += 1 }
                 return
             }
             if self.partiallyReliableInputChannel?.readyState == .open {
@@ -6512,341 +6562,8 @@ extension NativeStreamCoordinator: RTCDataChannelDelegate {
     }
 }
 
-private final class NativeStreamPictureInPictureBridge: NSObject {
-    var onAvailabilityChanged: ((Bool) -> Void)?
-    var onActiveChanged: ((Bool) -> Void)?
-    var onLog: ((String) -> Void)?
-
-    private let frameQueue = DispatchQueue(label: "OpenNOW.NativeStreamer.PiPFrames")
-    private weak var displayLayer: AVSampleBufferDisplayLayer?
-    private var contentSource: AVPictureInPictureController.ContentSource?
-    private var pictureInPictureController: AVPictureInPictureController?
-    private var possibilityObservation: NSKeyValueObservation?
-    private let frameInFlight = DispatchSemaphore(value: 1)
-    private let converter = NativeStreamPiPFrameConverter()
-    private let conversionCostLock = NSLock()
-    private var conversionCost: (frames: Int, milliseconds: Double) = (0, 0)
-    private let generationLock = NSLock()
-    private var generation: UInt64 = 0
-    private var availabilityPublished = false
-    private var playbackPaused = false
-
-    private var hasFrameForPlayback = false
-    private var activeForFrameQueue = false
-    private var lastAcceptedFrameAt: TimeInterval = 0
-    private var cachedFormatDescription: CMVideoFormatDescription?
-    private var cachedPixelFormat: OSType = 0
-    private var cachedWidth = 0
-    private var cachedHeight = 0
-
-    private static let activeFrameInterval: TimeInterval = 1.0 / 30.0
-    private static let inactiveFrameInterval: TimeInterval = 0.5
-
-    var isPictureInPictureActive: Bool {
-        pictureInPictureController?.isPictureInPictureActive == true
-    }
-
-    func attach(displayLayer: AVSampleBufferDisplayLayer) {
-        generationLock.lock(); generation &+= 1; generationLock.unlock()
-        self.displayLayer = displayLayer
-        hasFrameForPlayback = false
-        playbackPaused = false
-        displayLayer.videoGravity = .resizeAspect
-        displayLayer.backgroundColor = UIColor.black.cgColor
-        displayLayer.flush()
-        var timebase: CMTimebase?
-        if CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
-            sourceClock: CMClockGetHostTimeClock(), timebaseOut: &timebase) == noErr, let timebase {
-            CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
-            CMTimebaseSetRate(timebase, rate: 1)
-            displayLayer.controlTimebase = timebase
-        }
-        frameQueue.async { [weak self] in self?.resetFrameState() }
-
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
-            publishAvailability(false)
-            onLog?("Picture in Picture is not supported on this device")
-            return
-        }
-
-        let contentSource = AVPictureInPictureController.ContentSource(
-            sampleBufferDisplayLayer: displayLayer,
-            playbackDelegate: self
-        )
-        let controller = AVPictureInPictureController(contentSource: contentSource)
-        controller.delegate = self
-        controller.requiresLinearPlayback = true
-        controller.canStartPictureInPictureAutomaticallyFromInline = true
-        self.contentSource = contentSource
-        self.pictureInPictureController = controller
-        possibilityObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.updateAvailabilityFromController() }
-        }
-        publishAvailability(false)
-    }
-
-    @discardableResult
-    func start() -> Bool {
-        guard let controller = pictureInPictureController,
-              AVPictureInPictureController.isPictureInPictureSupported() else {
-            return false
-        }
-        if controller.isPictureInPictureActive {
-            return true
-        }
-        guard controller.isPictureInPicturePossible else {
-            return false
-        }
-        controller.startPictureInPicture()
-        return true
-    }
-
-    func stop() {
-        guard pictureInPictureController?.isPictureInPictureActive == true else { return }
-        pictureInPictureController?.stopPictureInPicture()
-    }
-
-    func detach() {
-        generationLock.lock(); generation &+= 1; generationLock.unlock()
-        possibilityObservation = nil
-        stop()
-        publishActive(false)
-        publishAvailability(false)
-        hasFrameForPlayback = false
-        playbackPaused = false
-        pictureInPictureController?.delegate = nil
-        pictureInPictureController = nil
-        contentSource = nil
-        displayLayer?.flush()
-        displayLayer = nil
-        frameQueue.async { [weak self] in
-            self?.resetFrameState()
-        }
-    }
-
-    func enqueue(frame: RTCVideoFrame) {
-        guard let cvBuffer = frame.buffer as? RTCCVPixelBuffer else { return }
-        guard frameInFlight.wait(timeout: .now()) == .success else { return }
-        let pixelBuffer = cvBuffer.pixelBuffer
-        generationLock.lock(); let frameGeneration = generation; generationLock.unlock()
-        frameQueue.async { [self] in
-            enqueue(pixelBuffer: pixelBuffer, generation: frameGeneration)
-        }
-    }
-
-    /// Frames converted for picture in picture since the last call, and the time that took.
-    func drainConversionCost() -> (frames: Int, milliseconds: Double) {
-        conversionCostLock.lock(); defer { conversionCostLock.unlock() }
-        defer { conversionCost = (0, 0) }
-        return conversionCost
-    }
-
-    private func timedConversion(of pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        let started = CACurrentMediaTime()
-        let converted = converter.convert(pixelBuffer)
-        let elapsed = (CACurrentMediaTime() - started) * 1_000
-        conversionCostLock.lock()
-        conversionCost.frames += 1
-        conversionCost.milliseconds += elapsed
-        conversionCostLock.unlock()
-        return converted
-    }
-
-    private func enqueue(pixelBuffer: CVPixelBuffer, generation frameGeneration: UInt64) {
-        guard shouldAcceptFrame(), let converted = timedConversion(of: pixelBuffer),
-              let sampleBuffer = makeSampleBuffer(pixelBuffer: converted) else {
-            frameInFlight.signal()
-            return
-        }
-        DispatchQueue.main.async { [self] in
-            defer { frameInFlight.signal() }
-            generationLock.lock(); let currentGeneration = generation; generationLock.unlock()
-            guard frameGeneration == currentGeneration, let displayLayer = displayLayer else { return }
-            if displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding {
-                displayLayer.flush()
-            }
-            guard displayLayer.isReadyForMoreMediaData else { return }
-            displayLayer.enqueue(sampleBuffer)
-            self.hasFrameForPlayback = true
-            self.updateAvailabilityFromController()
-            self.pictureInPictureController?.invalidatePlaybackState()
-        }
-    }
-
-    private func shouldAcceptFrame() -> Bool {
-        let now = ProcessInfo.processInfo.systemUptime
-        let interval = activeForFrameQueue ? Self.activeFrameInterval : Self.inactiveFrameInterval
-        guard lastAcceptedFrameAt == 0 || now - lastAcceptedFrameAt >= interval else {
-            return false
-        }
-        lastAcceptedFrameAt = now
-        return true
-    }
-
-    private func makeSampleBuffer(pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
-        guard let formatDescription = formatDescription(for: pixelBuffer) else { return nil }
-        var timing = NativeStreamPiPSampleTiming.make()
-        var sampleBuffer: CMSampleBuffer?
-        let status = CMSampleBufferCreateReadyWithImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescription: formatDescription,
-            sampleTiming: &timing,
-            sampleBufferOut: &sampleBuffer
-        )
-        guard status == noErr, let sampleBuffer else { return nil }
-        markDisplayImmediately(sampleBuffer)
-        return sampleBuffer
-    }
-
-    private func formatDescription(for pixelBuffer: CVPixelBuffer) -> CMVideoFormatDescription? {
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        if let cachedFormatDescription,
-           cachedWidth == width,
-           cachedHeight == height,
-           cachedPixelFormat == pixelFormat {
-            return cachedFormatDescription
-        }
-
-        var formatDescription: CMVideoFormatDescription?
-        let status = CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescriptionOut: &formatDescription
-        )
-        guard status == noErr, let formatDescription else { return nil }
-        cachedFormatDescription = formatDescription
-        cachedWidth = width
-        cachedHeight = height
-        cachedPixelFormat = pixelFormat
-        return formatDescription
-    }
-
-    private func markDisplayImmediately(_ sampleBuffer: CMSampleBuffer) {
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
-            sampleBuffer,
-            createIfNecessary: true
-        ), CFArrayGetCount(attachments) > 0 else {
-            return
-        }
-        let rawDictionary = CFArrayGetValueAtIndex(attachments, 0)
-        let attachmentsDictionary = unsafeBitCast(rawDictionary, to: CFMutableDictionary.self)
-        CFDictionarySetValue(
-            attachmentsDictionary,
-            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
-        )
-    }
-
-    private func updateAvailabilityFromController() {
-        publishAvailability(pictureInPictureController?.isPictureInPicturePossible == true)
-    }
-
-    private func publishAvailability(_ available: Bool) {
-        guard availabilityPublished != available else { return }
-        availabilityPublished = available
-        onAvailabilityChanged?(available)
-    }
-
-    private func publishActive(_ active: Bool) {
-        playbackPaused = false
-        frameQueue.async { [weak self] in
-            self?.activeForFrameQueue = active
-            if active {
-                self?.lastAcceptedFrameAt = 0
-            }
-        }
-        onActiveChanged?(active)
-        pictureInPictureController?.invalidatePlaybackState()
-    }
-
-    private func resetFrameState() {
-        activeForFrameQueue = false
-        lastAcceptedFrameAt = 0
-        cachedFormatDescription = nil
-        cachedPixelFormat = 0
-        cachedWidth = 0
-        cachedHeight = 0
-    }
-}
-
-extension NativeStreamPictureInPictureBridge: AVPictureInPictureControllerDelegate {
-    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-        publishActive(true)
-        onLog?("Picture in Picture started")
-    }
-
-    func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-        publishActive(false)
-        onLog?("Picture in Picture stopped")
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        failedToStartPictureInPictureWithError error: Error
-    ) {
-        publishActive(false)
-        onLog?("Picture in Picture failed: \(error.localizedDescription)")
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
-    ) {
-        completionHandler(true)
-    }
-}
-
-extension NativeStreamPictureInPictureBridge: AVPictureInPictureSampleBufferPlaybackDelegate {
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        setPlaying playing: Bool
-    ) {
-        playbackPaused = false
-        pictureInPictureController.invalidatePlaybackState()
-    }
-
-    func pictureInPictureControllerTimeRangeForPlayback(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> CMTimeRange {
-        hasFrameForPlayback
-            ? CMTimeRange(start: .zero, duration: .positiveInfinity)
-            : .invalid
-    }
-
-    func pictureInPictureControllerIsPlaybackPaused(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> Bool {
-        playbackPaused
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        didTransitionToRenderSize newRenderSize: CMVideoDimensions
-    ) {
-        onLog?("Picture in Picture render size \(newRenderSize.width)x\(newRenderSize.height)")
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        skipByInterval skipInterval: CMTime,
-        completion completionHandler: @escaping () -> Void
-    ) {
-        completionHandler()
-    }
-
-    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> Bool {
-        false
-    }
-}
-
 private final class NativeStreamVideoSink: NSObject, RTCVideoRenderer {
     var onFrame: ((Int, CGSize, String) -> Void)?
-    var onPictureInPictureFrame: ((RTCVideoFrame) -> Void)?
 
     private weak var renderView: NativeStreamRenderView?
     private let lock = NSLock()
@@ -6889,9 +6606,6 @@ private final class NativeStreamVideoSink: NSObject, RTCVideoRenderer {
         lock.unlock()
 
         target?.renderFrame(frame)
-        if let frame {
-            onPictureInPictureFrame?(frame)
-        }
         if count <= 3 || count.isMultiple(of: 60) {
             let colorMode = (frame?.buffer as? RTCCVPixelBuffer).map { NativeStreamHDRTransfer.colorMode(in: $0.pixelBuffer) } ?? (frame == nil ? "--" : "8-bit SDR")
             onFrame?(count, size, colorMode)
@@ -6917,8 +6631,6 @@ private struct NativeStreamVideoView: UIViewRepresentable, Equatable {
 }
 
 private final class NativeStreamRenderView: UIView {
-    let pictureInPictureDisplayLayer = AVSampleBufferDisplayLayer()
-
     private let videoContainerView = UIView(frame: .zero)
     private let metalVideoView = RTCMTLVideoView(frame: .zero)
     private let rendererStateLock = NSLock()
@@ -6930,6 +6642,7 @@ private final class NativeStreamRenderView: UIView {
     private var streamSharpeningAmount = 0.25
     private var metal4Enabled = false
     private var upscalingEnabled = false
+    private var evenFramePacing = true
     private var streamFPS = 60
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
     var presentationRates: NativeStreamPresentationRates? {
@@ -6975,6 +6688,11 @@ private final class NativeStreamRenderView: UIView {
         filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4)
         updateRendererVisibility()
     }
+
+    func setEvenFramePacing(_ enabled: Bool) {
+        evenFramePacing = enabled
+        filteredMetalView?.evenFramePacing = enabled
+    }
     private var viewportTransformScale: CGFloat = 1
     private var viewportTransformOffset: CGSize = .zero
     private var filteredRendererCreationScheduled = false
@@ -6989,9 +6707,6 @@ private final class NativeStreamRenderView: UIView {
         backgroundColor = .black
         isOpaque = true
         clipsToBounds = true
-        pictureInPictureDisplayLayer.videoGravity = .resizeAspect
-        pictureInPictureDisplayLayer.backgroundColor = UIColor.black.cgColor
-        layer.addSublayer(pictureInPictureDisplayLayer)
         videoContainerView.backgroundColor = .black
         videoContainerView.isUserInteractionEnabled = false
         addSubview(videoContainerView)
@@ -7011,7 +6726,6 @@ private final class NativeStreamRenderView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        pictureInPictureDisplayLayer.frame = bounds
         videoContainerView.bounds = CGRect(origin: .zero, size: bounds.size)
         videoContainerView.center = CGPoint(x: bounds.midX, y: bounds.midY)
         metalVideoView.frame = videoContainerView.bounds
@@ -7126,6 +6840,7 @@ private final class NativeStreamRenderView: UIView {
         filtered.sharpeningAmount = streamSharpeningEnabled ? streamSharpeningAmount : 0
         filtered.setStreamFrameRate(streamFPS)
         filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled)
+        filtered.evenFramePacing = evenFramePacing
         filtered.isHidden = true
         videoContainerView.addSubview(filtered)
         rendererStateLock.lock()
@@ -7214,6 +6929,8 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
         let frame: Frame
         /// When the frame may be shown, on the `CACurrentMediaTime` clock. Zero means at once.
         var due: TimeInterval = 0
+        /// When the frame came out of the decoder, on the same clock.
+        var arrival: TimeInterval = 0
     }
 
     /// While frames are held back, the most already-due frames kept waiting: a longer backlog is
@@ -7241,10 +6958,10 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
 
     /// Whether the frame pushed out one that was still waiting to be shown.
     @discardableResult
-    func offer(_ frame: Frame, due: TimeInterval = 0) -> Bool {
+    func offer(_ frame: Frame, due: TimeInterval = 0, arrival: TimeInterval = 0) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        pending.append(Entry(frame: frame, due: due))
+        pending.append(Entry(frame: frame, due: due, arrival: arrival))
         guard pending.count > capacity else { return false }
         pending.removeFirst(pending.count - capacity)
         return true
@@ -7253,6 +6970,12 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
     var hasPending: Bool {
         lock.lock(); defer { lock.unlock() }
         return !pending.isEmpty
+    }
+
+    /// How many frames are waiting and when the oldest of them arrived.
+    var waiting: (count: Int, oldestArrival: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        return (pending.count, pending.first?.arrival ?? 0)
     }
 
     /// Whether the oldest waiting frame may be shown at `now`.
@@ -7301,12 +7024,16 @@ struct NativeStreamPlayoutSchedule {
     private var lastTimestamp: UInt32?
     /// How much later than the quickest frame of the window the last frame arrived.
     private(set) var lastLateness: TimeInterval = 0
+    /// How long after the frame before it the last frame was captured; zero for the first.
+    private(set) var lastCaptureGap: TimeInterval = 0
     /// Arrivals in the window whose capture-to-arrival time no later arrival has beaten, in order:
     /// the first is the window's shortest.
     private var transits: [(arrival: TimeInterval, transit: TimeInterval)] = []
 
     mutating func due(arrival: TimeInterval, timestamp: UInt32, delay: TimeInterval) -> TimeInterval {
-        if let lastTimestamp { mediaTicks += Int64(Int32(bitPattern: timestamp &- lastTimestamp)) }
+        let step = lastTimestamp.map { Int64(Int32(bitPattern: timestamp &- $0)) } ?? 0
+        mediaTicks += step
+        lastCaptureGap = Double(max(0, step)) / Self.clockRate
         lastTimestamp = timestamp
         let media = Double(mediaTicks) / Self.clockRate
         let transit = arrival - media
@@ -7316,6 +7043,58 @@ struct NativeStreamPlayoutSchedule {
         lastLateness = transit - transits[0].transit
         return media + transits[0].transit + delay
     }
+}
+
+/// Keeps frames a steady number of refreshes apart on a screen that refreshes faster than the
+/// stream.
+///
+/// Frames leave the decoder a few milliseconds early or late. Shown at the first refresh after
+/// they arrive, a frame that lands just before a refresh and the next that lands just after are
+/// three refreshes apart, and the one after that only one: on a 120 Hz screen a 60 fps stream
+/// then alternates 25 ms and 8 ms frames instead of holding each for 17 ms. So a frame that is
+/// ready a refresh early waits for its own refresh. A late frame is still shown at once, and
+/// every frame after it then waits the same way, which is what keeps the pace even.
+///
+/// The wait costs up to one refresh of delay while it lasts. It ends by itself: a frame that has
+/// already waited its share, or has another behind it, is shown without waiting, and when every
+/// frame has been early for `recoverAfter` the schedule moves one refresh earlier.
+struct NativeStreamFramePacer {
+    static let recoverAfter: TimeInterval = 3
+
+    private var lastShown: TimeInterval?
+    /// Frames in a row that had to wait, and whether the frame now waiting already has.
+    private var earlyRun = 0
+    private var waited = false
+
+    /// Whether the oldest waiting frame should be drawn for the refresh at `target`.
+    /// `waiting` is how many frames are ready and `age` how long the oldest has been; `refresh`
+    /// and `frame` are the screen's and the stream's intervals.
+    mutating func shouldShow(target: TimeInterval, refresh: TimeInterval, frame: TimeInterval,
+                             waiting: Int, age: TimeInterval) -> Bool {
+        guard refresh > 0, frame >= refresh * 1.5, let lastShown, target > lastShown,
+              target - lastShown < frame * 4 else { return true }
+        let early = lastShown + frame - target
+        // Within half a refresh of its turn, or past it.
+        guard early > refresh / 2 else { return true }
+        // A frame that queued behind another has waited already; holding it too would leave the
+        // picture a whole frame behind.
+        guard waiting < 2, age < frame - refresh else { return true }
+        if Double(earlyRun) * frame >= Self.recoverAfter, early <= refresh * 1.5 {
+            earlyRun = 0
+            return true
+        }
+        waited = true
+        return false
+    }
+
+    /// The frame was drawn for the refresh at `target`.
+    mutating func shown(target: TimeInterval) {
+        earlyRun = waited ? earlyRun + 1 : 0
+        waited = false
+        lastShown = target
+    }
+
+    mutating func reset() { self = NativeStreamFramePacer() }
 }
 
 /// Decides when to hold frames back to smooth over Wi-Fi pauses, and by how much.
@@ -7410,6 +7189,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             parts.append("MetalFX: " + (CACurrentMediaTime() < suspendUpscalingUntil
                 ? "Paused: processing error" : (metal4UpscalingStatus ?? spatialUpscaler.status)))
         }
+        parts.append(evenFramePacing ? "Pacing: even" : "Pacing: off")
         return parts.joined(separator: " · ")
     }
 
@@ -7442,6 +7222,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var longestLateness: TimeInterval = 0
     /// When the frame drawn now will reach the screen; frames due by then may be drawn.
     private var nextPresentationTime: CFTimeInterval = 0
+    private var refreshInterval: CFTimeInterval = 0
+    private var pacer = NativeStreamFramePacer()
+    /// Whether frames are kept a steady number of refreshes apart (see `NativeStreamFramePacer`).
+    var evenFramePacing = true {
+        didSet { if evenFramePacing != oldValue { pacer.reset() } }
+    }
 
     /// Frames that came out of the decoder late against the stream's pace, since the last call.
     func drainLateFrames() -> (count: Int, longestMs: Double) {
@@ -7559,8 +7345,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     private func displayTick(_ link: CADisplayLink) {
         let interval = link.targetTimestamp - link.timestamp
-        presentations.cadence.noteTick(time: CACurrentMediaTime(), interval: interval)
+        let now = CACurrentMediaTime()
+        presentations.cadence.noteTick(time: now, interval: interval, delay: now - link.timestamp)
         nextPresentationTime = link.targetTimestamp
+        refreshInterval = interval
         playoutLock.lock()
         let delay = playoutDelay
         playoutLock.unlock()
@@ -7583,8 +7371,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         let holding = playoutDelay > 0
         if playout.lastLateness >= nativeStreamLateFrameSeconds { lateFrames += 1 }
         longestLateness = max(longestLateness, playout.lastLateness)
+        let captureGap = playout.lastCaptureGap
         playoutLock.unlock()
-        arrivals.observe(time: now, replacedPending: frames.offer(frame, due: holding ? due : 0))
+        arrivals.noteSourceGap(seconds: captureGap)
+        arrivals.observe(time: now, replacedPending: frames.offer(frame, due: holding ? due : 0, arrival: now))
     }
 
     /// Frame gaps since the last call: out of the decoder, and onto the screen.
@@ -7597,6 +7387,20 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard !isHidden, window != nil else { return }
         let drawStarted = CACurrentMediaTime()
+        let target = nextPresentationTime
+        // Frames being held back for a Wi-Fi pause already carry the time they are due.
+        playoutLock.lock()
+        let pacing = evenFramePacing && playoutDelay <= 0
+        playoutLock.unlock()
+        if pacing {
+            let waiting = frames.waiting
+            if waiting.count > 0, !pacer.shouldShow(
+                target: target, refresh: refreshInterval, frame: 1 / Double(max(1, streamFPS)),
+                waiting: waiting.count, age: drawStarted - waiting.oldestArrival) {
+                presentations.cadence.notePaced()
+                return
+            }
+        }
         guard gpuAdmission.wait(timeout: .now()) == .success else {
             if frames.hasDue(at: nextPresentationTime) { presentations.cadence.noteHeldBack() }
             return
@@ -7605,6 +7409,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         defer {
             if submitted {
                 presentations.cadence.noteDraw(milliseconds: (CACurrentMediaTime() - drawStarted) * 1_000)
+                pacer.shown(target: target)
             } else {
                 gpuAdmission.signal()
             }
@@ -7619,7 +7424,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         }
         guard let pixelBuffer = frameBridge.pixelBuffer(for: entry.frame) else { return }
         configureColorOutput(for: pixelBuffer)
-        guard let drawable = view.currentDrawable,
+        let drawableAsked = CACurrentMediaTime()
+        let currentDrawable = view.currentDrawable
+        presentations.cadence.noteDrawableWait(milliseconds: (CACurrentMediaTime() - drawableAsked) * 1_000)
+        guard let drawable = currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
             return
         }
@@ -7647,8 +7455,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         func presentMetal4(_ frame: NativeStreamMetal4Presentation.Frame) {
             let admission = gpuAdmission
             metal4Presentation.present(frame, drawable: drawable, presented: { time in
-                presentationTracker.recordPresentation(at: time)
+                presentationTracker.recordPresentation(at: time, target: target)
             }, completion: { [weak self] error in
+                presentationTracker.cadence.noteGPU(milliseconds: (CACurrentMediaTime() - drawStarted) * 1_000)
                 admission.signal()
                 mailbox.complete()
                 if let error {
@@ -7806,12 +7615,13 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         // Presentation callbacks are available on the physical device, not CoreSimulator.
         drawable.addPresentedHandler { drawable in
             guard drawable.presentedTime > 0 else { return }
-            presentationTracker.recordPresentation(at:drawable.presentedTime)
+            presentationTracker.recordPresentation(at: drawable.presentedTime, target: target)
         }
         #endif
         let admission = gpuAdmission
         let checkEffectsFailure = upscalingEnabled
         commandBuffer.addCompletedHandler { [weak self, pixelBuffer] command in
+            presentationTracker.cadence.noteGPU(milliseconds: (CACurrentMediaTime() - drawStarted) * 1_000)
             admission.signal()
             // Keep the pooled IOSurface alive until the GPU has finished reading it.
             _ = pixelBuffer
@@ -7898,6 +7708,11 @@ struct NativeStreamTouchControlsLayer: View {
                     .padding(.horizontal, max(12, proxy.safeAreaInsets.leading + 12))
                     .padding(.bottom, max(10, proxy.safeAreaInsets.bottom + 8))
                     .transition(.opacity)
+                }
+
+                if !coordinator.steamControllerMenus.isEmpty || coordinator.steamControllerActionSet != nil {
+                    SteamControllerMenuOverlay(menus: coordinator.steamControllerMenus,
+                                               actionSet: coordinator.steamControllerActionSet)
                 }
 
                 if coordinator.shouldShowTouchControlsVisibilityButton {

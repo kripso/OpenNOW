@@ -73,7 +73,7 @@ private enum SettingsCategory: String, CaseIterable, Hashable, Identifiable {
         case .stream:
             return ["stream", "preset", "recommended", "resolution", "aspect ratio", "fps", "frame rate", "bitrate", "data", "codec", "color", "hdr", "sharpening", "sharpness", "region", "server", "session proxy", "proxy", "native decoder", "hud", "gpu", "performance overlay", "metal", "metalfx", "upscaling", "stretch"]
         case .input:
-            return ["input", "mouse", "sensitivity", "acceleration", "scroll", "pointer", "keyboard", "layout", "language", "clipboard", "paste", "touch", "native touch", "joystick", "stick", "dead zone", "aim", "controller", "rumble", "haptics", "tutorial", "guide", "replay"]
+            return ["input", "mouse", "sensitivity", "acceleration", "scroll", "pointer", "keyboard", "layout", "language", "clipboard", "paste", "touch", "native touch", "joystick", "stick", "dead zone", "aim", "controller", "rumble", "haptics", "steam", "trackpad", "gyro", "back buttons", "tutorial", "guide", "replay"]
         case .interface:
             return ["interface", "ui", "accent", "color", "theme", "expressive", "outline", "cards", "titles", "favorites", "favourites", "store labels", "card size", "launch page", "stats", "hud", "metrics", "position", "afk", "idle", "keep awake", "server selector", "queue", "live activities", "sound", "chime", "ready", "catalog", "wallpaper", "console", "home", "background", "photo", "session report", "counter"]
         case .advanced:
@@ -1100,6 +1100,10 @@ struct SettingsView: View {
             Text("Opt in to Metal 4 on supported devices running iOS 26 or later. Off uses compatible Metal rendering; HDR and MetalFX remain available.")
                 .font(.footnote).foregroundStyle(.secondary)
 
+            Toggle("Even Frame Pacing", isOn: $store.settings.evenFramePacing)
+            Text("On a 120 Hz screen, holds each frame of a slower stream for the same time, which can add up to one screen refresh of delay. Off shows every frame as soon as it arrives.")
+                .font(.footnote).foregroundStyle(.secondary)
+
             Toggle("MetalFX Upscaling", isOn: $store.settings.metalFXUpscalingEnabled)
             if store.settings.metalFXUpscalingEnabled {
                 Picker("MetalFX Quality", selection: metalFXQualityBinding) {
@@ -1470,6 +1474,11 @@ struct SettingsView: View {
                     NativeStreamControllerShortcutsView(settings: $store.settings)
                 } label: {
                     Label("Controller Shortcuts", systemImage: "gamecontroller")
+                }
+                NavigationLink {
+                    SteamControllerSettingsView(settings: $store.settings)
+                } label: {
+                    Label("Steam Controller", systemImage: "dot.radiowaves.left.and.right")
                 }
             } header: {
                 Text("Game Input")

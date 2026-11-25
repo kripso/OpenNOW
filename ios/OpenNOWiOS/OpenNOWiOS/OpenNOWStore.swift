@@ -1064,6 +1064,9 @@ struct AppSettings: Codable, Equatable {
     var sessionProxyUrl: String = ""
     var enableL4S: Bool
     var metal4Enabled: Bool = false
+    /// Keeps stream frames a steady number of screen refreshes apart on a screen faster than the
+    /// stream, at the cost of up to one refresh of delay (see `NativeStreamFramePacer`).
+    var evenFramePacing: Bool = true
     var metalFXUpscalingEnabled: Bool = false
     var metalFXQualityPreset: MetalFXQualityPreset = .manual
     var streamSharpeningEnabled: Bool = false
@@ -1141,6 +1144,19 @@ struct AppSettings: Codable, Equatable {
     var microphoneMode: MicrophoneMode = .disabled
     var mouseScrollSensitivity: Int = 30
     var controllerMouseEmulation: Bool = false
+    /// Reads a Steam Controller over its own Bluetooth service, which is the only way to reach
+    /// its trackpads, grip buttons and gyro. Off by default so nobody is asked for Bluetooth
+    /// access they do not need.
+    var steamControllerEnabled: Bool = false
+    var steamControllerLayout = SteamControllerLayout()
+    /// The imported layout in use; empty means the layout made in OpenNOW.
+    var steamControllerActiveLayout: String = ""
+    /// Layout choices that apply to one game only, by `SteamLayoutLibrary.gameKey`.
+    var steamControllerGameLayouts: [String: String] = [:]
+    var steamControllerTuning = SteamControllerTuning()
+    /// Counts re-bindings of imported layouts, whose contents live outside these settings, so a
+    /// running stream notices them.
+    var steamControllerLayoutRevision: Int = 0
     var clipboardPasteEnabled: Bool = true
     var touch: TouchSettings = .default
 
@@ -1181,6 +1197,7 @@ struct AppSettings: Codable, Equatable {
         case sessionProxyUrl
         case enableL4S
         case metal4Enabled
+        case evenFramePacing
         case metalFXUpscalingEnabled
         case metalFXQualityPreset
         case streamSharpeningEnabled
@@ -1233,6 +1250,12 @@ struct AppSettings: Codable, Equatable {
         case microphoneMode
         case mouseScrollSensitivity
         case controllerMouseEmulation
+        case steamControllerEnabled
+        case steamControllerLayout
+        case steamControllerActiveLayout
+        case steamControllerGameLayouts
+        case steamControllerTuning
+        case steamControllerLayoutRevision
         case clipboardPasteEnabled
         case touch
         case controllerUISounds
@@ -1307,6 +1330,7 @@ struct AppSettings: Codable, Equatable {
         sessionProxyUrl = try container.decodeIfPresent(String.self, forKey: .sessionProxyUrl) ?? ""
         enableL4S = try container.decodeIfPresent(Bool.self, forKey: .enableL4S) ?? false
         metal4Enabled = try container.decodeIfPresent(Bool.self, forKey: .metal4Enabled) ?? false
+        evenFramePacing = try container.decodeIfPresent(Bool.self, forKey: .evenFramePacing) ?? true
         metalFXUpscalingEnabled = try container.decodeIfPresent(Bool.self, forKey: .metalFXUpscalingEnabled) ?? false
         metalFXQualityPreset = try container.decodeIfPresent(MetalFXQualityPreset.self, forKey: .metalFXQualityPreset) ?? .manual
         streamSharpeningEnabled = try container.decodeIfPresent(Bool.self, forKey: .streamSharpeningEnabled) ?? false
@@ -1366,6 +1390,12 @@ struct AppSettings: Codable, Equatable {
             ?? (keepMicEnabled ? .voiceActivity : .disabled)
         mouseScrollSensitivity = try container.decodeIfPresent(Int.self, forKey: .mouseScrollSensitivity) ?? 30
         controllerMouseEmulation = try container.decodeIfPresent(Bool.self, forKey: .controllerMouseEmulation) ?? false
+        steamControllerEnabled = try container.decodeIfPresent(Bool.self, forKey: .steamControllerEnabled) ?? false
+        steamControllerLayout = try container.decodeIfPresent(SteamControllerLayout.self, forKey: .steamControllerLayout) ?? .init()
+        steamControllerActiveLayout = try container.decodeIfPresent(String.self, forKey: .steamControllerActiveLayout) ?? ""
+        steamControllerGameLayouts = try container.decodeIfPresent([String: String].self, forKey: .steamControllerGameLayouts) ?? [:]
+        steamControllerTuning = try container.decodeIfPresent(SteamControllerTuning.self, forKey: .steamControllerTuning) ?? .init()
+        steamControllerLayoutRevision = try container.decodeIfPresent(Int.self, forKey: .steamControllerLayoutRevision) ?? 0
         clipboardPasteEnabled = try container.decodeIfPresent(Bool.self, forKey: .clipboardPasteEnabled) ?? true
         if let storedTouch = try container.decodeIfPresent(TouchSettings.self, forKey: .touch) {
             touch = storedTouch
@@ -1966,6 +1996,11 @@ enum StreamSettingsResolver {
         .init(value: "1024x768", aspectRatio: "4:3", tier: "768", requiredPlan: .free),
         .init(value: "1112x834", aspectRatio: "4:3", tier: "834", requiredPlan: .free),
         .init(value: "1600x1200", aspectRatio: "4:3", tier: "1080", requiredPlan: .free),
+        // 4:3 had nothing above 1200 lines, so an iPad's own shape could not get a 1440-class or
+        // 4K-class picture. Fewer pixels than 2560x1440 and 3840x2160 respectively.
+        .init(value: "1920x1440", aspectRatio: "4:3", tier: "1440", requiredPlan: .priority),
+        .init(value: "2048x1536", aspectRatio: "4:3", tier: "1440", requiredPlan: .priority),
+        .init(value: "2880x2160", aspectRatio: "4:3", tier: "2160", requiredPlan: .ultimate),
         .init(value: "1280x1024", aspectRatio: "5:4", tier: "1050", requiredPlan: .free),
         .init(value: "1600x720", aspectRatio: "20:9", tier: "720", requiredPlan: .free),
         .init(value: "1680x720", aspectRatio: "21:9", tier: "720", requiredPlan: .free),
@@ -2479,8 +2514,8 @@ enum StreamSettingsResolver {
         "900": ["16:9": "1600x900", "16:10": "1440x900"],
         "1050": ["16:10": "1680x1050", "5:4": "1280x1024"],
         "1080": ["16:9": "1920x1080", "16:10": "1920x1200", "4:3": "1600x1200", "20:9": "2400x1080", "21:9": "2560x1080", "32:9": "3840x1080"],
-        "1440": ["16:9": "2560x1440", "16:10": "2560x1600", "20:9": "3200x1440", "21:9": "3440x1440", "24:10": "3840x1600", "32:9": "5120x1440"],
-        "2160": ["16:9": "3840x2160", "16:10": "3456x2160", "20:9": "4800x2160", "21:9": "5120x2160"],
+        "1440": ["16:9": "2560x1440", "16:10": "2560x1600", "4:3": "2048x1536", "20:9": "3200x1440", "21:9": "3440x1440", "24:10": "3840x1600", "32:9": "5120x1440"],
+        "2160": ["16:9": "3840x2160", "16:10": "3456x2160", "4:3": "2880x2160", "20:9": "4800x2160", "21:9": "5120x2160"],
         "2880": ["16:9": "5120x2880"]
     ]
 }
@@ -4821,12 +4856,16 @@ private actor GFNAPIClient {
         vpcId: String,
         settings: AppSettings,
         deviceId: String,
-        touchProvisionedOverride: Bool? = nil
+        touchProvisionedOverride: Bool? = nil,
+        membershipTier: String? = nil
     ) async throws -> ActiveSession {
         let token = session.tokens.idToken ?? session.tokens.accessToken
         let clientId = UUID().uuidString
         let claimDeviceId = deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? UUID().uuidString : deviceId
-        let streamProfile = StreamSettingsResolver.profile(for: settings, membershipTier: session.user.membershipTier)
+        // The caller passes the subscription's tier. The auth session's own tier can be stale or
+        // "FREE" after a token refresh, which capped every reopen at 60 FPS on an Ultimate plan.
+        let streamProfile = StreamSettingsResolver.profile(
+            for: settings, membershipTier: membershipTier ?? session.user.membershipTier)
         // Claiming repeats the session request body. During recovery, retain the input device
         // profile chosen when this allocation was created instead of letting a transient hot-plug
         // silently change a touch session into a controller session (or vice versa).
@@ -7786,7 +7825,8 @@ final class OpenNOWStore: ObservableObject {
                     streamingBaseUrl: baseUrl,
                     vpcId: cachedVpcId,
                     settings: launchSettings,
-                    deviceId: deviceId
+                    deviceId: deviceId,
+                    membershipTier: subscription?.membershipTier ?? refreshed.user.membershipTier
                 )
             } else if let launchingCandidate {
                 let pending = ActiveSession(
@@ -8306,7 +8346,8 @@ final class OpenNOWStore: ObservableObject {
                 streamingBaseUrl: refreshed.provider.streamingServiceUrl,
                 vpcId: cachedVpcId,
                 settings: streamSettings,
-                deviceId: persistentDeviceId()
+                deviceId: persistentDeviceId(),
+                membershipTier: subscription?.membershipTier ?? refreshed.user.membershipTier
             )
             try Task.checkCancellation()
             guard generation == authGeneration, operation == sessionOperationGeneration else { return }
@@ -8858,6 +8899,15 @@ final class OpenNOWStore: ObservableObject {
     /// object would let a stale snapshot — the streamer holds one from when the session started —
     /// silently revert anything changed in Settings while the game was running.
     private var streamQualityRollback: (maxBitrateMbps: Int, preferredCodec: String)?
+    /// A resolution and frame rate picked in the stream panel, asked for on the next reopen of
+    /// that session only. Saved Settings are left alone: this is an experiment, not a new default.
+    /// Later reopens follow whatever GeForce NOW then has on record for the session.
+    private var reopenVideoRequest: (sessionId: String, resolution: String, fps: Int)?
+
+    func requestVideoOnNextReopen(resolution: String, fps: Int) {
+        guard let sessionId = activeSession?.id else { return }
+        reopenVideoRequest = (sessionId, resolution, fps)
+    }
 
     func applyStreamerSettings(_ updated: AppSettings) {
         var next = settings
@@ -8865,11 +8915,18 @@ final class OpenNOWStore: ObservableObject {
         next.controllerRumbleStrength = updated.controllerRumbleStrength
         next.controllerShortcuts = updated.controllerShortcuts
         next.metal4Enabled = updated.metal4Enabled
+        next.evenFramePacing = updated.evenFramePacing
         next.metalFXUpscalingEnabled = updated.metalFXUpscalingEnabled
         next.touch = updated.touch
         next.mouseSensitivity = updated.mouseSensitivity
         next.mouseScrollSensitivity = updated.mouseScrollSensitivity
         next.controllerMouseEmulation = updated.controllerMouseEmulation
+        next.steamControllerEnabled = updated.steamControllerEnabled
+        next.steamControllerLayout = updated.steamControllerLayout
+        next.steamControllerActiveLayout = updated.steamControllerActiveLayout
+        next.steamControllerGameLayouts = updated.steamControllerGameLayouts
+        next.steamControllerTuning = updated.steamControllerTuning
+        next.steamControllerLayoutRevision = updated.steamControllerLayoutRevision
         next.streamKeyboardClearConfirmationDisabled = updated.streamKeyboardClearConfirmationDisabled
         next.mouseAcceleration = updated.mouseAcceleration
         next.showAntiAfkIndicator = updated.showAntiAfkIndicator
@@ -9973,9 +10030,23 @@ final class OpenNOWStore: ObservableObject {
                 colorQuality: polled.negotiatedStreamProfile?.colorQuality,
                 hdrEnabled: polled.finalizedStreamingFeatures?.trueHdr
             )
-            let streamSettings = streamSettingsByAdoptingRemoteProfile(
+            var streamSettings = streamSettingsByAdoptingRemoteProfile(
                 candidate, base: requestedStreamSettings, session: refreshed
             )
+            // Experimental: a size or frame rate picked in the stream panel replaces the one the
+            // session was allocated with, to see whether GeForce NOW honours it on a resume.
+            let videoRequest = reopenVideoRequest.flatMap { $0.sessionId == session.id ? $0 : nil }
+            if videoRequest != nil { reopenVideoRequest = nil }
+            if let videoRequest {
+                streamSettings.preferredResolution = videoRequest.resolution
+                if let known = StreamSettingsResolver.resolutionChoices.first(where: { $0.value == videoRequest.resolution }) {
+                    streamSettings.preferredAspectRatio = known.aspectRatio
+                }
+                streamSettings.preferredFPS = videoRequest.fps
+                streamSettings.streamPreset = .custom
+            }
+            let claimTier = subscription?.membershipTier ?? refreshed.user.membershipTier
+            let requestedProfile = StreamSettingsResolver.profile(for: streamSettings, membershipTier: claimTier)
             let claimed = try await api.claimSession(
                 session: refreshed,
                 candidate: candidate,
@@ -9984,10 +10055,19 @@ final class OpenNOWStore: ObservableObject {
                 vpcId: session.zone,
                 settings: streamSettings,
                 deviceId: persistentDeviceId(),
-                touchProvisionedOverride: session.touchProvisioned
+                touchProvisionedOverride: session.touchProvisioned,
+                membershipTier: claimTier
             )
             try Task.checkCancellation()
             guard generation == authGeneration, operation == sessionOperationGeneration else { return }
+            let server = claimed.negotiatedStreamProfile
+            logger.notice(
+                "Reopen claimed requested=\(requestedProfile.resolutionString, privacy: .public)@\(requestedProfile.fps) changeRequested=\(videoRequest != nil) serverRecord=\(server?.resolution ?? "unknown", privacy: .public)@\(server?.fps ?? 0) polled=\(candidate.resolution ?? "unknown", privacy: .public)@\(candidate.fps ?? 0) tier=\(claimTier, privacy: .public)"
+            )
+            sessionReportAccumulator?.recordReopen(
+                changeRequested: videoRequest != nil, requested: requestedProfile,
+                serverRecordResolution: server?.resolution, serverRecordFps: server?.fps
+            )
             activeSession = claimed
             activeStreamSettings = streamSettings
             sessionAvailability = .available

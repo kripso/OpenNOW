@@ -17,6 +17,20 @@
 		BB0000000000000000000081 /* NativeStreamMetal4Presentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000091; };
 		EF1590000000000000000001 /* NativeStreamControllerHUD.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1590000000000000000011; };
 		EF1580000000000000000001 /* NativeStreamGameSirRumbler.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1580000000000000000011; };
+		EF1610000000000000000001 /* SteamControllerProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1610000000000000000011; };
+		EF16D0000000000000000001 /* SteamLayoutSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF16D0000000000000000011; };
+		EF16E0000000000000000001 /* SteamLayoutSearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF16E0000000000000000011; };
+		EF16C0000000000000000001 /* SteamLayoutDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF16C0000000000000000011; };
+		EF1670000000000000000001 /* SteamInputConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1670000000000000000011; };
+		EF1680000000000000000001 /* SteamInputEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1680000000000000000011; };
+		EF1690000000000000000001 /* SteamLayoutLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1690000000000000000011; };
+		EF16A0000000000000000001 /* SteamControllerMenuOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF16A0000000000000000011; };
+		EF1620000000000000000001 /* SteamControllerLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1620000000000000000011; };
+		EF1630000000000000000001 /* SteamControllerLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1630000000000000000011; };
+		EF1640000000000000000001 /* SteamControllerInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1640000000000000000011; };
+		EF1650000000000000000001 /* SteamControllerSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1650000000000000000011; };
+		EF1660000000000000000001 /* SteamControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1660000000000000000011; };
+		EF16B0000000000000000001 /* SteamInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF16B0000000000000000011; };
 		BB0000000000000000000061 /* NativeStreamMetal4Effects.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000071; };
 		BB0000000000000000000041 /* NativeStreamVideoEffects.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000051; };
 		BB0000000000000000000021 /* NativeStreamHDRMetal.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000031 /* NativeStreamHDRMetal.swift */; };
@@ -68,7 +82,6 @@
 		76C1D191CF4AA16F8556D648 /* NVST/BifrostFree/NvstFrameReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8090D16085E58499D3433A43 /* NVST/BifrostFree/NvstFrameReassembler.swift */; };
 		7AB171DB543E1642BCFF05B8 /* NVST/Rtsp/NvstRtspNegotiator.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF9C03956DA77543DE6BA71F /* NVST/Rtsp/NvstRtspNegotiator.swift */; };
 		8502B4279F48533B8965CFB0 /* NVST/Native/NvstDataChannel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 860CEB055C0123B5EE6F4561 /* NVST/Native/NvstDataChannel.swift */; };
-		861B9542E73D0DA498B9AD7E /* NativeStreamPiP.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFB07FF7772F95D7EC52A5D /* NativeStreamPiP.swift */; };
 		87837026AB2C3C8651C899B6 /* NVST/Handoff/NVSTVideoHandoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7608039FC35D8B039F1AE55 /* NVST/Handoff/NVSTVideoHandoff.swift */; };
 		88897007045D0B1A1E0C8DE7 /* NVST/Rtsp/NvstRtspEndpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF602EA1198F77A11775DDDC /* NVST/Rtsp/NvstRtspEndpoints.swift */; };
 		8AF1A15F926FA68CC59D2B4F /* NVST/Native/NvstDtlsHandshake.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18323691636658865C919C22 /* NVST/Native/NvstDtlsHandshake.swift */; };
@@ -220,6 +233,20 @@
 		BB0000000000000000000091 /* NativeStreamMetal4Presentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamMetal4Presentation.swift; sourceTree = "<group>"; };
 		EF1590000000000000000011 /* NativeStreamControllerHUD.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamControllerHUD.swift; sourceTree = "<group>"; };
 		EF1580000000000000000011 /* NativeStreamGameSirRumbler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamGameSirRumbler.swift; sourceTree = "<group>"; };
+		EF1610000000000000000011 /* SteamControllerProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamControllerProtocol.swift; sourceTree = "<group>"; };
+		EF16D0000000000000000011 /* SteamLayoutSearch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamLayoutSearch.swift; sourceTree = "<group>"; };
+		EF16E0000000000000000011 /* SteamLayoutSearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamLayoutSearchView.swift; sourceTree = "<group>"; };
+		EF16C0000000000000000011 /* SteamLayoutDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamLayoutDetailView.swift; sourceTree = "<group>"; };
+		EF1670000000000000000011 /* SteamInputConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamInputConfig.swift; sourceTree = "<group>"; };
+		EF1680000000000000000011 /* SteamInputEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamInputEngine.swift; sourceTree = "<group>"; };
+		EF1690000000000000000011 /* SteamLayoutLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamLayoutLibrary.swift; sourceTree = "<group>"; };
+		EF16A0000000000000000011 /* SteamControllerMenuOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamControllerMenuOverlay.swift; sourceTree = "<group>"; };
+		EF1620000000000000000011 /* SteamControllerLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamControllerLayout.swift; sourceTree = "<group>"; };
+		EF1630000000000000000011 /* SteamControllerLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamControllerLink.swift; sourceTree = "<group>"; };
+		EF1640000000000000000011 /* SteamControllerInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamControllerInput.swift; sourceTree = "<group>"; };
+		EF1650000000000000000011 /* SteamControllerSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamControllerSettingsView.swift; sourceTree = "<group>"; };
+		EF1660000000000000000011 /* SteamControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamControllerTests.swift; sourceTree = "<group>"; };
+		EF16B0000000000000000011 /* SteamInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamInputTests.swift; sourceTree = "<group>"; };
 		BB0000000000000000000071 /* NativeStreamMetal4Effects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamMetal4Effects.swift; sourceTree = "<group>"; };
 		BB0000000000000000000051 /* NativeStreamVideoEffects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamVideoEffects.swift; sourceTree = "<group>"; };
 		BB0000000000000000000031 /* NativeStreamHDRMetal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamHDRMetal.swift; sourceTree = "<group>"; };
@@ -326,7 +353,6 @@
 		C10B5618FA829A28A31EAA7E /* NVST/BifrostFree/NvstByteCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NVST/BifrostFree/NvstByteCodec.swift; sourceTree = "<group>"; };
 		C5A01981C89B6C2CDE9229B6 /* NVST/Rtsp/NvstRtspWireFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NVST/Rtsp/NvstRtspWireFormat.swift; sourceTree = "<group>"; };
 		C5AED86C88ABC9CF127D2EC2 /* NativeStreamPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamPresentation.swift; sourceTree = "<group>"; };
-		CAFB07FF7772F95D7EC52A5D /* NativeStreamPiP.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamPiP.swift; sourceTree = "<group>"; };
 		CC0000000000000000000011 /* QueueActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueueActivityAttributes.swift; sourceTree = "<group>"; };
 		CC0000000000000000000012 /* QueueLiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueueLiveActivityManager.swift; sourceTree = "<group>"; };
 		CC0000000000000000000013 /* OpenNOWWidgetBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenNOWWidgetBundle.swift; sourceTree = "<group>"; };
@@ -413,7 +439,6 @@
 		0A1B2C3D4E5F6A7B8C9D4002 /* OpenNOWiOS */ = {
 			isa = PBXGroup;
 			children = (
-				CAFB07FF7772F95D7EC52A5D /* NativeStreamPiP.swift */,
 				C5AED86C88ABC9CF127D2EC2 /* NativeStreamPresentation.swift */,
 				D7EAAADE36D7168904D2F92F /* NVST/Licenses */,
 				B077A38C81C6BC6E59A0A997 /* NativeStreamNVSTConfiguration.swift */,
@@ -525,6 +550,18 @@
 				BB000000000000000000001D /* NativeStreamInput.swift */,
 				EF1590000000000000000011 /* NativeStreamControllerHUD.swift */,
 				EF1580000000000000000011 /* NativeStreamGameSirRumbler.swift */,
+				EF1610000000000000000011 /* SteamControllerProtocol.swift */,
+				EF16D0000000000000000011 /* SteamLayoutSearch.swift */,
+				EF16E0000000000000000011 /* SteamLayoutSearchView.swift */,
+				EF16C0000000000000000011 /* SteamLayoutDetailView.swift */,
+				EF1670000000000000000011 /* SteamInputConfig.swift */,
+				EF1680000000000000000011 /* SteamInputEngine.swift */,
+				EF1690000000000000000011 /* SteamLayoutLibrary.swift */,
+				EF16A0000000000000000011 /* SteamControllerMenuOverlay.swift */,
+				EF1620000000000000000011 /* SteamControllerLayout.swift */,
+				EF1630000000000000000011 /* SteamControllerLink.swift */,
+				EF1640000000000000000011 /* SteamControllerInput.swift */,
+				EF1650000000000000000011 /* SteamControllerSettingsView.swift */,
 				BB000000000000000000001E /* NativeStreamCodec.swift */,
 				BB0000000000000000000030 /* NativeStreamAV1.swift */,
 				BB0000000000000000000051 /* NativeStreamVideoEffects.swift */,
@@ -596,6 +633,8 @@
 				569C0ADC474B85350859646A /* NVST/NvstDtlsHandshakeTests.swift */,
 				F10000000000000000000011 /* OpenNOWiOSParityTests.swift */,
 				A184D2000000000000000002 /* SessionLifecycleTests.swift */,
+				EF1660000000000000000011 /* SteamControllerTests.swift */,
+				EF16B0000000000000000011 /* SteamInputTests.swift */,
 			);
 			path = OpenNOWiOSTests;
 			sourceTree = "<group>";
@@ -733,7 +772,6 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				861B9542E73D0DA498B9AD7E /* NativeStreamPiP.swift in Sources */,
 				E162081677B89815538C5BE6 /* NativeStreamPresentation.swift in Sources */,
 				39C10CC1F62415F05F8FE3BC /* NativeStreamNVSTConfiguration.swift in Sources */,
 				04937EADD6D6B625A79E37F9 /* NVST/BifrostFree/GeronimoInputProtocol.swift in Sources */,
@@ -844,6 +882,18 @@
 				BB000000000000000000000D /* NativeStreamInput.swift in Sources */,
 				EF1590000000000000000001 /* NativeStreamControllerHUD.swift in Sources */,
 				EF1580000000000000000001 /* NativeStreamGameSirRumbler.swift in Sources */,
+				EF1610000000000000000001 /* SteamControllerProtocol.swift in Sources */,
+				EF16D0000000000000000001 /* SteamLayoutSearch.swift in Sources */,
+				EF16E0000000000000000001 /* SteamLayoutSearchView.swift in Sources */,
+				EF16C0000000000000000001 /* SteamLayoutDetailView.swift in Sources */,
+				EF1670000000000000000001 /* SteamInputConfig.swift in Sources */,
+				EF1680000000000000000001 /* SteamInputEngine.swift in Sources */,
+				EF1690000000000000000001 /* SteamLayoutLibrary.swift in Sources */,
+				EF16A0000000000000000001 /* SteamControllerMenuOverlay.swift in Sources */,
+				EF1620000000000000000001 /* SteamControllerLayout.swift in Sources */,
+				EF1630000000000000000001 /* SteamControllerLink.swift in Sources */,
+				EF1640000000000000000001 /* SteamControllerInput.swift in Sources */,
+				EF1650000000000000000001 /* SteamControllerSettingsView.swift in Sources */,
 				BB000000000000000000000E /* NativeStreamCodec.swift in Sources */,
 				BB0000000000000000000020 /* NativeStreamAV1.swift in Sources */,
 				BB0000000000000000000041 /* NativeStreamVideoEffects.swift in Sources */,
@@ -890,6 +940,8 @@
 				22D0B32C8458038A33A4ACE0 /* NVST/SrtpCryptographyTests.swift in Sources */,
 				F10000000000000000000001 /* OpenNOWiOSParityTests.swift in Sources */,
 				A184D2000000000000000001 /* SessionLifecycleTests.swift in Sources */,
+				EF1660000000000000000001 /* SteamControllerTests.swift in Sources */,
+				EF16B0000000000000000001 /* SteamInputTests.swift in Sources */,
 				CC0000000000000000000008 /* QueueLiveActivityWidget.swift in Tests */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

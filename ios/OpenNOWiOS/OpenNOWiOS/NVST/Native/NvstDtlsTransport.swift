@@ -119,6 +119,11 @@ public final class NvstDtlsTransport: @unchecked Sendable {
             Darwin.close(descriptor)
             throw TransportError.peerUnresolvable(peerAddress)
         }
+        // This socket sends the player's input, the control commands and the microphone. Marked
+        // as interactive, like the video socket, they go out ahead of ordinary data on Wi-Fi
+        // instead of waiting behind it.
+        var serviceType = NET_SERVICE_TYPE_VI
+        setsockopt(descriptor, SOL_SOCKET, SO_NET_SERVICE_TYPE, &serviceType, socklen_t(MemoryLayout<Int32>.size))
         self.handshake = handshake
         self.descriptor = descriptor
         self.peer = address

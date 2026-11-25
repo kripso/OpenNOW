@@ -46,6 +46,8 @@
 	<string>$(OPENNOW_REPORTS_REPOSITORY)</string>
 	<key>OpenNOWReportsToken</key>
 	<string>$(OPENNOW_REPORTS_TOKEN)</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>OpenNOW uses Bluetooth only when you turn on Steam Controller support, to read the controller's trackpads, back buttons and gyro.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>OpenNOW uses the camera only when you choose to provide camera input in a compatible streamed game.</string>
 	<key>NSMicrophoneUsageDescription</key>
