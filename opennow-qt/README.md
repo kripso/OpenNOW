@@ -754,6 +754,41 @@ Run `ctest --test-dir build/opennow-qt -R '^opennow-controllertuning-tests$'`
 for virtual-device dead-zone endpoints, independent live settings, motor routing,
 intensity scaling, effect refresh/expiry, and ownership cleanup.
 
+The in-stream **Controllers** page also customises what a pad's extra controls do, per
+pad and saved with its profile. Back paddles, an extra button and trackpad clicks can
+each send a gamepad button or trigger, a mouse button, or a key. Gyro can move the mouse
+or the right stick, always or only while a chosen control is held, and each trackpad can
+act as the mouse or a stick. The page only offers what SDL reports for the pad; on the
+Steam Controller the rows are named R4, L4, R5, L5, the trackpads and the grip sensors.
+Everything is translated locally into the gamepad, mouse and key input the session
+already accepts, and is released whenever input moves to the shell. PlayStation
+touchpads are not offered because they reach the game as the real device.
+Gyro and trackpad mouse movement is sent as relative motion, so it suits games that
+capture the mouse; validate it with a real pad and game, including menus with a visible
+cursor. Run `ctest --test-dir build/opennow-qt -R '^opennow-controllermapping-tests$'`
+for bindings, release on ownership changes, gyro activation and trackpad output on a
+virtual device.
+
+A pad can instead run a layout made for Steam Input. **Settings → Controls → Steam
+layouts** imports one from a share link (`steam://controllerconfig/<app>/<id>`), a
+Workshop link or ID, fetched through Steam's public file-details service without an
+account or key, or from a layout file. The Controllers page then offers **Layout** for
+each pad except PlayStation pads, which reach the game as the real device. While a
+layout is chosen it decides everything the pad sends, and the bindings made in OpenNOW
+are kept but not used. Layouts run as published: action sets, layers, mode shifts, long,
+double, start and release presses, toggles and turbo, gamepad, key, mouse and wheel
+bindings, gyro with its enable buttons, flick stick, mouse regions, two-way scrolling,
+and radial and touch menus, which are drawn over the stream. Steam names every pad's
+controls after the Steam Controller's, so SDL's buttons, paddles, touchpads and gyro
+stand in for them on any pad. A control bound to a game's native Steam Input action is
+sent as the gamepad control of the same name; what else has no meaning outside Steam is
+listed after import. The engine is the one the iOS client uses, ported with its tests:
+`^opennow-steaminput-tests$` covers the file format and the engine, and
+`^opennow-controllermapping-tests$` a pad driven by an imported layout. Searching
+Steam for layouts, re-binding single controls of an imported layout and the calibration
+sliders exist only in the iOS client so far, and none of this has been run with a
+physical controller.
+
 The desktop controller rows and source picker use SDL's reported device name and
 [`SDL_GetRealGamepadType`](https://wiki.libsdl.org/SDL3/SDL_GetRealGamepadType)
 for PlayStation (PS3/PS4/PS5) and Xbox (360/One-family) logos. Unknown devices keep

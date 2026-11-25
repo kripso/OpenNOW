@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 import OpenNOW
 
 DesktopSettingsPanel {
@@ -96,7 +97,76 @@ DesktopSettingsPanel {
             onCommitted: value => controlsRoot.settingsScreen.setSetting("controllerVibrationIntensity", value)
         }
     }
-    DesktopSettingsRow { width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Gyroscope"); description: qsTr("Motion aiming on supported pads"); showDivider: false
+    DesktopSettingsRow { width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Gyroscope"); description: qsTr("Motion aiming on supported pads")
         DesktopSettingsToggle { checked: controlsRoot.settingsScreen.boolSetting("enableGyroscopeControls",false); onValueChangedByUser: value => controlsRoot.settingsScreen.setSetting("enableGyroscopeControls",value) }
+    }
+    FileDialog {
+        id: layoutFileDialog
+        title: qsTr("Choose a Steam Input layout file")
+        fileMode: FileDialog.OpenFile
+        onAccepted: SteamLayouts.importFile(selectedFile)
+    }
+    Connections {
+        target: SteamLayouts
+        function onLayoutImported() { steamLayoutReference.text = "" }
+    }
+    DesktopSettingsRow {
+        objectName: "steamLayoutsRow"
+        width: parent.width; paperStyle: true; glyph: "controller"; title: qsTr("Steam layouts")
+        description: qsTr("Import community layouts made for Steam Input and pick one per controller in the stream menu")
+        Row {
+            spacing: DesktopTokens.px(10)
+            DesktopSettingsField {
+                id: steamLayoutReference
+                objectName: "steamLayoutReference"
+                width: DesktopTokens.px(220)
+                placeholderText: qsTr("Steam layout link or ID")
+                Accessible.name: placeholderText
+            }
+            DesktopSettingsButton {
+                objectName: "steamLayoutImport"
+                text: qsTr("Import")
+                enabled: SteamLayouts.workshopId(steamLayoutReference.text) !== "" && !SteamLayouts.importing
+                onClicked: SteamLayouts.importFromSteam(steamLayoutReference.text)
+            }
+            DesktopSettingsButton {
+                objectName: "steamLayoutImportFile"
+                text: qsTr("Import a file…")
+                enabled: !SteamLayouts.importing
+                onClicked: layoutFileDialog.open()
+            }
+        }
+    }
+    Item {
+        width: parent.width
+        visible: SteamLayouts.message !== ""
+        height: visible ? steamLayoutMessage.implicitHeight + DesktopTokens.px(12) : 0
+        Text {
+            id: steamLayoutMessage
+            objectName: "steamLayoutMessage"
+            x: DesktopTokens.settingsLabelInset
+            width: parent.width - 2 * x
+            text: SteamLayouts.message
+            color: DesktopTokens.textMuted
+            font.family: DesktopTokens.bodyFont; font.pixelSize: 11; font.weight: Font.DemiBold
+            wrapMode: Text.WordWrap
+        }
+    }
+    Repeater {
+        model: SteamLayouts.layouts
+        delegate: DesktopSettingsRow {
+            id: layoutRow
+            required property var modelData
+            required property int index
+            objectName: "steamLayoutRow-" + index
+            width: parent.width; paperStyle: true; glyph: "controller"
+            title: String(modelData.title || "")
+            description: String(modelData.controllerType || "").replace("controller_", "")
+            DesktopSettingsButton {
+                objectName: "steamLayoutRemove-" + layoutRow.index
+                text: qsTr("Remove")
+                onClicked: SteamLayouts.remove(layoutRow.modelData.id)
+            }
+        }
     }
 }

@@ -1628,6 +1628,23 @@ to `{}`. Settings saved before this key existed load with `{}`, and
 `settings.reset` clears it. These values apply live in Qt before input reaches the
 streamer; they never require a new session.
 
+A profile may also say what the controls outside the gamepad packet do in a stream.
+`bindPaddle1`–`bindPaddle4`, `bindMisc1`, `bindTouchpad` and `bindMisc2` (SDL's
+names for the back paddles, the extra button and the touchpad clicks) each hold one
+output: `pad:<a|b|x|y|lb|rb|lt|rt|ls|rs|back|start|up|down|left|right>`,
+`mouse:<left|middle|right>` or `key:<Windows virtual-key code>`. `gyroMode` is
+`mouse` or `rightStick`; `gyroActivation` names the control that must be held
+(`lt`, `rt`, `lb`, `rb`, `touch0`, `touch1`, or an SDL extra-button name such as
+`paddle1` or `misc5`) and means "always" when absent. `leftPadMode` and
+`rightPadMode` are `mouse`, `leftStick` or `rightStick`. `gyroSensitivity`,
+`leftPadSensitivity` and `rightPadSensitivity` are percentages clamped to 0–500
+(Qt applies at least 10; default 100). `layout` names an imported Steam Input
+layout by the ID Qt gave it; while it is set and Qt still has that layout, the
+layout decides everything the pad sends and the fields above are not used. The core
+keeps these string fields only when they hold 1–40 ASCII letters, digits, colons or
+hyphens and does not interpret them; Qt ignores values it does not know. They count as tuning fields, so a profile holding
+only a mapping is kept.
+
 Provider discovery falls back to NVIDIA's
 default service when discovery is unavailable. Device-login tokens are stored
 through the OS credential store (DPAPI/Credential Manager, Keychain or Secret

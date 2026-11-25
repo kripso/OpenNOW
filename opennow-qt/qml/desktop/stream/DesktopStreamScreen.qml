@@ -166,6 +166,12 @@ FocusScope {
         }
     }
 
+    DesktopStreamLayoutMenus {
+        anchors.fill: parent
+        menus: ControllerInput.steamMenus || []
+        z: 6
+    }
+
     Timer {
         id: clipboardPasteNotice
         objectName: "streamClipboardPasteNoticeTimer"

@@ -1406,7 +1406,7 @@ if(BUILD_TESTING)
     )
     qt_add_executable(opennow-generichidinput-tests tests/tst_generichidinput.cpp)
     target_link_libraries(opennow-generichidinput-tests PRIVATE
-        Qt6::Test Qt6::Gui opennow-generic-hid)
+        Qt6::Test Qt6::Gui opennow-generic-hid opennow-steam-input)
     target_sources(opennow-generichidinput-tests PRIVATE
         src/input/ControllerInput.cpp src/input/ControllerInput.h)
     add_test(NAME opennow-generichidinput-tests COMMAND opennow-generichidinput-tests -o -,txt)
@@ -1459,6 +1459,45 @@ if(BUILD_TESTING)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         TIMEOUT 15
     )
+    qt_add_executable(opennow-controllermapping-tests
+        tests/tst_controllermapping.cpp
+        tests/SdlJoystickTestSession.h
+        src/input/ControllerInput.cpp
+        src/input/ControllerInput.h
+        src/input/ControllerMapping.h
+        src/input/SdlDeviceClaim.h
+    )
+    target_include_directories(opennow-controllermapping-tests PRIVATE src)
+    target_link_libraries(opennow-controllermapping-tests PRIVATE
+        Qt6::Test Qt6::Core Qt6::Gui SDL3::SDL3)
+    add_test(NAME opennow-controllermapping-tests
+             COMMAND opennow-controllermapping-tests -o -,txt)
+    set_tests_properties(opennow-controllermapping-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 30
+    )
+    qt_add_executable(opennow-steamlayoutlibrary-tests
+        tests/tst_steamlayoutlibrary.cpp
+        src/input/SteamLayoutLibrary.cpp
+        src/input/SteamLayoutLibrary.h
+    )
+    target_link_libraries(opennow-steamlayoutlibrary-tests PRIVATE
+        Qt6::Test Qt6::Core Qt6::Network opennow-steam-input)
+    add_test(NAME opennow-steamlayoutlibrary-tests
+             COMMAND opennow-steamlayoutlibrary-tests -o -,txt)
+    set_tests_properties(opennow-steamlayoutlibrary-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 30
+    )
+    qt_add_executable(opennow-steaminput-tests tests/tst_steaminput.cpp)
+    target_link_libraries(opennow-steaminput-tests PRIVATE
+        Qt6::Test Qt6::Core Qt6::Gui opennow-steam-input)
+    add_test(NAME opennow-steaminput-tests
+             COMMAND opennow-steaminput-tests -o -,txt)
+    set_tests_properties(opennow-steaminput-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 30
+    )
     qt_add_executable(opennow-controllersources-tests
         tests/tst_controllersources.cpp
         tests/SdlJoystickTestSession.h
@@ -1493,9 +1532,9 @@ if(BUILD_TESTING)
     foreach(target opennow-consolelaunchinput-tests opennow-sonychain-tests
             opennow-controllerinput-tests opennow-controllernavigation-tests
             opennow-controllertuning-tests opennow-controllersources-tests
-            opennow-controllermetadata-tests)
+            opennow-controllermetadata-tests opennow-controllermapping-tests)
         if(TARGET ${target})
-            target_link_libraries(${target} PRIVATE opennow-generic-hid)
+            target_link_libraries(${target} PRIVATE opennow-generic-hid opennow-steam-input)
         endif()
     endforeach()
     if(APPLE)
@@ -1505,6 +1544,7 @@ if(BUILD_TESTING)
             opennow-controllerinput-tests
             opennow-controllernavigation-tests
             opennow-controllertuning-tests
+            opennow-controllermapping-tests
             opennow-controllersources-tests
             opennow-controllermetadata-tests
             PROPERTIES RESOURCE_LOCK macos-controller-discovery
@@ -1551,6 +1591,9 @@ if(BUILD_TESTING)
         opennow-controllerinput-tests
         opennow-controllernavigation-tests
         opennow-controllertuning-tests
+        opennow-controllermapping-tests
+        opennow-steaminput-tests
+        opennow-steamlayoutlibrary-tests
         opennow-controllersources-tests
         opennow-controllermetadata-tests
     )

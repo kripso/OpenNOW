@@ -6,6 +6,7 @@
 #include "app/ApplicationStartup.h"
 #include "app/platform/MacAwdlController.h"
 #include "input/ControllerInput.h"
+#include "input/SteamLayoutLibrary.h"
 #include "core/CoreClient.h"
 #include "input/InputModeTracker.h"
 #include "input/SonySnapshotWire.h"
@@ -22,6 +23,7 @@
 #include "streaming/StreamVideoItem.h"
 #include "media/ThumbnailGenerator.h"
 
+#include <limits>
 #include <QGuiApplication>
 #include <QIcon>
 #include <QElapsedTimer>
@@ -208,6 +210,12 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
     FileOpenFilter fileOpenFilter(&controller);
     application.installEventFilter(&fileOpenFilter);
     ControllerInput controllerInput;
+    // Acceptance runs must not depend on the layouts this machine's player imported.
+    SteamLayoutLibrary steamLayouts(nullptr, arguments.contains(u"--smoke-test"_s)
+        ? QDir::tempPath() + u"/opennow-smoke-layouts-%1"_s.arg(QCoreApplication::applicationPid()) : QString());
+    controllerInput.setLayoutProvider([&steamLayouts](const QString &id) { return steamLayouts.config(id); });
+    QObject::connect(&steamLayouts, &SteamLayoutLibrary::layoutsChanged,
+                     &controllerInput, &ControllerInput::reloadLayouts);
     ThumbnailGenerator thumbnailGenerator;
     Localization localization;
     application.installTranslator(&localization);
@@ -270,6 +278,29 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
     QObject::connect(&controllerInput, &ControllerInput::localActionRequested,
                      &nativeStreamRuntime, [&nativeStreamRuntime](quint32 action) {
                          nativeStreamRuntime.submitLocalAction(action);
+                     });
+    QObject::connect(&controllerInput, &ControllerInput::mappedMouseMotion, &nativeStreamRuntime,
+                     [&nativeStreamRuntime](qint16 deltaX, qint16 deltaY) {
+                         nativeStreamRuntime.submitMouseRelative(deltaX, deltaY);
+                     });
+    QObject::connect(&controllerInput, &ControllerInput::mappedMouseButton, &nativeStreamRuntime,
+                     [&nativeStreamRuntime](quint8 button, bool pressed) {
+                         nativeStreamRuntime.submitMouseButton(button, pressed);
+                     });
+    QObject::connect(&controllerInput, &ControllerInput::mappedMouseAbsolute, &nativeStreamRuntime,
+                     [&nativeStreamRuntime](double x, double y) {
+                         // A surface 65535 units across is the finest the packet can carry.
+                         constexpr auto extent = std::numeric_limits<quint16>::max();
+                         nativeStreamRuntime.submitMouseAbsolute(static_cast<quint16>(x * extent),
+                                                                 static_cast<quint16>(y * extent), extent, extent);
+                     });
+    QObject::connect(&controllerInput, &ControllerInput::mappedMouseWheel, &nativeStreamRuntime,
+                     [&nativeStreamRuntime](qint16 deltaX, qint16 deltaY) {
+                         nativeStreamRuntime.submitMouseWheel(deltaX, deltaY);
+                     });
+    QObject::connect(&controllerInput, &ControllerInput::mappedKey, &nativeStreamRuntime,
+                     [&nativeStreamRuntime](quint16 virtualKey, bool pressed) {
+                         nativeStreamRuntime.submitKey(virtualKey, 0, pressed);
                      });
     QObject::connect(&controllerInput, &ControllerInput::deviceClaimsChanged,
                      &nativeStreamRuntime, [&controllerInput, &nativeStreamRuntime] {
@@ -360,6 +391,7 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
                                                coreClient, arguments);
     engine.rootContext()->setContextProperty(u"AppController"_s, &controller);
     engine.rootContext()->setContextProperty(u"ControllerInput"_s, &controllerInput);
+    engine.rootContext()->setContextProperty(u"SteamLayouts"_s, &steamLayouts);
     engine.rootContext()->setContextProperty(u"ThumbnailGenerator"_s, &thumbnailGenerator);
     engine.rootContext()->setContextProperty(u"I18n"_s, &localization);
     engine.rootContext()->setContextProperty(u"CoreClient"_s, &coreClient);

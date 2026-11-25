@@ -1,3 +1,13 @@
+# Steam Input layouts and the engine that runs them. ControllerInput uses it, so every target
+# that builds ControllerInput links this.
+add_library(opennow-steam-input STATIC
+    src/input/SteamInputConfig.cpp
+    src/input/SteamInputConfig.h
+    src/input/SteamInputEngine.cpp
+    src/input/SteamInputEngine.h)
+target_include_directories(opennow-steam-input PUBLIC src)
+target_link_libraries(opennow-steam-input PUBLIC Qt6::Core)
+
 add_library(opennow-generic-hid STATIC
     src/input/GenericHidInput.cpp
     src/input/GenericHidInput.h
@@ -91,6 +101,9 @@ qt_add_executable(opennow-qt
     src/diagnostics/DiagnosticsPaths.h
     src/input/ControllerInput.cpp
     src/input/ControllerInput.h
+    src/input/ControllerMapping.h
+    src/input/SteamLayoutLibrary.cpp
+    src/input/SteamLayoutLibrary.h
     src/input/SdlDeviceClaim.h
     src/input/SonySnapshotWire.h
     src/input/InputModeTracker.cpp
@@ -102,4 +115,4 @@ qt_add_executable(opennow-qt
     ${OPENNOW_STREAM_RUNTIME_SOURCES}
     ${OPENNOW_STREAM_PRESENTATION_SOURCES}
 )
-target_link_libraries(opennow-qt PRIVATE opennow-generic-hid)
+target_link_libraries(opennow-qt PRIVATE opennow-generic-hid opennow-steam-input)

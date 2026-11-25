@@ -23,6 +23,15 @@ constexpr quint16 sessionChordButtons = 0x0030;
 constexpr qint64 sessionChordWindowMs = 80;
 constexpr quint32 testRumbleDurationMs = 280;
 constexpr int maximumSerialChars = 120;
+constexpr qint64 gyroStickHoldMs = 50;
+constexpr quint16 valveVendor = 0x28de;
+
+// Valve pads report their stick and grip touch sensors as buttons, so these read as held for as
+// long as the pad is in hand and must not count as a deliberate press.
+bool isTouchSensor(quint16 vendor, int button)
+{
+    return vendor == valveVendor && button >= SDL_GAMEPAD_BUTTON_MISC3 && button <= SDL_GAMEPAD_BUTTON_MISC6;
+}
 
 int profileField(const QVariantMap &profile, QLatin1StringView name, int fallback, int maximum)
 {
@@ -348,6 +357,12 @@ void ControllerInput::refreshControllerMetadata()
             {QStringLiteral("leftStickDeadzone"), slot.leftDeadzone},
             {QStringLiteral("rightStickDeadzone"), slot.rightDeadzone},
             {QStringLiteral("vibrationIntensity"), slot.vibration},
+            {QStringLiteral("extraButtons"), slot.extraButtonNames},
+            {QStringLiteral("hasGyro"), slot.hasGyro},
+            {QStringLiteral("touchpads"), slot.touchpadCount},
+            {QStringLiteral("steamLayout"), slot.vendor == valveVendor},
+            {QStringLiteral("layout"), slot.layout ? slot.layoutId : QString()},
+            {QStringLiteral("acceptsLayouts"), slot.vendor != 0x054c},
         };
         available.push_back(metadata);
         if (acceptsController(slot.instanceId)) {
@@ -419,14 +434,31 @@ void ControllerInput::applySlotTuning()
 {
     bool sticksChanged = false;
     bool vibrationChanged = false;
-    for (auto &slot : m_slots) {
+    for (int index = 0; index < static_cast<int>(m_slots.size()); ++index) {
+        auto &slot = m_slots[static_cast<std::size_t>(index)];
         if (!slot.gamepad) continue;
         const auto left = slot.leftDeadzone;
         const auto right = slot.rightDeadzone;
         const auto vibration = slot.vibration;
+        const auto mapping = slot.mapping;
+        const auto layoutId = slot.layoutId;
+        const auto hadLayout = slot.layout.has_value();
+        // What the old layout holds must be let go before it is replaced.
+        auto previousLayout = std::exchange(slot.layout, std::nullopt);
         tuneSlot(slot);
+        // The same ID can hold new contents after a layout is imported again.
+        const auto layoutChanged = layoutId != slot.layoutId || hadLayout != slot.layout.has_value()
+            || (slot.layout && previousLayout && !(slot.layout->config() == previousLayout->config()));
+        if (!layoutChanged) slot.layout = std::move(previousLayout);
+        else if (previousLayout) sendLayoutOutput(index, previousLayout->releaseAll());
         sticksChanged |= left != slot.leftDeadzone || right != slot.rightDeadzone;
         vibrationChanged |= vibration != slot.vibration;
+        if (mapping == slot.mapping && !layoutChanged) continue;
+        slot.layoutPad = {};
+        releaseMappedOutputs(index);
+        updateSensorState(slot);
+        applyMapping(index);
+        sticksChanged = true;
     }
     if (vibrationChanged) stopRumble();
     if (sticksChanged && !m_shellCaptureEnabled) publishConnectedInputs();
@@ -439,6 +471,30 @@ void ControllerInput::tuneSlot(GamepadSlot &slot) const
     slot.leftDeadzone = profileField(profile, QLatin1StringView("leftStickDeadzone"), m_leftStickDeadzone, 50);
     slot.rightDeadzone = profileField(profile, QLatin1StringView("rightStickDeadzone"), m_rightStickDeadzone, 50);
     slot.vibration = profileField(profile, QLatin1StringView("vibrationIntensity"), m_vibrationIntensity, 100);
+    slot.mapping = ControllerMapping::parse(profile);
+    // PlayStation pads reach the game as the real device, touchpad included, so no layout is put
+    // in front of them.
+    const auto sony = slot.vendor == 0x054c;
+    const auto layoutId = sony ? QString() : profile.value(QStringLiteral("layout")).toString();
+    auto config = m_layoutProvider && !layoutId.isEmpty() ? m_layoutProvider(layoutId) : std::nullopt;
+    if (layoutId != slot.layoutId || slot.layout.has_value() != config.has_value()) {
+        slot.layoutId = layoutId;
+        slot.layout.reset();
+        if (config) slot.layout.emplace(std::move(*config));
+    }
+    // An imported layout takes the pad over; the bindings made here apply only without one.
+    if (slot.layout) slot.mapping = {};
+}
+
+void ControllerInput::setLayoutProvider(LayoutProvider provider)
+{
+    m_layoutProvider = std::move(provider);
+    applySlotTuning();
+}
+
+void ControllerInput::reloadLayouts()
+{
+    applySlotTuning();
 }
 
 QString ControllerInput::profileKey(quint16 vendor, quint16 product, const char *serial, SDL_GUID guid)
@@ -550,8 +606,10 @@ void ControllerInput::updateShellInputDrain()
     if (m_shellInputBlocked || m_shellInputDraining) {
         for (const auto &slot : m_slots) {
             if (!slot.gamepad || !acceptsController(slot.instanceId)) continue;
-            for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; ++button)
+            for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; ++button) {
+                if (isTouchSensor(slot.vendor, button)) continue;
                 draining |= SDL_GetGamepadButton(slot.gamepad, SDL_GamepadButton(button));
+            }
             for (int axis = 0; axis < SDL_GAMEPAD_AXIS_COUNT; ++axis)
                 draining |= std::abs(int(SDL_GetGamepadAxis(slot.gamepad, SDL_GamepadAxis(axis))))
                     > axisReleaseThreshold;
@@ -667,6 +725,9 @@ void ControllerInput::poll()
         case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
             handleTouchpad(event.gtouchpad);
             break;
+        case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+            handleSensor(event.gsensor);
+            break;
         default:
             break;
         }
@@ -688,6 +749,8 @@ void ControllerInput::poll()
             slot.tappedButtons = 0;
             changed = true;
         }
+        changed |= flushMappedMotion(index, now);
+        changed |= runLayout(index, std::exchange(slot.layoutDirty, false));
         if (changed && slot.gamepad && !m_shellCaptureEnabled) publishSlotSnapshot(index);
     }
     if (!m_shellCaptureEnabled && now - m_lastGamepadSnapshotAt >= gamepadKeepaliveMs) {
@@ -721,12 +784,21 @@ void ControllerInput::openController(SDL_JoystickID id)
     freeSlot->hasSerial = serial && !QString::fromUtf8(serial).trimmed().isEmpty();
     freeSlot->profileKey = profileKey(freeSlot->vendor, freeSlot->product, serial, SDL_GetGamepadGUIDForID(id));
     tuneSlot(*freeSlot);
-    if (isSonySlot(slot)) {
+    const auto sony = isSonySlot(slot);
+    if (sony) {
         for (auto &contact : freeSlot->contacts) {
             contact.x = sonyContactCenter;
             contact.y = sonyContactCenter;
         }
     }
+    // Sony touchpads already reach the game as the real device, so they are not offered for mapping.
+    for (const auto &extra : ControllerMapping::extraButtons) {
+        if (SDL_GamepadHasButton(gamepad, extra.button) && !(sony && extra.button == SDL_GAMEPAD_BUTTON_TOUCHPAD))
+            freeSlot->extraButtonNames.append(QString::fromLatin1(extra.name));
+    }
+    freeSlot->hasGyro = SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO);
+    freeSlot->touchpadCount = sony ? 0 : std::clamp(SDL_GetNumGamepadTouchpads(gamepad), 0, 2);
+    updateSensorState(*freeSlot);
     m_gamepadSlots.insert(id, slot);
     updateSlotSnapshot(slot);
     if (!m_shellCaptureEnabled) publishSlotSnapshot(slot);
@@ -762,6 +834,7 @@ void ControllerInput::closeController(SDL_JoystickID id)
     const auto publishedSlot = effectiveSlot(slotIndex);
     const auto sony = isSonySlot(slotIndex);
     releaseShellButtons(slotIndex);
+    releaseMappedOutputs(slotIndex);
     if (sony) releaseSonyContacts(slotIndex);
     SDL_CloseGamepad(slot.gamepad);
     slot = {};
@@ -779,6 +852,11 @@ void ControllerInput::handleButton(const SDL_GamepadButtonEvent &event, bool pre
     const auto slotIndex = m_gamepadSlots.value(event.which, -1);
     if (slotIndex < 0 || !acceptsController(event.which)) return;
     auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    slot.layoutDirty = true;
+    if (const auto bit = ControllerMapping::extraBit(event.button); bit != 0) {
+        slot.extraHeld = pressed ? slot.extraHeld | bit : slot.extraHeld & ~bit;
+        if (applyMapping(slotIndex) && !m_shellCaptureEnabled) publishSlotSnapshot(slotIndex);
+    }
     if (event.button == SDL_GAMEPAD_BUTTON_GUIDE) {
         if (pressed) {
             if (slot.guideLatched) return;
@@ -824,13 +902,13 @@ void ControllerInput::handleButton(const SDL_GamepadButtonEvent &event, bool pre
             }
             slot.withheldButtons &= static_cast<quint16>(~mask);
         }
-        if (!m_shellCaptureEnabled) publishSlotSnapshot(slotIndex);
+        if (!m_shellCaptureEnabled && !slot.layout) publishSlotSnapshot(slotIndex);
     }
 
     if (!m_shellCaptureEnabled || m_inputSuspended) return;
     if (m_shellInputBlocked || m_shellInputDraining) {
         updateShellInputDrain();
-        if (pressed && m_shellInputBlocked) emit shellInputSkipRequested();
+        if (pressed && m_shellInputBlocked && !isTouchSensor(slot.vendor, event.button)) emit shellInputSkipRequested();
         return;
     }
     const auto key = keyForButton(event.button);
@@ -855,7 +933,9 @@ void ControllerInput::handleAxis(const SDL_GamepadAxisEvent &event)
     case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: slot.rightTrigger = triggerValue(event.value); break;
     default: return;
     }
-    if (!m_shellCaptureEnabled) publishSlotSnapshot(slotIndex);
+    slot.layoutDirty = true;
+    // With a layout the packet comes from the layout, once this poll has gathered every change.
+    if (!m_shellCaptureEnabled && !slot.layout) publishSlotSnapshot(slotIndex);
     if (!m_shellCaptureEnabled || m_inputSuspended) return;
 
     if (m_shellInputBlocked || m_shellInputDraining) {
@@ -912,13 +992,20 @@ void ControllerInput::publishGamepad(int slotIndex, bool neutral)
     if (m_inputSuspended && !neutral) return;
     const auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
     if (!slot.gamepad || !acceptsController(slot.instanceId)) return;
-    const auto left = neutral ? QPair<qint16, qint16>{}
-        : radialDeadzone(slot.rawLeftX, slot.rawLeftY, slot.leftDeadzone);
-    const auto right = neutral ? QPair<qint16, qint16>{}
-        : radialDeadzone(slot.rawRightX, slot.rawRightY, slot.rightDeadzone);
+    if (slot.layout && !neutral) {
+        // A layout's sticks already grow upward, as the packet's do.
+        const auto &pad = slot.layoutPad;
+        emit gamepadSnapshot(static_cast<quint8>(effectiveSlot(slotIndex)), gamepadBitmap(), pad.buttons,
+                             pad.leftTrigger, pad.rightTrigger, pad.leftStickX, pad.leftStickY,
+                             pad.rightStickX, pad.rightStickY);
+        return;
+    }
+    const auto left = neutral ? QPair<qint16, qint16>{} : outputStick(slot, false);
+    const auto right = neutral ? QPair<qint16, qint16>{} : outputStick(slot, true);
     emit gamepadSnapshot(static_cast<quint8>(effectiveSlot(slotIndex)), gamepadBitmap(),
                          neutral ? 0 : slot.forwardedButtons(),
-                         neutral ? 0 : slot.leftTrigger, neutral ? 0 : slot.rightTrigger,
+                         neutral ? 0 : slot.forwardedLeftTrigger(),
+                         neutral ? 0 : slot.forwardedRightTrigger(),
                          left.first, static_cast<qint16>(-left.second),
                          right.first, static_cast<qint16>(-right.second));
 }
@@ -974,16 +1061,14 @@ void ControllerInput::publishSonySnapshot(int slotIndex, bool neutral)
     if (m_inputSuspended && !neutral) return;
     if (m_shellCaptureEnabled) return;
     const auto cleared = neutral || m_inputSuspended;
-    const auto left = cleared ? QPair<qint16, qint16>{}
-        : radialDeadzone(slot.rawLeftX, slot.rawLeftY, slot.leftDeadzone);
-    const auto right = cleared ? QPair<qint16, qint16>{}
-        : radialDeadzone(slot.rawRightX, slot.rawRightY, slot.rightDeadzone);
+    const auto left = cleared ? QPair<qint16, qint16>{} : outputStick(slot, false);
+    const auto right = cleared ? QPair<qint16, qint16>{} : outputStick(slot, true);
     SonySnapshot snapshot;
     snapshot.slot = static_cast<quint8>(effectiveSlot(slotIndex));
     snapshot.incarnation = slot.incarnation;
     snapshot.buttons = cleared ? 0 : slot.forwardedButtons();
-    snapshot.leftTrigger = cleared ? 0 : slot.leftTrigger;
-    snapshot.rightTrigger = cleared ? 0 : slot.rightTrigger;
+    snapshot.leftTrigger = cleared ? 0 : slot.forwardedLeftTrigger();
+    snapshot.rightTrigger = cleared ? 0 : slot.forwardedRightTrigger();
     snapshot.leftStickX = left.first;
     snapshot.leftStickY = left.second;
     snapshot.rightStickX = right.first;
@@ -1008,6 +1093,9 @@ void ControllerInput::publishConnectedSony(bool neutral)
 
 void ControllerInput::publishConnectedInputs(bool neutral)
 {
+    if (neutral) {
+        for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot) releaseMappedOutputs(slot);
+    }
     publishConnectedGamepads(neutral);
     publishConnectedSony(neutral);
 }
@@ -1026,6 +1114,10 @@ void ControllerInput::handleTouchpad(const SDL_GamepadTouchpadEvent &event)
     if (!m_shellCaptureEnabled && event.timestamp < m_streamInputStartedNs) return;
     const auto slotIndex = m_gamepadSlots.value(event.which, -1);
     if (slotIndex < 0 || !acceptsController(event.which)) return;
+    if (!isSonySlot(slotIndex)) {
+        handleMappedTouchpad(slotIndex, event);
+        return;
+    }
     if (event.touchpad != 0) return;
     if (event.finger < 0 || event.finger > 1) return;
     auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
@@ -1086,6 +1178,366 @@ void ControllerInput::updateSlotSnapshot(int slotIndex)
     slot.rightTrigger = triggerValue(
         SDL_GetGamepadAxis(slot.gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
     sampleSonyContacts(slotIndex);
+    slot.extraHeld = 0;
+    for (const auto &extra : ControllerMapping::extraButtons) {
+        if (SDL_GetGamepadButton(slot.gamepad, extra.button)) slot.extraHeld |= ControllerMapping::extraBit(extra.button);
+    }
+    for (int pad = 0; pad < slot.touchpadCount; ++pad) {
+        bool down = false;
+        float x = 0.0f;
+        float y = 0.0f;
+        float pressure = 0.0f;
+        if (!SDL_GetGamepadTouchpadFinger(slot.gamepad, pad, 0, &down, &x, &y, &pressure)) continue;
+        slot.touchpads[static_cast<std::size_t>(pad)] = {down && std::isfinite(x) && std::isfinite(y), QPointF(x, y), {}};
+    }
+    slot.gyroSampleNs = 0;
+    applyMapping(slotIndex);
+}
+
+bool ControllerInput::streamOwnsSlot(const GamepadSlot &slot) const
+{
+    return slot.gamepad && !m_shellCaptureEnabled && !m_inputSuspended && acceptsController(slot.instanceId);
+}
+
+bool ControllerInput::gyroActive(const GamepadSlot &slot) const
+{
+    using Kind = ControllerMapping::Activation::Kind;
+    const auto &activation = slot.mapping.gyroActivation;
+    switch (activation.kind) {
+    case Kind::Always: return true;
+    case Kind::ExtraButton: return (slot.extraHeld & activation.code) != 0;
+    case Kind::PadButton: return (slot.buttons & activation.code) != 0;
+    case Kind::LeftTrigger: return slot.leftTrigger >= ControllerMapping::triggerActivationThreshold;
+    case Kind::RightTrigger: return slot.rightTrigger >= ControllerMapping::triggerActivationThreshold;
+    case Kind::Touchpad: return slot.touchpads[activation.code & 1u].down;
+    }
+    return false;
+}
+
+void ControllerInput::updateSensorState(const GamepadSlot &slot) const
+{
+    if (!slot.gamepad || !slot.hasGyro) return;
+    const auto wanted = slot.mapping.gyro != ControllerMapping::GyroMode::Off
+        || (slot.layout && slot.layout->wantsGyro());
+    if (SDL_GamepadSensorEnabled(slot.gamepad, SDL_SENSOR_GYRO) == wanted) return;
+    if (!SDL_SetGamepadSensorEnabled(slot.gamepad, SDL_SENSOR_GYRO, wanted))
+        qWarning("Could not %s the controller gyro: %s", wanted ? "enable" : "disable", SDL_GetError());
+}
+
+// Recomputes what the held extra buttons contribute. Mouse and key transitions are emitted here;
+// the return value says whether the gamepad packet changed and needs publishing.
+bool ControllerInput::applyMapping(int slotIndex)
+{
+    using Kind = ControllerMapping::Target::Kind;
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    quint16 buttons = 0;
+    bool leftTrigger = false;
+    bool rightTrigger = false;
+    std::array<bool, 4> mouseButtons{};
+    QList<quint16> keys;
+    if (streamOwnsSlot(slot)) {
+        const auto sony = isSonySlot(slotIndex);
+        for (std::size_t index = 0; index < ControllerMapping::bindableButtons; ++index) {
+            const auto button = ControllerMapping::extraButtons[index].button;
+            if ((slot.extraHeld & ControllerMapping::extraBit(button)) == 0) continue;
+            if (sony && button == SDL_GAMEPAD_BUTTON_TOUCHPAD) continue;
+            const auto &target = slot.mapping.bindings[index];
+            switch (target.kind) {
+            case Kind::None: break;
+            case Kind::PadButton: buttons |= target.code; break;
+            case Kind::LeftTrigger: leftTrigger = true; break;
+            case Kind::RightTrigger: rightTrigger = true; break;
+            case Kind::MouseButton: mouseButtons[target.code & 3u] = true; break;
+            case Kind::Key: if (!keys.contains(target.code)) keys.append(target.code); break;
+            }
+        }
+    }
+    for (quint8 button = 1; button < mouseButtons.size(); ++button) {
+        if (mouseButtons[button] != slot.mappedMouseButtons[button]) emit mappedMouseButton(button, mouseButtons[button]);
+    }
+    for (const auto key : std::as_const(slot.mappedKeys)) {
+        if (!keys.contains(key)) emit mappedKey(key, false);
+    }
+    for (const auto key : std::as_const(keys)) {
+        if (!slot.mappedKeys.contains(key)) emit mappedKey(key, true);
+    }
+    const auto changed = buttons != slot.mappedButtons || leftTrigger != slot.mappedLeftTrigger
+        || rightTrigger != slot.mappedRightTrigger;
+    slot.mappedButtons = buttons;
+    slot.mappedLeftTrigger = leftTrigger;
+    slot.mappedRightTrigger = rightTrigger;
+    slot.mappedMouseButtons = mouseButtons;
+    slot.mappedKeys = std::move(keys);
+    return changed;
+}
+
+void ControllerInput::releaseMappedOutputs(int slotIndex)
+{
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    for (quint8 button = 1; button < slot.mappedMouseButtons.size(); ++button) {
+        if (slot.mappedMouseButtons[button]) emit mappedMouseButton(button, false);
+    }
+    for (const auto key : std::as_const(slot.mappedKeys)) emit mappedKey(key, false);
+    slot.mappedMouseButtons = {};
+    slot.mappedKeys.clear();
+    slot.mappedButtons = 0;
+    slot.mappedLeftTrigger = false;
+    slot.mappedRightTrigger = false;
+    for (auto &touchpad : slot.touchpads) touchpad.stick = {};
+    slot.gyroStick = {};
+    slot.gyroStickAt = 0;
+    slot.gyroSampleNs = 0;
+    slot.pointerPending = {};
+    slot.pointerRemainder = {};
+    slot.mappingDirty = false;
+    if (slot.layout) sendLayoutOutput(slotIndex, slot.layout->releaseAll());
+    slot.layoutPad = {};
+    slot.layoutGyroInterval = 0.0;
+    slot.layoutGyroSampleNs = 0;
+    slot.layoutPointerRemainder = {};
+}
+
+// The pad as an imported layout sees it. Steam's layouts name the second-generation Steam
+// Controller's controls; SDL's names for the same places on any pad are used for them.
+SteamInput::Report ControllerInput::layoutReport(const GamepadSlot &slot) const
+{
+    using Button = SteamInput::Button;
+    SteamInput::Report report;
+    const auto held = [&](SDL_GamepadButton button) { return SDL_GetGamepadButton(slot.gamepad, button); };
+    const auto set = [&](SDL_GamepadButton from, Button to) { if (held(from)) report.buttons |= to; };
+    set(SDL_GAMEPAD_BUTTON_SOUTH, Button::A);
+    set(SDL_GAMEPAD_BUTTON_EAST, Button::B);
+    set(SDL_GAMEPAD_BUTTON_WEST, Button::X);
+    set(SDL_GAMEPAD_BUTTON_NORTH, Button::Y);
+    set(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, Button::LeftBumper);
+    set(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, Button::RightBumper);
+    set(SDL_GAMEPAD_BUTTON_BACK, Button::View);
+    set(SDL_GAMEPAD_BUTTON_START, Button::Menu);
+    set(SDL_GAMEPAD_BUTTON_DPAD_UP, Button::DpadUp);
+    set(SDL_GAMEPAD_BUTTON_DPAD_DOWN, Button::DpadDown);
+    set(SDL_GAMEPAD_BUTTON_DPAD_LEFT, Button::DpadLeft);
+    set(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, Button::DpadRight);
+    set(SDL_GAMEPAD_BUTTON_LEFT_STICK, Button::LeftStickClick);
+    set(SDL_GAMEPAD_BUTTON_RIGHT_STICK, Button::RightStickClick);
+    set(SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, Button::R4);
+    set(SDL_GAMEPAD_BUTTON_LEFT_PADDLE1, Button::L4);
+    set(SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2, Button::R5);
+    set(SDL_GAMEPAD_BUTTON_LEFT_PADDLE2, Button::L5);
+    set(SDL_GAMEPAD_BUTTON_MISC1, Button::QuickAccess);
+    set(SDL_GAMEPAD_BUTTON_TOUCHPAD, Button::LeftPadClick);
+    set(SDL_GAMEPAD_BUTTON_MISC2, Button::RightPadClick);
+    if (isTouchSensor(slot.vendor, SDL_GAMEPAD_BUTTON_MISC3)) {
+        set(SDL_GAMEPAD_BUTTON_MISC3, Button::LeftStickTouch);
+        set(SDL_GAMEPAD_BUTTON_MISC4, Button::RightStickTouch);
+        set(SDL_GAMEPAD_BUTTON_MISC5, Button::LeftGrip);
+        set(SDL_GAMEPAD_BUTTON_MISC6, Button::RightGrip);
+    }
+    const auto axis = [&](SDL_GamepadAxis which) {
+        return std::clamp(SDL_GetGamepadAxis(slot.gamepad, which) / 32767.0f, -1.0f, 1.0f);
+    };
+    // SDL's sticks grow downward; a layout's grow upward.
+    report.leftStick = {axis(SDL_GAMEPAD_AXIS_LEFTX), -axis(SDL_GAMEPAD_AXIS_LEFTY)};
+    report.rightStick = {axis(SDL_GAMEPAD_AXIS_RIGHTX), -axis(SDL_GAMEPAD_AXIS_RIGHTY)};
+    report.leftTrigger = std::max(axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER), 0.0f);
+    report.rightTrigger = std::max(axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER), 0.0f);
+    // A touchpad reports 0...1 from its top left; a layout wants -1...1 about its centre.
+    const std::array<Button, 2> touchFlags{Button::LeftPadTouch, Button::RightPadTouch};
+    for (std::size_t pad = 0; pad < slot.touchpads.size(); ++pad) {
+        if (!slot.touchpads[pad].down) continue;
+        report.buttons |= touchFlags[pad];
+        const SteamInput::Vector position{static_cast<float>(slot.touchpads[pad].position.x() * 2.0 - 1.0),
+                                          static_cast<float>(1.0 - slot.touchpads[pad].position.y() * 2.0)};
+        (pad == 0 ? report.leftPad : report.rightPad) = position;
+    }
+    report.gyroPitch = slot.layoutGyroPitch;
+    report.gyroYaw = slot.layoutGyroYaw;
+    report.gyroInterval = slot.layoutGyroInterval;
+    return report;
+}
+
+// Feeds a pad's imported layout: a new report when something changed, otherwise only the passing
+// of time. Returns whether the gamepad packet changed.
+bool ControllerInput::runLayout(int slotIndex, bool fresh)
+{
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    if (!slot.gamepad || !slot.layout) return false;
+    const auto now = static_cast<double>(m_clock.nsecsElapsed()) / 1e9;
+    const auto owned = streamOwnsSlot(slot);
+    SteamInput::Engine::Output output;
+    if (!owned) {
+        // The layout still watches the pad, so what is held now stays ignored once play resumes.
+        output = slot.layout->apply(layoutReport(slot), now, true);
+        output.shortcuts.clear();
+    } else if (fresh) {
+        output = slot.layout->apply(layoutReport(slot), now);
+    } else {
+        output = slot.layout->advance(now);
+    }
+    slot.layoutGyroInterval = 0.0;
+    const auto changed = sendLayoutOutput(slotIndex, output);
+    refreshSteamMenus();
+    return changed && owned;
+}
+
+bool ControllerInput::sendLayoutOutput(int slotIndex, const SteamInput::Engine::Output &output)
+{
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    for (const auto &key : output.keys) emit mappedKey(key.virtualKey, key.pressed);
+    for (const auto &button : output.mouseButtons) emit mappedMouseButton(static_cast<quint8>(button.button), button.pressed);
+    // Whole counts are sent and the fraction is kept, so slow gyro or trackpad travel is not lost.
+    const auto travel = slot.layoutPointerRemainder + output.mouse;
+    const QPointF whole(std::clamp(std::trunc(travel.x()), -32768.0, 32767.0),
+                        std::clamp(std::trunc(travel.y()), -32768.0, 32767.0));
+    slot.layoutPointerRemainder = {std::fmod(travel.x(), 1.0), std::fmod(travel.y(), 1.0)};
+    if (!whole.isNull()) emit mappedMouseMotion(static_cast<qint16>(whole.x()), static_cast<qint16>(whole.y()));
+    if (output.absolute) emit mappedMouseAbsolute(output.absolute->x(), output.absolute->y());
+    if (output.wheel != 0 || output.wheelX != 0) {
+        emit mappedMouseWheel(static_cast<qint16>(std::clamp(output.wheelX, -32768, 32767)),
+                              static_cast<qint16>(std::clamp(output.wheel, -32768, 32767)));
+    }
+    for (const auto shortcut : output.shortcuts) {
+        if (shortcut == SteamInput::Shortcut::Controls) emit localActionRequested(guideLocalAction);
+    }
+    if (output.pad == slot.layoutPad) return false;
+    slot.layoutPad = output.pad;
+    return true;
+}
+
+void ControllerInput::refreshSteamMenus()
+{
+    QVariantList menus;
+    for (const auto &slot : m_slots) {
+        if (!slot.gamepad || !slot.layout) continue;
+        for (const auto &menu : slot.layout->menus()) {
+            const auto left = menu.source == SteamInput::Config::Source::Joystick
+                || menu.source == SteamInput::Config::Source::LeftTrackpad;
+            menus.append(QVariantMap{
+                {QStringLiteral("id"), QStringLiteral("%1:%2").arg(slot.instanceId).arg(menu.id())},
+                {QStringLiteral("left"), left},
+                {QStringLiteral("radial"), menu.radial},
+                {QStringLiteral("title"), menu.title},
+                {QStringLiteral("items"), menu.items},
+                {QStringLiteral("selected"), menu.selected.value_or(-1)},
+                {QStringLiteral("columns"), SteamInput::Engine::gridColumns(static_cast<int>(menu.items.size()))},
+            });
+        }
+    }
+    if (menus == m_steamMenus) return;
+    m_steamMenus = std::move(menus);
+    emit steamMenusChanged();
+}
+
+void ControllerInput::handleSensor(const SDL_GamepadSensorEvent &event)
+{
+    if (event.sensor != SDL_SENSOR_GYRO) return;
+    if (!m_shellCaptureEnabled && event.timestamp < m_streamInputStartedNs) return;
+    const auto slotIndex = m_gamepadSlots.value(event.which, -1);
+    if (slotIndex < 0) return;
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    const auto mode = slot.mapping.gyro;
+    const auto pitch = event.data[0];
+    const auto yaw = event.data[1];
+    if (slot.layout && std::isfinite(pitch) && std::isfinite(yaw)) {
+        // The layout takes the latest rate, covering all the time since it last looked.
+        const auto last = std::exchange(slot.layoutGyroSampleNs, event.sensor_timestamp);
+        if (last != 0 && event.sensor_timestamp > last)
+            slot.layoutGyroInterval += static_cast<double>(event.sensor_timestamp - last) / 1e9;
+        slot.layoutGyroPitch = pitch;
+        slot.layoutGyroYaw = yaw;
+        slot.layoutDirty = true;
+        return;
+    }
+    const auto previous = std::exchange(slot.gyroSampleNs, event.sensor_timestamp);
+    if (mode == ControllerMapping::GyroMode::Off || !streamOwnsSlot(slot) || !gyroActive(slot)
+            || !std::isfinite(pitch) || !std::isfinite(yaw)) {
+        slot.gyroSampleNs = 0;
+        slot.gyroStickAt = 0;
+        if (!slot.gyroStick.isNull()) {
+            slot.gyroStick = {};
+            slot.mappingDirty = true;
+        }
+        return;
+    }
+    if (mode == ControllerMapping::GyroMode::Mouse) {
+        if (previous != 0 && event.sensor_timestamp > previous) {
+            slot.pointerPending += ControllerMapping::gyroMouseCounts(
+                pitch, yaw, static_cast<double>(event.sensor_timestamp - previous) / 1e9, slot.mapping.gyroSensitivity);
+        }
+        return;
+    }
+    const auto stick = ControllerMapping::gyroStick(pitch, yaw, slot.mapping.gyroSensitivity);
+    slot.gyroStickAt = m_clock.elapsed();
+    if (stick == slot.gyroStick) return;
+    slot.gyroStick = stick;
+    slot.mappingDirty = true;
+}
+
+void ControllerInput::handleMappedTouchpad(int slotIndex, const SDL_GamepadTouchpadEvent &event)
+{
+    if (event.touchpad < 0 || event.touchpad > 1 || event.finger != 0) return;
+    using Mode = ControllerMapping::TouchpadMode;
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    const auto pad = static_cast<std::size_t>(event.touchpad);
+    auto &touchpad = slot.touchpads[pad];
+    slot.layoutDirty = true;
+    const auto mode = slot.mapping.touchpads[pad];
+    const auto sensitivity = slot.mapping.touchpadSensitivity[pad];
+    const auto owned = streamOwnsSlot(slot);
+    const QPointF position(event.x, event.y);
+    const auto finite = std::isfinite(event.x) && std::isfinite(event.y);
+    QPointF stick;
+    if (event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) {
+        touchpad.down = false;
+    } else if (finite) {
+        if (owned && mode == Mode::Mouse && touchpad.down)
+            slot.pointerPending += ControllerMapping::touchpadMouseCounts(touchpad.position, position, sensitivity);
+        if (owned && (mode == Mode::LeftStick || mode == Mode::RightStick))
+            stick = ControllerMapping::touchpadStick(position, sensitivity);
+        touchpad.position = position;
+        touchpad.down = true;
+    } else {
+        stick = touchpad.stick;
+    }
+    if (stick == touchpad.stick) return;
+    touchpad.stick = stick;
+    slot.mappingDirty = true;
+}
+
+// Sends the pointer motion gathered during this poll and reports whether gyro or trackpad
+// movement changed the gamepad packet.
+bool ControllerInput::flushMappedMotion(int slotIndex, qint64 now)
+{
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    if (!slot.gamepad) return false;
+    // A sensor that stops reporting must not leave the stick deflected.
+    if (slot.gyroStickAt != 0 && now - slot.gyroStickAt > gyroStickHoldMs) {
+        slot.gyroStickAt = 0;
+        if (!slot.gyroStick.isNull()) {
+            slot.gyroStick = {};
+            slot.mappingDirty = true;
+        }
+    }
+    if (!slot.pointerPending.isNull()) {
+        const auto total = slot.pointerRemainder + std::exchange(slot.pointerPending, {});
+        const auto deltaX = std::clamp(std::trunc(total.x()), -32768.0, 32767.0);
+        const auto deltaY = std::clamp(std::trunc(total.y()), -32768.0, 32767.0);
+        slot.pointerRemainder = {std::fmod(total.x(), 1.0), std::fmod(total.y(), 1.0)};
+        if ((deltaX != 0.0 || deltaY != 0.0) && streamOwnsSlot(slot))
+            emit mappedMouseMotion(static_cast<qint16>(deltaX), static_cast<qint16>(deltaY));
+    }
+    return std::exchange(slot.mappingDirty, false);
+}
+
+QPair<qint16, qint16> ControllerInput::outputStick(const GamepadSlot &slot, bool right) const
+{
+    using Mode = ControllerMapping::TouchpadMode;
+    const auto physical = right ? radialDeadzone(slot.rawRightX, slot.rawRightY, slot.rightDeadzone)
+                                : radialDeadzone(slot.rawLeftX, slot.rawLeftY, slot.leftDeadzone);
+    auto mapped = right ? slot.gyroStick : QPointF();
+    for (std::size_t pad = 0; pad < slot.touchpads.size(); ++pad) {
+        if (slot.mapping.touchpads[pad] == (right ? Mode::RightStick : Mode::LeftStick)) mapped += slot.touchpads[pad].stick;
+    }
+    return mapped.isNull() ? physical : ControllerMapping::combineStick(physical, mapped);
 }
 
 quint16 ControllerInput::buttonMask(Uint8 button)

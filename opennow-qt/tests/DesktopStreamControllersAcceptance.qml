@@ -22,6 +22,11 @@ QtObject {
     readonly property var genericPad: ({instanceId: 14, slot: 4, name: "8BitDo Pro 2", family: "generic",
         powerState: "noBattery", batteryPercent: -1, charging: false,
         profileKey: "guid:03000000c82d00000660000000010000", hasSerial: false})
+    readonly property var steamPad: ({instanceId: 15, slot: 2, name: "Steam Controller", family: "generic",
+        powerState: "onBattery", batteryPercent: 64, charging: false,
+        profileKey: "serial:28de:1205:steamfixture01", hasSerial: true,
+        extraButtons: ["paddle1", "paddle2", "paddle3", "paddle4", "misc1", "touchpad", "misc2", "misc3", "misc4", "misc5", "misc6"],
+        hasGyro: true, touchpads: 2, steamLayout: true})
 
     property QtObject settingsClient: QtObject {
         property int serial: 0
@@ -40,12 +45,14 @@ QtObject {
         property int leftStickDeadzone: 5
         property int rightStickDeadzone: 5
         property int vibrationIntensity: 100
+        property var steamMenus: []
         function tuned(pad) {
             const profile = controllerProfiles[pad.profileKey] || {}
             return Object.assign({}, pad, {
                 leftStickDeadzone: profile.leftStickDeadzone ?? leftStickDeadzone,
                 rightStickDeadzone: profile.rightStickDeadzone ?? rightStickDeadzone,
-                vibrationIntensity: profile.vibrationIntensity ?? vibrationIntensity
+                vibrationIntensity: profile.vibrationIntensity ?? vibrationIntensity,
+                layout: profile.layout || ""
             })
         }
         readonly property var availableControllers: basePads.map(pad => tuned(pad))
@@ -379,12 +386,109 @@ QtObject {
             return true
         },
         function() {
+            AppController.showOverlay("desktop-stream-menu")
+            need("streamControllersRow").clicked()
+            const page = need("streamControllersPage")
+            check(page.active, "Controllers opens for the customise checks")
+            input.basePads = [xboxOne, steamPad]
+            page.selectedInstanceId = xboxOne.instanceId
+            check(!need("controllerCustomiseLabel").visible, "a pad without extra controls has no customise block")
+            check(!need("controllerGyroMode").visible && !need("controllerPadMode-0").visible,
+                "a pad without gyro or trackpads hides the customise rows")
+        },
+        function() {
+            const page = need("streamControllersPage")
+            page.selectedInstanceId = steamPad.instanceId
+            check(need("controllerCustomiseLabel").visible, "the Steam Controller shows the customise block")
+            check(need("controllerBind-paddle1").visible && need("controllerBind-paddle1").title === "R4",
+                "the Steam Controller's paddle 1 is labelled R4")
+            check(!need("controllerGyroActivation").visible && !need("controllerGyroSensitivity").visible,
+                "gyro activation and sensitivity wait for a gyro mode")
+            check(!need("controllerPadSensitivity-0").visible && !need("controllerPadSensitivity-1").visible,
+                "trackpad sensitivity waits for a trackpad mode")
+            need("controllerBind-paddle1").control.forceActiveFocus()
+            press(Qt.Key_Right)
+        },
+        function() {
+            const saved = profiles()[steamPad.profileKey]
+            if (!saved || saved.bindPaddle1 !== "pad:a") return false
+            check(need("controllerBind-paddle1").value === "pad:a", "the binding row shows the saved value")
+            check(need("streamControllersPage").custom, "a binding makes the pad custom")
+            need("controllerGyroMode").control.forceActiveFocus()
+            press(Qt.Key_Right)
+        },
+        function() {
+            const saved = profiles()[steamPad.profileKey]
+            if (!saved || saved.gyroMode !== "mouse") return false
+            check(need("controllerGyroActivation").visible && need("controllerGyroSensitivity").visible,
+                "gyro activation and sensitivity appear once gyro is on")
+            need("controllerPadMode-1").control.forceActiveFocus()
+            press(Qt.Key_Right)
+        },
+        function() {
+            const saved = profiles()[steamPad.profileKey]
+            if (!saved || saved.rightPadMode !== "mouse") return false
+            check(need("controllerPadSensitivity-1").visible, "trackpad sensitivity appears once its trackpad leaves Off")
+            check(!need("controllerPadSensitivity-0").visible, "the left trackpad keeps its own sensitivity hidden")
+            need("controllerTestVibration").forceActiveFocus()
+            press(Qt.Key_Tab)
+        },
+        function() {
+            const order = ["controllerBind-paddle1", "controllerBind-paddle2", "controllerBind-paddle3", "controllerBind-paddle4",
+                "controllerBind-misc1", "controllerBind-touchpad", "controllerBind-misc2", "controllerGyroMode",
+                "controllerGyroActivation", "controllerGyroSensitivity", "controllerPadMode-0", "controllerPadSensitivity-0",
+                "controllerPadMode-1", "controllerPadSensitivity-1"].filter(name => need(name).visible)
+            if (customiseWalk < order.length) {
+                check(need(order[customiseWalk]).control.activeFocus, order[customiseWalk] + " follows the Test button on Tab")
+                customiseWalk += 1
+                press(Qt.Key_Tab)
+                return false
+            }
+            check(need("controllerPlayerOne").activeFocus, "Tab after the customise rows reaches Player 1")
+        },
+        function() {
+            check(!need("controllerLayout").visible, "no imported layouts means no Layout row")
+            check(need("controllerBind-paddle1").visible, "the Steam pad keeps its bindings without a layout")
+            acceptanceLayout = SteamLayouts.importText('"controller_mappings" { "title" "Acceptance Layout" "group" { "id" "0" "mode" "four_buttons" "inputs" { "button_a" { "activators" { "Full_Press" { "bindings" { "binding" "key_press Q" } } } } } } "preset" { "id" "0" "name" "Default" "group_source_bindings" { "0" "button_diamond active" } } }')
+            check(acceptanceLayout !== "", "the acceptance layout imports")
+        },
+        function() {
+            if (!need("controllerLayout").visible) return false
+            const page = need("streamControllersPage")
+            page.selectedInstanceId = xboxOne.instanceId
+            check(need("controllerLayout").visible, "a plain pad can pick an imported layout")
+            page.selectedInstanceId = steamPad.instanceId
+            need("controllerLayout").control.forceActiveFocus()
+            press(Qt.Key_Right)
+        },
+        function() {
+            const saved = profiles()[steamPad.profileKey]
+            if (!saved || saved.layout !== acceptanceLayout) return false
+            check(need("streamControllersPage").custom, "a layout makes the pad custom")
+            check(find(parent, "controllerBind-paddle1") === null, "a layout hides the pad's own bindings")
+            check(need("controllerLayoutNotice").visible && need("controllerLayoutNotice").title === "Acceptance Layout",
+                "the layout notice names the chosen layout")
+            check(need("controllerLayout").value === acceptanceLayout, "the Layout row shows the chosen layout")
+            SteamLayouts.remove(acceptanceLayout)
+        },
+        function() {
+            if (need("controllerLayout").visible) return false
+            check(!need("controllerLayout").visible, "removing the last layout hides the Layout row")
+        },
+        function() {
+            ShellStore.settings = Object.assign({}, ShellStore.settings, {controllerProfiles: {}})
+            AppController.showOverlay("")
+            return true
+        },
+        function() {
             if (!fixture.sceneReady && AppController.overlay !== "") return false
             return fixture.scene()
         }
     ]
 
     property int shortTabs: 0
+    property int customiseWalk: 0
+    property string acceptanceLayout: ""
     property real endBeforeY: -1
     property bool sceneReady: false
     property int sceneTicks: 0

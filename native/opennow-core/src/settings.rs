@@ -32,10 +32,30 @@ const MAXIMUM_HDR_NOTICE_SHOWN: usize = 200;
 const MAXIMUM_CONTROLLER_PROFILES: usize = 32;
 const MAXIMUM_CONTROLLER_PROFILE_KEY_CHARS: usize = 160;
 const MAXIMUM_CONTROLLER_PROFILE_NAME_CHARS: usize = 80;
-const CONTROLLER_PROFILE_TUNING: [(&str, i64); 3] = [
+const MAXIMUM_CONTROLLER_PROFILE_MAPPING_CHARS: usize = 40;
+const CONTROLLER_PROFILE_TUNING: [(&str, i64); 6] = [
     ("leftStickDeadzone", 50),
     ("rightStickDeadzone", 50),
     ("vibrationIntensity", 100),
+    ("gyroSensitivity", 500),
+    ("leftPadSensitivity", 500),
+    ("rightPadSensitivity", 500),
+];
+/// What a controller's back paddles, extra buttons, gyro and trackpads do in a stream. The shell
+/// owns the vocabulary of these values; the store only keeps them short and plain.
+const CONTROLLER_PROFILE_MAPPING: [&str; 12] = [
+    "bindPaddle1",
+    "bindPaddle2",
+    "bindPaddle3",
+    "bindPaddle4",
+    "bindMisc1",
+    "bindTouchpad",
+    "bindMisc2",
+    "gyroMode",
+    "gyroActivation",
+    "leftPadMode",
+    "rightPadMode",
+    "layout",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1177,6 +1197,18 @@ fn normalize_controller_profiles(value: &Value) -> Map<String, Value> {
             for (field, maximum) in CONTROLLER_PROFILE_TUNING {
                 if let Some(value) = profile.get(field).and_then(Value::as_i64) {
                     normalized.insert(field.to_owned(), json!(value.clamp(0, maximum)));
+                }
+            }
+            for field in CONTROLLER_PROFILE_MAPPING {
+                let value = profile.get(field).and_then(Value::as_str).filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= MAXIMUM_CONTROLLER_PROFILE_MAPPING_CHARS
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b':' || byte == b'-'
+                        })
+                });
+                if let Some(value) = value {
+                    normalized.insert(field.to_owned(), Value::String(value.to_owned()));
                 }
             }
             if normalized.is_empty() {
@@ -3921,7 +3953,14 @@ mod tests {
                     "guid:only-a-name": {"name": "No tuning"},
                     "": {"leftStickDeadzone": 1},
                     "guid:bad": "not an object",
-                    "guid:wrong-type": {"leftStickDeadzone": "high", "vibrationIntensity": 0.5}
+                    "guid:wrong-type": {"leftStickDeadzone": "high", "vibrationIntensity": 0.5},
+                    "guid:mapped": {
+                        "bindPaddle1": "pad:a", "bindPaddle2": "key:32", "bindMisc1": "pad a",
+                        "bindMisc2": 7, "bindTouchpad": "", "bindPaddle3": "mouse:right:and:then:some:more:far:too:long",
+                        "layout": "0b6f3f0e-4c1d-4d0a-9d55-2f1f6f0c7a11",
+                        "gyroMode": "mouse", "gyroActivation": "misc5", "gyroSensitivity": 900,
+                        "rightPadMode": "mouse", "rightPadSensitivity": 150, "unknown": "dropped"
+                    }
                 }),
             )
             .unwrap();
@@ -3929,7 +3968,13 @@ mod tests {
             saved,
             json!({
                 "serial:054c:0ce6:abc": {"name": "DualSense", "leftStickDeadzone": 12, "lastSeen": 20},
-                "guid:030000005e040000e002000000006800": {"vibrationIntensity": 100, "rightStickDeadzone": 0, "lastSeen": 0}
+                "guid:030000005e040000e002000000006800": {"vibrationIntensity": 100, "rightStickDeadzone": 0, "lastSeen": 0},
+                "guid:mapped": {
+                    "bindPaddle1": "pad:a", "bindPaddle2": "key:32", "gyroMode": "mouse",
+                    "gyroActivation": "misc5", "gyroSensitivity": 500, "rightPadMode": "mouse",
+                    "rightPadSensitivity": 150, "layout": "0b6f3f0e-4c1d-4d0a-9d55-2f1f6f0c7a11",
+                    "lastSeen": 0
+                }
             })
         );
         let profile = &saved["serial:054c:0ce6:abc"];

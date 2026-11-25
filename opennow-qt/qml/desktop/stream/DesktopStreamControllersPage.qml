@@ -28,8 +28,30 @@ FocusScope {
     property var sample: ({})
     readonly property var selectedPad: pads.find(pad => Number(pad.instanceId) === selectedInstanceId) || null
     readonly property var selectedProfile: selectedPad ? (profiles[selectedPad.profileKey] || ({})) : ({})
-    readonly property bool custom: ["leftStickDeadzone", "rightStickDeadzone", "vibrationIntensity"]
+    readonly property var mappingFields: ["bindPaddle1", "bindPaddle2", "bindPaddle3", "bindPaddle4", "bindMisc1",
+        "bindTouchpad", "bindMisc2", "gyroMode", "gyroActivation", "gyroSensitivity", "leftPadMode", "rightPadMode",
+        "leftPadSensitivity", "rightPadSensitivity", "layout"]
+    readonly property bool custom: ["leftStickDeadzone", "rightStickDeadzone", "vibrationIntensity"].concat(mappingFields)
         .some(field => root.selectedProfile[field] !== undefined)
+    readonly property var bindableButtons: ["paddle1", "paddle2", "paddle3", "paddle4", "misc1", "touchpad", "misc2"]
+    readonly property var extraButtonOrder: ["paddle1", "paddle2", "paddle3", "paddle4", "misc1", "touchpad", "misc2",
+        "misc3", "misc4", "misc5", "misc6"]
+    readonly property var steamLayouts: typeof SteamLayouts !== "undefined" && SteamLayouts ? SteamLayouts.layouts : []
+    readonly property string selectedLayout: selectedPad ? String(selectedPad.layout || "") : ""
+    readonly property bool layoutActive: selectedLayout !== ""
+    readonly property var layoutEntry: steamLayouts.find(layout => layout.id === selectedLayout) || null
+    readonly property var layoutNotes: layoutEntry && layoutEntry.notes ? layoutEntry.notes : []
+    readonly property bool layoutCapable: selectedPad !== null && selectedPad.acceptsLayouts !== false
+        && steamLayouts.length > 0
+    // A layout decides everything the pad sends, so the pad's own bindings are not offered while one is set.
+    readonly property bool editable: !layoutActive
+    readonly property var visibleBindings: selectedPad && editable
+        ? bindableButtons.filter(name => padHas(selectedPad, name)) : []
+    readonly property bool gyroCapable: selectedPad !== null && !!selectedPad.hasGyro
+    readonly property int touchpadCount: selectedPad ? Number(selectedPad.touchpads || 0) : 0
+    readonly property bool gyroActive: gyroCapable && editable && (selectedProfile.gyroMode || "") !== ""
+    readonly property bool hasCustomise: layoutCapable || visibleBindings.length > 0
+        || (editable && (gyroCapable || touchpadCount > 0))
     readonly property var sharedWith: selectedPad
         ? pads.filter(pad => pad.profileKey === selectedPad.profileKey && pad.instanceId !== selectedPad.instanceId) : []
     readonly property bool playerOneMissing: Number(ControllerInput.inputControllerId) !== 0
@@ -92,6 +114,111 @@ FocusScope {
     function padGlyph(pad) {
         return InputPromptIcons.sourceFor(pad.family === "playstation" ? "playstation" : "controller", DesktopTokens.textHigh)
     }
+    function padHas(pad, name) {
+        return (pad.extraButtons || []).indexOf(name) >= 0
+    }
+    function bindField(name) {
+        return "bind" + name.charAt(0).toUpperCase() + name.slice(1)
+    }
+    function controlLabel(name, pad) {
+        const steam = !!(pad && pad.steamLayout)
+        switch (name) {
+        case "paddle1": return steam ? "R4" : qsTr("Right paddle 1")
+        case "paddle2": return steam ? "L4" : qsTr("Left paddle 1")
+        case "paddle3": return steam ? "R5" : qsTr("Right paddle 2")
+        case "paddle4": return steam ? "L5" : qsTr("Left paddle 2")
+        case "misc1": return steam ? qsTr("Quick access button") : qsTr("Extra button")
+        case "touchpad": return steam ? qsTr("Left trackpad click") : qsTr("Touchpad click")
+        case "misc2": return steam ? qsTr("Right trackpad click") : qsTr("Extra button 2")
+        case "misc3": return steam ? qsTr("Left stick touch") : qsTr("Extra button 3")
+        case "misc4": return steam ? qsTr("Right stick touch") : qsTr("Extra button 4")
+        case "misc5": return steam ? qsTr("Left grip") : qsTr("Extra button 5")
+        case "misc6": return steam ? qsTr("Right grip") : qsTr("Extra button 6")
+        case "touch0": return steam ? qsTr("Left trackpad touch") : qsTr("Touchpad touch")
+        case "touch1": return steam ? qsTr("Right trackpad touch") : qsTr("Second touchpad touch")
+        case "lt": return "LT"
+        case "rt": return "RT"
+        case "lb": return "LB"
+        case "rb": return "RB"
+        default: return name
+        }
+    }
+    function bindOptions() {
+        return [
+            {value: "", label: qsTr("Nothing")},
+            {value: "pad:a", label: "A"},
+            {value: "pad:b", label: "B"},
+            {value: "pad:x", label: "X"},
+            {value: "pad:y", label: "Y"},
+            {value: "pad:lb", label: "LB"},
+            {value: "pad:rb", label: "RB"},
+            {value: "pad:lt", label: "LT"},
+            {value: "pad:rt", label: "RT"},
+            {value: "pad:ls", label: qsTr("Left stick click")},
+            {value: "pad:rs", label: qsTr("Right stick click")},
+            {value: "pad:back", label: qsTr("View")},
+            {value: "pad:start", label: qsTr("Menu")},
+            {value: "pad:up", label: qsTr("D-pad up")},
+            {value: "pad:down", label: qsTr("D-pad down")},
+            {value: "pad:left", label: qsTr("D-pad left")},
+            {value: "pad:right", label: qsTr("D-pad right")},
+            {value: "mouse:left", label: qsTr("Left click")},
+            {value: "mouse:right", label: qsTr("Right click")},
+            {value: "mouse:middle", label: qsTr("Middle click")},
+            {value: "key:32", label: qsTr("Space")},
+            {value: "key:160", label: qsTr("Shift")},
+            {value: "key:162", label: qsTr("Ctrl")},
+            {value: "key:164", label: qsTr("Alt")},
+            {value: "key:9", label: qsTr("Tab")},
+            {value: "key:27", label: qsTr("Esc")},
+            {value: "key:13", label: qsTr("Enter")},
+            {value: "key:69", label: "E"},
+            {value: "key:70", label: "F"},
+            {value: "key:81", label: "Q"},
+            {value: "key:82", label: "R"},
+            {value: "key:67", label: "C"},
+            {value: "key:86", label: "V"},
+            {value: "key:71", label: "G"},
+            {value: "key:77", label: "M"}
+        ]
+    }
+    function gyroModeOptions() {
+        return [
+            {value: "", label: qsTr("Off")},
+            {value: "mouse", label: qsTr("Mouse")},
+            {value: "rightStick", label: qsTr("Right stick")}
+        ]
+    }
+    function gyroActivationOptions(pad) {
+        if (!pad) return []
+        const touchpads = Number(pad.touchpads || 0)
+        const activators = extraButtonOrder.filter(name => padHas(pad, name))
+            .concat(["lt", "rt", "lb", "rb"])
+            .concat(touchpads > 0 ? ["touch0"] : [])
+            .concat(touchpads > 1 ? ["touch1"] : [])
+        return [{value: "", label: qsTr("Always")}].concat(activators.map(name => ({
+            value: name,
+            label: qsTr("While holding %1").arg(controlLabel(name, pad))
+        })))
+    }
+    function layoutOptions() {
+        return [{value: "", label: qsTr("Made in OpenNOW")}].concat(steamLayouts.map(layout => ({
+            value: String(layout.id),
+            label: String(layout.title)
+        })))
+    }
+    function padModeOptions() {
+        return [
+            {value: "", label: qsTr("Off")},
+            {value: "mouse", label: qsTr("Mouse")},
+            {value: "leftStick", label: qsTr("Left stick")},
+            {value: "rightStick", label: qsTr("Right stick")}
+        ]
+    }
+    function customiseControls() {
+        void customiseRepeater.count
+        return customiseBlock.children.filter(child => child.visible && child.control).map(child => child.control)
+    }
     function selectPad(step) {
         if (pads.length < 2) return
         const index = Math.max(0, pads.findIndex(pad => Number(pad.instanceId) === selectedInstanceId))
@@ -135,8 +262,8 @@ FocusScope {
     }
 
     readonly property var focusItems: selectedPad
-        ? [backButton, padTabs, leftTune.control, rightTune.control, vibrationTune.control, testButton,
-           playerOneRow, resetButton, applyButton]
+        ? [backButton, padTabs, leftTune.control, rightTune.control, vibrationTune.control, testButton]
+            .concat(customiseControls(), [playerOneRow, resetButton, applyButton])
         : [backButton, globalLeftTune.control, globalRightTune.control, globalVibrationTune.control]
     property var focusFollowed: []
     function followFocus(item) {
@@ -254,6 +381,8 @@ FocusScope {
         property string note: ""
         property real value: 0
         property int maximum: 50
+        property int minimum: 0
+        property int step: 1
         property int trailingWidth: 0
         readonly property alias control: slider.control
         signal committed(int value)
@@ -283,12 +412,95 @@ FocusScope {
         DesktopSettingsSlider {
             id: slider
             x: 6; y: 26
-            from: 0; to: tune.maximum; stepSize: 1
+            from: tune.minimum; to: tune.maximum; stepSize: tune.step
             value: tune.value
             wheelEnabled: true
             accessibleName: tune.title
             trackWidth: tune.width - 12 - tune.trailingWidth - DesktopTokens.px(80) - spacing
             onCommitted: value => tune.committed(Math.round(value))
+        }
+    }
+
+    component ChoiceRow: Item {
+        id: choice
+        property string title: ""
+        property var options: []
+        property string value: ""
+        readonly property int currentIndex: Math.max(0, options.findIndex(option => option.value === value))
+        readonly property string currentLabel: options[currentIndex] ? String(options[currentIndex].label) : ""
+        readonly property Item control: chooser
+        signal picked(string value)
+        function step(delta) {
+            if (options.length === 0) return
+            picked(options[(currentIndex + delta + options.length) % options.length].value)
+        }
+        width: parent ? parent.width : 0
+        height: 44
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: -4
+            radius: 12
+            color: chooser.activeFocus ? "#0F7FD4FF" : "transparent"
+            border.width: 2
+            border.color: DesktopTokens.focus
+            visible: chooser.activeFocus && AppController.inputMode !== "pointer"
+        }
+        Text {
+            x: 6
+            anchors.verticalCenter: parent.verticalCenter
+            text: choice.title
+            color: DesktopTokens.textHigh
+            font.family: DesktopTokens.bodyFont; font.pixelSize: 13; font.weight: Font.Bold
+        }
+        Item {
+            id: chooser
+            anchors.fill: parent
+            activeFocusOnTab: true
+            Accessible.role: Accessible.ComboBox
+            Accessible.name: choice.title
+            Accessible.description: choice.currentLabel
+            Keys.onLeftPressed: event => { choice.step(-1); event.accepted = true }
+            Keys.onRightPressed: event => { choice.step(1); event.accepted = true }
+            Keys.onReturnPressed: event => { choice.step(1); event.accepted = true }
+            Keys.onEnterPressed: event => { choice.step(1); event.accepted = true }
+            Keys.onSpacePressed: event => { choice.step(1); event.accepted = true }
+            Text {
+                id: nextGlyph
+                anchors.right: parent.right; anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                text: "›"
+                color: DesktopTokens.textMuted
+                font.family: DesktopTokens.bodyFont; font.pixelSize: 20; font.weight: Font.Bold
+            }
+            Text {
+                id: valueText
+                anchors.right: nextGlyph.left; anchors.rightMargin: 6
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.min(implicitWidth, choice.width * 0.5)
+                horizontalAlignment: Text.AlignRight
+                elide: Text.ElideRight
+                text: choice.currentLabel
+                color: DesktopTokens.textHigh
+                font.family: DesktopTokens.bodyFont; font.pixelSize: 12; font.weight: Font.Bold
+            }
+            Text {
+                id: prevGlyph
+                anchors.right: valueText.left; anchors.rightMargin: 6
+                anchors.verticalCenter: parent.verticalCenter
+                text: "‹"
+                color: DesktopTokens.textMuted
+                font.family: DesktopTokens.bodyFont; font.pixelSize: 20; font.weight: Font.Bold
+            }
+            MouseArea {
+                anchors.fill: parent
+                onClicked: mouse => {
+                    chooser.forceActiveFocus()
+                    if (mouse.x >= prevGlyph.x - 6 && mouse.x <= prevGlyph.x + prevGlyph.width + 6)
+                        choice.step(-1)
+                    else
+                        choice.step(1)
+                }
+            }
         }
     }
 
@@ -875,6 +1087,109 @@ FocusScope {
                         color: DesktopTokens.textHigh
                         font.family: DesktopTokens.bodyFont; font.pixelSize: 12; font.weight: Font.Bold
                     }
+                }
+            }
+
+            Column {
+                id: customiseBlock
+                visible: root.hasCustomise
+                width: parent.width
+                spacing: 10
+                SectionLabel {
+                    objectName: "controllerCustomiseLabel"
+                    visible: root.hasCustomise
+                    text: qsTr("CUSTOMISE")
+                }
+                ChoiceRow {
+                    objectName: "controllerLayout"
+                    visible: root.layoutCapable
+                    title: qsTr("Layout")
+                    options: root.layoutOptions()
+                    value: root.selectedLayout
+                    onPicked: value => root.writePad(root.selectedPad, {layout: value})
+                }
+                Notice {
+                    objectName: "controllerLayoutNotice"
+                    visible: root.layoutActive
+                    tone: DesktopTokens.focus
+                    title: root.layoutEntry ? String(root.layoutEntry.title || "") : ""
+                    body: qsTr("This Steam layout decides everything the pad sends. Choose Made in OpenNOW to use the bindings below instead.")
+                        + (root.layoutNotes.length > 0 ? "\n" + root.layoutNotes.join(" ") : "")
+                }
+                Repeater {
+                    id: customiseRepeater
+                    model: root.visibleBindings
+                    delegate: ChoiceRow {
+                        id: bindRow
+                        required property var modelData
+                        objectName: "controllerBind-" + modelData
+                        title: root.controlLabel(modelData, root.selectedPad)
+                        options: root.bindOptions()
+                        value: root.selectedProfile[root.bindField(modelData)] || ""
+                        onPicked: value => root.writePad(root.selectedPad, ({[root.bindField(bindRow.modelData)]: value}))
+                    }
+                }
+                ChoiceRow {
+                    objectName: "controllerGyroMode"
+                    visible: root.gyroCapable && root.editable
+                    title: qsTr("Gyro")
+                    options: root.gyroModeOptions()
+                    value: root.selectedProfile.gyroMode || ""
+                    onPicked: value => root.writePad(root.selectedPad, {gyroMode: value})
+                }
+                ChoiceRow {
+                    objectName: "controllerGyroActivation"
+                    visible: root.gyroActive
+                    title: qsTr("Gyro is active")
+                    options: root.gyroActivationOptions(root.selectedPad)
+                    value: root.selectedProfile.gyroActivation || ""
+                    onPicked: value => root.writePad(root.selectedPad, {gyroActivation: value})
+                }
+                TuneSlider {
+                    objectName: "controllerGyroSensitivity"
+                    visible: root.gyroActive
+                    title: qsTr("Gyro sensitivity")
+                    minimum: 10
+                    maximum: 500
+                    step: 10
+                    value: Number(root.selectedProfile.gyroSensitivity ?? 100)
+                    onCommitted: value => root.writePad(root.selectedPad, {gyroSensitivity: value})
+                }
+                ChoiceRow {
+                    objectName: "controllerPadMode-0"
+                    visible: root.touchpadCount > 0 && root.editable
+                    title: root.touchpadCount > 1 ? qsTr("Left trackpad") : qsTr("Trackpad")
+                    options: root.padModeOptions()
+                    value: root.selectedProfile.leftPadMode || ""
+                    onPicked: value => root.writePad(root.selectedPad, {leftPadMode: value})
+                }
+                TuneSlider {
+                    objectName: "controllerPadSensitivity-0"
+                    visible: root.touchpadCount > 0 && root.editable && (root.selectedProfile.leftPadMode || "") !== ""
+                    title: root.touchpadCount > 1 ? qsTr("Left trackpad sensitivity") : qsTr("Trackpad sensitivity")
+                    minimum: 10
+                    maximum: 500
+                    step: 10
+                    value: Number(root.selectedProfile.leftPadSensitivity ?? 100)
+                    onCommitted: value => root.writePad(root.selectedPad, {leftPadSensitivity: value})
+                }
+                ChoiceRow {
+                    objectName: "controllerPadMode-1"
+                    visible: root.touchpadCount > 1 && root.editable
+                    title: qsTr("Right trackpad")
+                    options: root.padModeOptions()
+                    value: root.selectedProfile.rightPadMode || ""
+                    onPicked: value => root.writePad(root.selectedPad, {rightPadMode: value})
+                }
+                TuneSlider {
+                    objectName: "controllerPadSensitivity-1"
+                    visible: root.touchpadCount > 1 && root.editable && (root.selectedProfile.rightPadMode || "") !== ""
+                    title: qsTr("Right trackpad sensitivity")
+                    minimum: 10
+                    maximum: 500
+                    step: 10
+                    value: Number(root.selectedProfile.rightPadSensitivity ?? 100)
+                    onCommitted: value => root.writePad(root.selectedPad, {rightPadSensitivity: value})
                 }
             }
 

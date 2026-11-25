@@ -3,15 +3,21 @@
 #include <QObject>
 #include <QElapsedTimer>
 #include <QHash>
+#include <QPointF>
 #include <QPointer>
+#include <QStringList>
 #include <QTimer>
 #include <QVariantList>
 
 #include <array>
+#include <functional>
 #include <memory>
+#include <optional>
 
 #include <SDL3/SDL.h>
 
+#include "input/ControllerMapping.h"
+#include "input/SteamInputEngine.h"
 #include "input/SdlDeviceClaim.h"
 #include "input/GenericHidWire.h"
 
@@ -37,6 +43,7 @@ class ControllerInput final : public QObject
     Q_PROPERTY(int vibrationIntensity READ vibrationIntensity WRITE setVibrationIntensity NOTIFY vibrationIntensityChanged)
     Q_PROPERTY(QVariantMap controllerProfiles READ controllerProfiles WRITE setControllerProfiles NOTIFY controllerProfilesChanged)
     Q_PROPERTY(bool leftStickNavigationEnabled READ leftStickNavigationEnabled WRITE setLeftStickNavigationEnabled NOTIFY leftStickNavigationEnabledChanged)
+    Q_PROPERTY(QVariantList steamMenus READ steamMenus NOTIFY steamMenusChanged)
 
 public:
     static constexpr quint32 syntheticControllerScanCode = 0x4f504e57;
@@ -94,6 +101,11 @@ public:
     void setControllerProfiles(const QVariantMap &profiles);
     [[nodiscard]] bool leftStickNavigationEnabled() const { return m_leftStickNavigationEnabled; }
     void setLeftStickNavigationEnabled(bool enabled);
+    // The radial and touch menus imported layouts have open, for drawing over the game.
+    [[nodiscard]] QVariantList steamMenus() const { return m_steamMenus; }
+    // Where pads' imported Steam layouts come from. A pad's profile names one by ID.
+    using LayoutProvider = std::function<std::optional<SteamInput::Config>(const QString &id)>;
+    void setLayoutProvider(LayoutProvider provider);
     Q_INVOKABLE QVariantMap stickSample(quint32 instanceId) const;
     Q_INVOKABLE bool testRumble(quint32 instanceId);
     [[nodiscard]] static QString profileKey(quint16 vendor, quint16 product, const char *serial, SDL_GUID guid);
@@ -107,6 +119,8 @@ public slots:
     void setGenericHidAdmission(quint8 slot, quint64 incarnation, GenericHidAdmission admission);
     void resetGenericHidAdmissions();
     void handleGenericHidOutput(const GenericHidReport &report);
+    // Looks every pad's layout up again, after layouts were imported or removed.
+    void reloadLayouts();
     void stopGenericHidOutput();
 
 signals:
@@ -138,6 +152,13 @@ signals:
     void inputDiagnostic(const QString &message);
     void sonySnapshot(const ControllerInput::SonySnapshot &snapshot);
     void localActionRequested(quint32 action);
+    void mappedMouseMotion(qint16 deltaX, qint16 deltaY);
+    void mappedMouseButton(quint8 button, bool pressed);
+    void mappedKey(quint16 virtualKey, bool pressed);
+    // A point of the stream, as fractions of its width and height from the top left.
+    void mappedMouseAbsolute(double x, double y);
+    void mappedMouseWheel(qint16 deltaX, qint16 deltaY);
+    void steamMenusChanged();
 
 private slots:
     void poll();
@@ -182,10 +203,44 @@ private:
         qint64 chordDeadline = 0;
         quint64 chordStartedNs = 0;
         qint64 tapReleaseAt = 0;
+        struct MappedTouchpad {
+            bool down = false;
+            QPointF position;
+            QPointF stick;
+        };
+        ControllerMapping::Profile mapping;
+        QStringList extraButtonNames;
+        bool hasGyro = false;
+        int touchpadCount = 0;
+        quint32 extraHeld = 0;
+        quint16 mappedButtons = 0;
+        bool mappedLeftTrigger = false;
+        bool mappedRightTrigger = false;
+        std::array<bool, 4> mappedMouseButtons{};
+        QList<quint16> mappedKeys;
+        std::array<MappedTouchpad, 2> touchpads{};
+        quint64 gyroSampleNs = 0;
+        QPointF gyroStick;
+        qint64 gyroStickAt = 0;
+        QPointF pointerPending;
+        QPointF pointerRemainder;
+        bool mappingDirty = false;
+        // An imported Steam layout, which then decides everything this pad sends.
+        QString layoutId;
+        std::optional<SteamInput::Engine> layout;
+        SteamInput::Engine::Pad layoutPad;
+        float layoutGyroPitch = 0.0f;
+        float layoutGyroYaw = 0.0f;
+        double layoutGyroInterval = 0.0;
+        quint64 layoutGyroSampleNs = 0;
+        QPointF layoutPointerRemainder;
+        bool layoutDirty = false;
         [[nodiscard]] quint16 forwardedButtons() const
         {
-            return static_cast<quint16>((buttons | tappedButtons) & ~withheldButtons);
+            return static_cast<quint16>(((buttons | tappedButtons) & ~withheldButtons) | mappedButtons);
         }
+        [[nodiscard]] quint8 forwardedLeftTrigger() const { return mappedLeftTrigger ? 255 : leftTrigger; }
+        [[nodiscard]] quint8 forwardedRightTrigger() const { return mappedRightTrigger ? 255 : rightTrigger; }
         std::array<SonyContact, 2> contacts{};
         QHash<int, ShellKeyPress> shellKeys;
         std::array<RepeatingDirection, 4> directions{{
@@ -198,6 +253,19 @@ private:
     void handleButton(const SDL_GamepadButtonEvent &event, bool pressed);
     void handleAxis(const SDL_GamepadAxisEvent &event);
     void handleTouchpad(const SDL_GamepadTouchpadEvent &event);
+    void handleMappedTouchpad(int slotIndex, const SDL_GamepadTouchpadEvent &event);
+    void handleSensor(const SDL_GamepadSensorEvent &event);
+    [[nodiscard]] bool streamOwnsSlot(const GamepadSlot &slot) const;
+    [[nodiscard]] bool gyroActive(const GamepadSlot &slot) const;
+    bool applyMapping(int slotIndex);
+    void releaseMappedOutputs(int slotIndex);
+    bool flushMappedMotion(int slotIndex, qint64 now);
+    void updateSensorState(const GamepadSlot &slot) const;
+    [[nodiscard]] QPair<qint16, qint16> outputStick(const GamepadSlot &slot, bool right) const;
+    [[nodiscard]] SteamInput::Report layoutReport(const GamepadSlot &slot) const;
+    bool runLayout(int slotIndex, bool fresh);
+    bool sendLayoutOutput(int slotIndex, const SteamInput::Engine::Output &output);
+    void refreshSteamMenus();
     void sampleSonyContacts(int slotIndex);
     void publishSonySnapshot(int slotIndex, bool neutral = false);
     void publishConnectedSony(bool neutral = false);
@@ -255,6 +323,8 @@ private:
     int m_rightStickDeadzone = 5;
     int m_vibrationIntensity = 100;
     QVariantMap m_controllerProfiles;
+    LayoutProvider m_layoutProvider;
+    QVariantList m_steamMenus;
     bool m_leftStickNavigationEnabled = true;
     qint64 m_lastControllerMetadataAt = 0;
     qint64 m_lastGamepadSnapshotAt = 0;
