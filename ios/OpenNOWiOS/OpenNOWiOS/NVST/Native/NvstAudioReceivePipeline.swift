@@ -25,6 +25,8 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
         public var datagramBytes: UInt64 = 0
         /// Interleaved samples the decoder actually produced.
         public var decodedSamples: UInt64 = 0
+        /// Decoded samples dropped because they arrived too late to play without adding delay.
+        public var lateSamplesDropped: UInt64 = 0
         public var ssrc: UInt32?
     }
 
@@ -132,6 +134,7 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
             sampleOffset = 0
         }
         bufferedSamples.append(contentsOf: drain(jitter.advance()))
+        dropLateBacklog(beyond: sampleCount)
         let count = min(sampleCount, bufferedSamples.count)
         sampleOffset = count
         return Array(bufferedSamples.prefix(count))
@@ -177,6 +180,26 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
         }
         return output
     }
+
+    /// Nothing downstream plays faster than real time, so audio that arrives late would otherwise
+    /// play late for the rest of the session: a network pause renders as silence, the burst that
+    /// follows it is queued behind the device, and every later pause adds to the delay. Once more
+    /// than `maximumBacklogFrames` is queued beyond this render, the oldest is dropped back down to
+    /// `targetBacklogFrames` — one audible skip in place of a delay that never goes away.
+    private func dropLateBacklog(beyond sampleCount: Int) {
+        let backlog = bufferedSamples.count - sampleCount
+        guard backlog > Self.maximumBacklogFrames * channels else { return }
+        let excess = backlog - Self.targetBacklogFrames * channels
+        let dropped = excess - excess % channels
+        bufferedSamples.removeFirst(dropped)
+        counters.lateSamplesDropped &+= UInt64(dropped)
+    }
+
+    /// 60 ms at 48 kHz: well past ordinary arrival jitter and render quanta, short of a delay a
+    /// player hears against the picture.
+    static let maximumBacklogFrames = 2_880
+    /// 20 ms at 48 kHz, so one trim does not leave the device on the edge of running dry.
+    static let targetBacklogFrames = 960
 
     private func silence() -> [Float] {
         [Float](repeating: 0, count: framesPerPacket * channels)

@@ -457,3 +457,85 @@ private final class AudioTrackBox: @unchecked Sendable {
     var reportedCount: Int? { lock.withLock { trackCount } }
     func record(_ count: Int) { lock.withLock { trackCount = count } }
 }
+
+/// What the player hears after the network pauses and then delivers everything it held at once.
+@Suite struct NvstAudioPlayoutLatencyTests {
+    /// Samples the device asks for on each 5 ms render: 240 stereo frames.
+    private static let renderSamples = 480
+
+    @Test func aBurstAfterANetworkPauseDoesNotLeaveAudioPermanentlyBehind() throws {
+        let (seat, receiver) = try Self.seatAndReceiver()
+        let tone = (0..<Self.renderSamples).map { Float(sin(Double($0 / 2) * 0.05)) * 0.3 }
+        func deliver(_ count: Int) { for _ in 0..<count { seat.push(capturedPCM: tone).forEach(receiver.ingest) } }
+        func render() -> Int { receiver.pull(sampleCount: Self.renderSamples).count }
+
+        // Steady play: one packet arrives for every render.
+        for _ in 0..<40 { deliver(1); _ = render() }
+        // The network pauses for 300 ms while the device keeps rendering...
+        for _ in 0..<60 { _ = render() }
+        // ...then delivers the 60 packets it held over two renders, and play continues steadily.
+        deliver(30); _ = render()
+        deliver(30); _ = render()
+        for _ in 0..<200 { deliver(1); _ = render() }
+
+        // Whatever is still queued once the seat stops sending is how far behind the player is.
+        var queuedRenders = 0
+        while render() > 0, queuedRenders < 1_000 { queuedRenders += 1 }
+        let behindMs = queuedRenders * 5
+        #expect(behindMs <= 60, "playback is still \(behindMs) ms behind the seat after a 300 ms pause")
+        #expect(receiver.snapshot.lateSamplesDropped > 0)
+    }
+
+    @Test func packetsThatNeverArriveDoNotLeaveAudioPermanentlyBehindEither() throws {
+        let (seat, receiver) = try Self.seatAndReceiver()
+        let tone = [Float](repeating: 0.1, count: Self.renderSamples)
+        func deliver(_ count: Int) { for _ in 0..<count { seat.push(capturedPCM: tone).forEach(receiver.ingest) } }
+        func render() -> Int { receiver.pull(sampleCount: Self.renderSamples).count }
+
+        for _ in 0..<40 { deliver(1); _ = render() }
+        // 300 ms of packets are lost outright: the seat sent them, nothing arrived, and the device
+        // played the gap as silence. The jitter buffer then conceals the whole gap at once.
+        for _ in 0..<60 { _ = seat.push(capturedPCM: tone); _ = render() }
+        for _ in 0..<200 { deliver(1); _ = render() }
+
+        var queuedRenders = 0
+        while render() > 0, queuedRenders < 1_000 { queuedRenders += 1 }
+        #expect(queuedRenders * 5 <= 60, "playback is still \(queuedRenders * 5) ms behind after 300 ms of loss")
+    }
+
+    /// Arrival jitter, a pause that leaves a cushion just under the limit, and render quanta from
+    /// 5 ms up to the 4096-frame slice iOS uses with the screen locked: none of it is late enough
+    /// to drop. Driven on a 5 ms clock: the seat sends one packet per tick, each arrives up to
+    /// 15 ms late, and the device renders whenever its own clock reaches the next quantum.
+    @Test(arguments: [240, 1_024, 4_096])
+    func ordinaryJitterAndLargeRenderQuantaNeverDropAudio(framesPerRender: Int) throws {
+        let (seat, receiver) = try Self.seatAndReceiver()
+        let tone = [Float](repeating: 0.1, count: Self.renderSamples)
+        var inFlight: [(arrivesAt: Int, datagrams: [Data])] = []
+        var nextRenderFrame = framesPerRender
+        let pause = 200..<208 // 40 ms in which nothing arrives
+        for tick in 0..<2_000 {
+            let lateTicks = [0, 3, 0, 1, 2, 0, 0, 3, 1, 0][tick % 10]
+            inFlight.append((max(tick + lateTicks, pause.contains(tick) ? pause.upperBound : 0),
+                             seat.push(capturedPCM: tone)))
+            for packet in inFlight where packet.arrivesAt <= tick { packet.datagrams.forEach(receiver.ingest) }
+            inFlight.removeAll { $0.arrivesAt <= tick }
+            while (tick + 1) * 240 >= nextRenderFrame {
+                _ = receiver.pull(sampleCount: framesPerRender * 2)
+                nextRenderFrame += framesPerRender
+            }
+        }
+        #expect(receiver.snapshot.lateSamplesDropped == 0)
+    }
+
+    private static func seatAndReceiver() throws -> (NvstAudioSendPipeline, NvstAudioReceivePipeline) {
+        let profile = NVSTSrtpProfile.aesCm128HmacSha1_80
+        let key = Data((0..<profile.masterKeyLength).map { UInt8($0) })
+        let salt = Data((0..<profile.masterSaltLength).map { UInt8(0x40 + $0) })
+        let seat = try NvstAudioSendPipeline(srtp: try NvstAudioSrtp(masterKey: key, masterSalt: salt, profile: profile),
+                                             framesPerPacket: 240, channels: 2,
+                                             initialSequenceNumber: 100, initialTimestamp: 0)
+        let receiver = try NvstAudioReceivePipeline(srtp: try NvstAudioSrtp(masterKey: key, masterSalt: salt, profile: profile))
+        return (seat, receiver)
+    }
+}
