@@ -98,6 +98,8 @@ import Testing
         #expect(reception.packets > 0, "no packet arrived: \(bundleSeat.bundle.diagnosticSummary)")
         #expect(reception.discarded == 0, "packets failed authentication: \(bundleSeat.bundle.diagnosticSummary)")
         #expect(reception.samples > 0, "nothing decoded: \(bundleSeat.bundle.diagnosticSummary)")
+        let playout = try #require(bundleSeat.bundle.audioPlayout())
+        #expect(playout.summary.contains(" restarts=0 "), "\(playout.summary)")
     }
 
     @Test func theBundleSendsCapturedMicrophoneAudioEncryptedWithItsClientKeys() async throws {
@@ -458,84 +460,181 @@ private final class AudioTrackBox: @unchecked Sendable {
     func record(_ count: Int) { lock.withLock { trackCount = count } }
 }
 
-/// What the player hears after the network pauses and then delivers everything it held at once.
+/// How far behind the seat the player hears its audio, on a simulated 5 ms clock: the seat sends one
+/// packet per tick, the network delays or drops each one, and the device renders whenever its own
+/// clock reaches the next quantum, unless it has stopped.
 @Suite struct NvstAudioPlayoutLatencyTests {
-    /// Samples the device asks for on each 5 ms render: 240 stereo frames.
-    private static let renderSamples = 480
-
-    @Test func aBurstAfterANetworkPauseDoesNotLeaveAudioPermanentlyBehind() throws {
-        let (seat, receiver) = try Self.seatAndReceiver()
-        let tone = (0..<Self.renderSamples).map { Float(sin(Double($0 / 2) * 0.05)) * 0.3 }
-        func deliver(_ count: Int) { for _ in 0..<count { seat.push(capturedPCM: tone).forEach(receiver.ingest) } }
-        func render() -> Int { receiver.pull(sampleCount: Self.renderSamples).count }
-
-        // Steady play: one packet arrives for every render.
-        for _ in 0..<40 { deliver(1); _ = render() }
-        // The network pauses for 300 ms while the device keeps rendering...
-        for _ in 0..<60 { _ = render() }
-        // ...then delivers the 60 packets it held over two renders, and play continues steadily.
-        deliver(30); _ = render()
-        deliver(30); _ = render()
-        for _ in 0..<200 { deliver(1); _ = render() }
-
-        // Whatever is still queued once the seat stops sending is how far behind the player is.
-        var queuedRenders = 0
-        while render() > 0, queuedRenders < 1_000 { queuedRenders += 1 }
-        let behindMs = queuedRenders * 5
-        #expect(behindMs <= 60, "playback is still \(behindMs) ms behind the seat after a 300 ms pause")
-        #expect(receiver.snapshot.lateSamplesDropped > 0)
-    }
-
-    @Test func packetsThatNeverArriveDoNotLeaveAudioPermanentlyBehindEither() throws {
-        let (seat, receiver) = try Self.seatAndReceiver()
-        let tone = [Float](repeating: 0.1, count: Self.renderSamples)
-        func deliver(_ count: Int) { for _ in 0..<count { seat.push(capturedPCM: tone).forEach(receiver.ingest) } }
-        func render() -> Int { receiver.pull(sampleCount: Self.renderSamples).count }
-
-        for _ in 0..<40 { deliver(1); _ = render() }
-        // 300 ms of packets are lost outright: the seat sent them, nothing arrived, and the device
-        // played the gap as silence. The jitter buffer then conceals the whole gap at once.
-        for _ in 0..<60 { _ = seat.push(capturedPCM: tone); _ = render() }
-        for _ in 0..<200 { deliver(1); _ = render() }
-
-        var queuedRenders = 0
-        while render() > 0, queuedRenders < 1_000 { queuedRenders += 1 }
-        #expect(queuedRenders * 5 <= 60, "playback is still \(queuedRenders * 5) ms behind after 300 ms of loss")
-    }
-
-    /// Arrival jitter, a pause that leaves a cushion just under the limit, and render quanta from
-    /// 5 ms up to the 4096-frame slice iOS uses with the screen locked: none of it is late enough
-    /// to drop. Driven on a 5 ms clock: the seat sends one packet per tick, each arrives up to
-    /// 15 ms late, and the device renders whenever its own clock reaches the next quantum.
-    @Test(arguments: [240, 1_024, 4_096])
-    func ordinaryJitterAndLargeRenderQuantaNeverDropAudio(framesPerRender: Int) throws {
-        let (seat, receiver) = try Self.seatAndReceiver()
-        let tone = [Float](repeating: 0.1, count: Self.renderSamples)
-        var inFlight: [(arrivesAt: Int, datagrams: [Data])] = []
-        var nextRenderFrame = framesPerRender
-        let pause = 200..<208 // 40 ms in which nothing arrives
-        for tick in 0..<2_000 {
-            let lateTicks = [0, 3, 0, 1, 2, 0, 0, 3, 1, 0][tick % 10]
-            inFlight.append((max(tick + lateTicks, pause.contains(tick) ? pause.upperBound : 0),
-                             seat.push(capturedPCM: tone)))
-            for packet in inFlight where packet.arrivesAt <= tick { packet.datagrams.forEach(receiver.ingest) }
-            inFlight.removeAll { $0.arrivesAt <= tick }
-            while (tick + 1) * 240 >= nextRenderFrame {
-                _ = receiver.pull(sampleCount: framesPerRender * 2)
-                nextRenderFrame += framesPerRender
+    private struct Run {
+        let receiver: NvstAudioReceivePipeline
+        /// Starved frames counted at each tick, to tell when the device last ran dry.
+        var starvedByTick: [UInt64] = []
+        /// Audio queued on the device at the end of each second, in milliseconds.
+        var queuedMsBySecond: [Int] = []
+        var queuedMs: Int { queuedMsBySecond.last ?? 0 }
+        func starvedMs(since second: Int) -> Int { Int((starvedByTick.last! - starvedByTick[second * 200]) / 48) }
+        var starvedMsBySecond: [Int] {
+            stride(from: 0, to: starvedByTick.count, by: 200).map { start in
+                Int((starvedByTick[min(start + 199, starvedByTick.count - 1)] - (start > 0 ? starvedByTick[start - 1] : 0)) / 48)
             }
         }
-        #expect(receiver.snapshot.lateSamplesDropped == 0)
     }
 
-    private static func seatAndReceiver() throws -> (NvstAudioSendPipeline, NvstAudioReceivePipeline) {
+    private static func play(seconds: Int, framesPerRender: Int = 240,
+                             deviceStopped: (Int) -> Bool = { _ in false },
+                             discardsOnRestart: Bool = false,
+                             arrivalTick: (Int) -> Int? = { $0 }) throws -> Run {
         let profile = NVSTSrtpProfile.aesCm128HmacSha1_80
         let key = Data((0..<profile.masterKeyLength).map { UInt8($0) })
         let salt = Data((0..<profile.masterSaltLength).map { UInt8(0x40 + $0) })
         let seat = try NvstAudioSendPipeline(srtp: try NvstAudioSrtp(masterKey: key, masterSalt: salt, profile: profile),
                                              framesPerPacket: 240, channels: 2,
                                              initialSequenceNumber: 100, initialTimestamp: 0)
-        let receiver = try NvstAudioReceivePipeline(srtp: try NvstAudioSrtp(masterKey: key, masterSalt: salt, profile: profile))
-        return (seat, receiver)
+        var run = Run(receiver: try NvstAudioReceivePipeline(srtp: try NvstAudioSrtp(masterKey: key, masterSalt: salt, profile: profile)))
+        let tone = (0..<480).map { Float(sin(Double($0 / 2) * 0.05)) * 0.3 }
+        var inFlight: [(arrivesAt: Int, datagrams: [Data])] = []
+        var nextRenderFrame = framesPerRender
+        for tick in 0..<(seconds * 200) {
+            let datagrams = seat.push(capturedPCM: tone)
+            if let arrival = arrivalTick(tick) { inFlight.append((arrival, datagrams)) }
+            for packet in inFlight where packet.arrivesAt <= tick { packet.datagrams.forEach(run.receiver.ingest) }
+            inFlight.removeAll { $0.arrivesAt <= tick }
+            if deviceStopped(tick) {
+                // A stopped device's clock still runs; it just asks for nothing.
+                nextRenderFrame = (tick + 1) * 240 + framesPerRender
+            } else if tick > 0, deviceStopped(tick - 1), discardsOnRestart {
+                run.receiver.discardQueuedAudio()
+            }
+            while (tick + 1) * 240 >= nextRenderFrame {
+                _ = run.receiver.pull(sampleCount: framesPerRender * 2)
+                nextRenderFrame += framesPerRender
+            }
+            run.starvedByTick.append(run.receiver.snapshot.starvedFrames)
+            if (tick + 1) % 200 == 0 { run.queuedMsBySecond.append(run.receiver.drainQueuedFrames().current / 48) }
+        }
+        return run
+    }
+
+    @Test func theQueueReadingCountsWhatTheJitterBufferAndTheDeviceQueueHold() throws {
+        let run = try Self.play(seconds: 1, deviceStopped: { $0 >= 100 }) { $0 }
+        // A device that stopped half a second in holds what arrived since, up to the jitter
+        // buffer's 50-packet ceiling: 250 ms.
+        #expect(run.queuedMs == 250)
+        #expect(run.receiver.overflowDropCount > 0)
+    }
+
+    @Test func aBurstAfterANetworkPauseCatchesBackUpWithinSeconds() throws {
+        // 300 ms in which nothing arrives, then everything held arrives at once.
+        let run = try Self.play(seconds: 10) { (200..<260).contains($0) ? 260 : $0 }
+        // Kept as a cushion against the next pause, but never past the 150 ms ceiling...
+        #expect((100...150 + 15 + 10).contains(run.queuedMsBySecond[1]), "\(run.queuedMsBySecond)")
+        // ...and gone once five seconds have passed without another pause needing it.
+        #expect(run.queuedMs <= 25, "audio is still \(run.queuedMs) ms behind 8.7 s after a 300 ms pause: \(run.queuedMsBySecond)")
+        #expect(run.receiver.snapshot.trimmedFrames > 0)
+    }
+
+    @Test func packetsThatNeverArriveAreNotPlayedAsSilenceTwice() throws {
+        // 300 ms of packets lost outright. The device already played that time as silence while it
+        // waited, so nothing is left to catch up and nothing should need trimming.
+        let run = try Self.play(seconds: 2) { (200..<260).contains($0) ? nil : $0 }
+        #expect(run.queuedMs <= 25, "audio is \(run.queuedMs) ms behind the seat after 300 ms of loss")
+        #expect(run.receiver.snapshot.lostPacketsAlreadyPlayed >= 55)
+        #expect(run.receiver.snapshot.trimmedFrames == 0)
+    }
+
+    /// An outage where the first packets come late and the rest never come: the late ones end the
+    /// silence before the losses are declared, so those are concealed and queue up as silence.
+    /// That queue may never stand past the 150 ms ceiling.
+    @Test func anOutageWithAFewLatePacketsDoesNotQueueItsSilence() throws {
+        let run = try Self.play(seconds: 14) { tick in
+            if (1_000..<1_020).contains(tick) { return 1_400 }
+            return (1_020..<1_400).contains(tick) ? nil : tick
+        }
+        #expect(run.queuedMsBySecond.max()! <= 150 + 15 + 10, "\(run.queuedMsBySecond)")
+        #expect(run.queuedMs <= 25, "\(run.queuedMsBySecond)")
+    }
+
+    /// Once the stretch of silence is over, a later loss is concealed in place: credit from an
+    /// old pause must not turn it into a skip that leaves the device short.
+    @Test func aLossAfterAPauseIsConcealedRatherThanSkipped() throws {
+        let losses: Set<Int> = [700, 900, 1_100, 1_300, 1_500]
+        let run = try Self.play(seconds: 9) { tick in
+            if losses.contains(tick) { return nil }
+            return (200..<220).contains(tick) ? 220 : tick
+        }
+        #expect(run.receiver.snapshot.lostPacketsAlreadyPlayed == 0)
+        #expect(run.starvedMs(since: 3) == 0, "the device ran dry \(run.starvedMs(since: 3)) ms after the pause")
+    }
+
+    /// Ordinary arrival jitter of up to 15 ms and render quanta up to the 4096-frame slice iOS uses
+    /// with the screen locked: once the queue has settled the device never runs dry, so nothing
+    /// that was trimmed was needed.
+    @Test(arguments: [240, 1_024, 4_096])
+    func ordinaryJitterNeverRunsTheDeviceDryOnceSettled(framesPerRender: Int) throws {
+        let pattern = [0, 3, 0, 1, 2, 0, 0, 3, 1, 0]
+        let run = try Self.play(seconds: 12, framesPerRender: framesPerRender) { tick in
+            // A 40 ms pause one second in, on top of the jitter.
+            let arrival = tick + pattern[tick % pattern.count]
+            return (200..<208).contains(tick) ? max(arrival, 208) : arrival
+        }
+        #expect(run.starvedMs(since: 2) == 0, "the device ran dry \(run.starvedMs(since: 2)) ms after settling")
+        #expect(run.queuedMs <= 15 + framesPerRender / 48 + 10)
+    }
+
+    /// Pauses this iPad's Wi-Fi takes when the Mac's peer-to-peer link wakes: 50 ms every 600 ms.
+    /// The cushion they need is never trimmed. With large render quanta a pause can still meet the
+    /// renders worse than any before it once, which only the cushion growing again can cover.
+    @Test(arguments: [240, 1_024, 4_096])
+    func repeatedPausesKeepTheirCushionInsteadOfSkippingEveryTime(framesPerRender: Int) throws {
+        let run = try Self.play(seconds: 10, framesPerRender: framesPerRender) { tick in
+            let phase = tick % 120
+            return phase < 10 ? tick - phase + 10 : tick
+        }
+        #expect(run.receiver.snapshot.trimmedFrames == 0)
+        #expect(run.starvedMs(since: 2) <= (framesPerRender == 240 ? 0 : framesPerRender / 48),
+                "ran dry by second: \(run.starvedMsBySecond) queued: \(run.queuedMsBySecond)")
+        #expect(run.queuedMs <= 50 + framesPerRender / 48 + 15 + 10)
+    }
+
+    /// Pauses of 30 to 140 ms, one to three seconds apart: further apart than one window, so a
+    /// cushion kept for only a second would be gone before nearly every one of them.
+    @Test(arguments: [240, 1_024, 4_096])
+    func irregularPausesSecondsApartKeepTheirCushion(framesPerRender: Int) throws {
+        let lengths = [60, 140, 80, 30, 120, 100, 70, 130]
+        let gaps = [1_500, 2_500, 1_000, 3_000, 2_000, 1_200, 2_800, 1_700]
+        var pauses: [Range<Int>] = []
+        var at = 400, index = 0
+        while at < 40 * 200 {
+            pauses.append(at..<(at + lengths[index % lengths.count] / 5))
+            at += gaps[index % gaps.count] / 5
+            index += 1
+        }
+        let run = try Self.play(seconds: 40, framesPerRender: framesPerRender) { tick in
+            pauses.first { $0.contains(tick) }?.upperBound ?? tick
+        }
+        let pausedMs = pauses.filter { $0.lowerBound >= 10 * 200 }.reduce(0) { $0 + $1.count * 5 }
+        // Only a pause longer than any in the last five seconds should play as silence at all.
+        #expect(run.starvedMs(since: 10) * 5 <= pausedMs,
+                "ran dry \(run.starvedMs(since: 10)) ms over \(pausedMs) ms of pauses, trimmed \(run.receiver.snapshot.trimmedFrames / 48) ms: \(run.starvedMsBySecond)")
+        #expect(run.queuedMsBySecond.max()! <= 150 + framesPerRender / 48 + 15 + 10)
+    }
+
+    /// The audio output being rebuilt (a route change, the end of an interruption) stops renders
+    /// while audio keeps arriving. Before this, each one added the 250 ms that queued meanwhile, for
+    /// good. A rebuild the device reports discards what queued during it.
+    @Test func reportedDeviceRebuildsDiscardWhatQueuedWhileStopped() throws {
+        let stops = (0..<6).map { (400 + $0 * 400)..<(460 + $0 * 400) }
+        let run = try Self.play(seconds: 20, deviceStopped: { tick in stops.contains { $0.contains(tick) } },
+                                discardsOnRestart: true)
+        #expect(run.queuedMsBySecond.max()! <= 25, "\(run.queuedMsBySecond)")
+        #expect(run.receiver.snapshot.trimmedFrames > 0)
+    }
+
+    /// A stop nothing reports, such as render cycles the system skipped, is left to the playout
+    /// level: it may cost delay for a few seconds but never accumulates.
+    @Test func unreportedDeviceStopsDoNotAccumulateDelay() throws {
+        let stops = (0..<6).map { (400 + $0 * 400)..<(460 + $0 * 400) }
+        let run = try Self.play(seconds: 20, deviceStopped: { tick in stops.contains { $0.contains(tick) } })
+        #expect(run.queuedMsBySecond.max()! <= 150 + 250 + 25, "\(run.queuedMsBySecond)")
+        #expect(run.queuedMs <= 25, "audio is still \(run.queuedMs) ms behind after six device stops: \(run.queuedMsBySecond)")
     }
 }

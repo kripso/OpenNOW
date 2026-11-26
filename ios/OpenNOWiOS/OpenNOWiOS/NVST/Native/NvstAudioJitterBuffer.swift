@@ -26,6 +26,9 @@ public struct NvstAudioJitterBuffer: Sendable {
     private var highestExtended: UInt64?
     private var nextExpected: UInt64?
     private(set) public var lostPacketCount = 0
+    /// Packets dropped because the buffer reached `maximumDepth`: what arrived while nothing was
+    /// being played out, such as an audio device that had stopped.
+    private(set) public var overflowDropCount = 0
 
     /// Cumulative time the emitted packets spent waiting, and how many were emitted. These are the
     /// counters the HUD's A/V reading is computed from — the same two libwebrtc's NetEq reported, so
@@ -71,6 +74,18 @@ public struct NvstAudioJitterBuffer: Sendable {
         return emitted
     }
 
+    /// Emits the packets that are already here in sequence, below the reorder depth, stopping at the
+    /// first one still missing. Called when the device would otherwise play silence: holding them
+    /// back then only delays them, and a gap is still left open for a late or repeated packet.
+    public mutating func releaseReady() -> [Emission] {
+        var emitted: [Emission] = []
+        while let expected = nextExpected, pending[expected] != nil {
+            emitted.append(emit(expected))
+            nextExpected = expected + 1
+        }
+        return emitted
+    }
+
     /// Emits whatever is left, reporting the gaps between the remaining packets. Called when the
     /// stream ends, where holding the tail would simply lose it.
     public mutating func flush() -> [Emission] {
@@ -88,6 +103,14 @@ public struct NvstAudioJitterBuffer: Sendable {
         pending.removeAll()
         nextExpected = expected
         return emitted
+    }
+
+    /// Drops what is held and carries on after the newest arrival, so a packet still in flight
+    /// from before is discarded as old rather than restarting the sequence behind it.
+    public mutating func discardPending() {
+        pending.removeAll()
+        arrivalTimes.removeAll()
+        nextExpected = highestExtended.map { $0 + 1 }
     }
 
     public mutating func reset() {
@@ -116,6 +139,7 @@ public struct NvstAudioJitterBuffer: Sendable {
             arrivalTimes.removeValue(forKey: oldest)
             if let expected = nextExpected, oldest >= expected { nextExpected = oldest + 1 }
             lostPacketCount += 1
+            overflowDropCount += 1
         }
     }
 

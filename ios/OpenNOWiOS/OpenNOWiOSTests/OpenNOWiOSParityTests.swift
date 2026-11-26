@@ -6448,6 +6448,69 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertTrue(different.detail.contains("requested 2048x1536"))
     }
 
+    func testReportCarriesHowFarBehindTheAudioWasEachSecondAndOverall() throws {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, decodedFps: 120,
+                                               audio: StreamAudioSecond(delayMs: 30)))
+        accumulator.record(StreamRuntimeSample(timestamp: 1, pingMs: 25, decodedFps: 120,
+                                               audio: StreamAudioSecond(delayMs: 320, starvedMs: 300, lostPackets: 4,
+                                                                        deviceRestarts: 1, missedRenderMs: 12)))
+        accumulator.record(StreamRuntimeSample(timestamp: 2, pingMs: 25, decodedFps: 120,
+                                               audio: StreamAudioSecond(delayMs: 40, trimmedMs: 280, interruptions: 1,
+                                                                        overflowDrops: 7)))
+        // The WebRTC path has no audio reading; a second without one leaves the figures alone.
+        accumulator.record(StreamRuntimeSample(timestamp: 3, pingMs: 25, decodedFps: 120))
+        let report = try XCTUnwrap(accumulator.finish())
+        XCTAssertEqual(report.audio, SessionAudioPlayout(averageDelayMs: 130, peakDelayMs: 320, starvedMs: 300,
+                                                         trimmedMs: 280, deviceRestarts: 1, lostPackets: 4,
+                                                         interruptions: 1, missedRenderMs: 12, overflowDrops: 7))
+
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(report)) as? [String: Any]
+        let timeline = try XCTUnwrap(json?["timeline"] as? [String: Any])
+        let columns = try XCTUnwrap(timeline["columns"] as? [String])
+        let rows = try XCTUnwrap(timeline["rows"] as? [[Int]])
+        func column(_ name: String) throws -> [Int] {
+            let index = try XCTUnwrap(columns.firstIndex(of: name), name)
+            return rows.map { $0[index] }
+        }
+        XCTAssertEqual(try column("peakAudioDelayMs"), [30, 320, 40, -1])
+        XCTAssertEqual(try column("audioStarvedMs"), [0, 300, 0, -1])
+        XCTAssertEqual(try column("audioTrimmedMs"), [0, 0, 280, -1])
+        XCTAssertEqual(try column("audioLostPackets"), [0, 4, 0, -1])
+        XCTAssertEqual(try column("audioDeviceRestarts"), [0, 1, 0, -1])
+        XCTAssertEqual(try column("audioMissedRenderMs"), [0, 12, 0, -1])
+        XCTAssertEqual(columns.last, "phase")
+        XCTAssertNotNil(json?["audio"])
+    }
+
+    func testAudioReadingsAreDifferencedFromOneConnectionsRunningTotals() {
+        var playout = NvstNativeBundle.AudioPlayout(peakQueuedMs: 18, queuedMs: 10, outputLatencyMs: 6)
+        playout.starvedFrames = 4_800        // 100 ms
+        playout.trimmedFrames = 47           // under 1 ms
+        playout.continuity.restarts = 1
+        let first = StreamAudioSecond.totals(of: playout)
+        // Nothing before the first reading of a connection: its totals are the change.
+        XCTAssertEqual(first.since(nil), first)
+        XCTAssertEqual(first.delayMs, 24)
+        playout.starvedFrames = 9_600
+        playout.trimmedFrames = 95           // 1.98 ms in all: the second reading takes the 1 ms
+        let second = StreamAudioSecond.totals(of: playout)
+        let change = second.since(first)
+        XCTAssertEqual(change.starvedMs, 100)
+        XCTAssertEqual(change.trimmedMs, 1)
+        XCTAssertEqual(change.deviceRestarts, 0)
+        // A new connection starts its totals again; its first reading is the change.
+        let reconnected = StreamAudioSecond.totals(of: NvstNativeBundle.AudioPlayout())
+        XCTAssertEqual(reconnected.since(second), reconnected)
+    }
+
+    func testReportWithoutAudioReadingsLeavesTheAudioSectionOut() throws {
+        let accumulator = StreamSessionReportAccumulator(launchProfile: Self.launchProfile())
+        accumulator.record(StreamRuntimeSample(timestamp: 0, pingMs: 25, decodedFps: 120))
+        let report = try XCTUnwrap(accumulator.finish())
+        XCTAssertNil(report.audio)
+    }
+
     @MainActor
     func testMidSessionResolutionPickReopensTheStreamWithThatSize() {
         var settings = AppSettings.default

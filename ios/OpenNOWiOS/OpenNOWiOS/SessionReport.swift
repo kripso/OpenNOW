@@ -224,6 +224,8 @@ struct StreamRuntimeSample: Equatable {
     /// and the latest of them.
     var lateFrames: Int? = nil
     var longestFrameLatenessMs: Double? = nil
+    /// The native receiver's audio this second; the WebRTC path has none.
+    var audio: StreamAudioSecond? = nil
     /// The transport's own running counters as one line of text: loss, repairs, keyframe requests.
     var transportDetail: String? = nil
 
@@ -236,6 +238,59 @@ struct StreamRuntimeSample: Equatable {
             || decodeMs != nil
             || jitterMs != nil
             || packetLossPercent != nil
+    }
+}
+
+/// The native receiver's audio over one reading: its worst delay, and what happened since the
+/// previous reading.
+struct StreamAudioSecond: Equatable {
+    /// The receiver's audio delay at worst: what was queued on this device between the network
+    /// and the speaker, plus the output route's own latency. Network latency comes on top.
+    var delayMs: Int
+    /// Silence the device played because nothing had arrived (late or lost audio), and audio
+    /// removed because it had queued up behind the device without being needed.
+    var starvedMs = 0
+    var trimmedMs = 0
+    /// Packets that never arrived, whether concealed or skipped.
+    var lostPackets = 0
+    /// Times the audio output was torn down and rebuilt; audio keeps arriving meanwhile.
+    var deviceRestarts = 0
+    var interruptions = 0
+    /// Hardware clock time that passed without a render, outside rebuilds.
+    var missedRenderMs = 0
+    /// Packets dropped because nothing was playing them out.
+    var overflowDrops = 0
+
+    /// The bundle's running totals, in whole milliseconds before any differencing, so the seconds
+    /// add up to the totals.
+    static func totals(of playout: NvstNativeBundle.AudioPlayout) -> StreamAudioSecond {
+        StreamAudioSecond(delayMs: Int(playout.peakDelayMs.rounded()),
+                          starvedMs: Int(clamping: playout.starvedFrames / 48),
+                          trimmedMs: Int(clamping: playout.trimmedFrames / 48),
+                          lostPackets: Int(clamping: playout.lostPackets),
+                          deviceRestarts: playout.continuity.restarts,
+                          interruptions: playout.continuity.interruptions,
+                          missedRenderMs: Int(clamping: max(0, playout.continuity.missedRenderFrames) / 48),
+                          overflowDrops: playout.overflowDrops)
+    }
+
+    /// What changed since `previous`, the totals of the reading before. The totals belong to one
+    /// connection and start at zero, so with no previous reading the totals themselves are the
+    /// change; if any went backwards a new connection has begun, and the same holds.
+    func since(_ previous: StreamAudioSecond?) -> StreamAudioSecond {
+        guard let previous,
+              starvedMs >= previous.starvedMs, trimmedMs >= previous.trimmedMs,
+              lostPackets >= previous.lostPackets, deviceRestarts >= previous.deviceRestarts,
+              interruptions >= previous.interruptions, missedRenderMs >= previous.missedRenderMs,
+              overflowDrops >= previous.overflowDrops else { return self }
+        return StreamAudioSecond(delayMs: delayMs,
+                                 starvedMs: starvedMs - previous.starvedMs,
+                                 trimmedMs: trimmedMs - previous.trimmedMs,
+                                 lostPackets: lostPackets - previous.lostPackets,
+                                 deviceRestarts: deviceRestarts - previous.deviceRestarts,
+                                 interruptions: interruptions - previous.interruptions,
+                                 missedRenderMs: missedRenderMs - previous.missedRenderMs,
+                                 overflowDrops: overflowDrops - previous.overflowDrops)
     }
 }
 
@@ -399,6 +454,13 @@ struct SessionTimelineRow: Equatable {
     var displayTicks: Int?
     var lateFrames: Int?
     var longestFrameLatenessMs: Int?
+    /// The receiver's audio delay at worst, and what lay behind it (see `StreamAudioSecond`).
+    var peakAudioDelayMs: Int?
+    var audioStarvedMs: Int?
+    var audioTrimmedMs: Int?
+    var audioLostPackets: Int?
+    var audioDeviceRestarts: Int?
+    var audioMissedRenderMs: Int?
     /// 0 in front since the start, 1 back after being away, 2 away.
     var phase = 0
 
@@ -410,6 +472,8 @@ struct SessionTimelineRow: Equatable {
         "wifiPackets", "peerToPeerPackets", "lowLatencyLinkPackets", "smoothingDelayMs",
         "sourceStutters", "unevenFrames", "presentedOneLate", "presentedTwoLate", "pacedFrames",
         "longestTickDelayMs", "longestDrawableWaitMs", "longestGpuMs",
+        "peakAudioDelayMs", "audioStarvedMs", "audioTrimmedMs", "audioLostPackets", "audioDeviceRestarts",
+        "audioMissedRenderMs",
         "displayTicks", "lateFrames", "longestFrameLatenessMs", "phase"
     ]
 
@@ -422,6 +486,8 @@ struct SessionTimelineRow: Equatable {
          wifiPackets ?? -1, peerToPeerPackets ?? -1, lowLatencyLinkPackets ?? -1, smoothingDelayMs ?? -1,
          sourceStutters ?? -1, unevenFrames ?? -1, presentedOneLate ?? -1, presentedTwoLate ?? -1, pacedFrames ?? -1,
          longestTickDelayMs ?? -1, longestDrawableWaitMs ?? -1, longestGpuMs ?? -1,
+         peakAudioDelayMs ?? -1, audioStarvedMs ?? -1, audioTrimmedMs ?? -1, audioLostPackets ?? -1,
+         audioDeviceRestarts ?? -1, audioMissedRenderMs ?? -1,
          displayTicks ?? -1, lateFrames ?? -1, longestFrameLatenessMs ?? -1, phase]
     }
 
@@ -466,6 +532,12 @@ struct SessionTimelineRow: Equatable {
         case .returned: phase = 1
         case .away: phase = 2
         }
+        peakAudioDelayMs = sample.audio?.delayMs
+        audioStarvedMs = sample.audio?.starvedMs
+        audioTrimmedMs = sample.audio?.trimmedMs
+        audioLostPackets = sample.audio?.lostPackets
+        audioDeviceRestarts = sample.audio?.deviceRestarts
+        audioMissedRenderMs = sample.audio?.missedRenderMs
     }
 
     mutating func absorb(_ next: SessionTimelineRow) {
@@ -510,6 +582,12 @@ struct SessionTimelineRow: Equatable {
         lateFrames = sum(lateFrames, next.lateFrames)
         longestFrameLatenessMs = worst(longestFrameLatenessMs, next.longestFrameLatenessMs, max)
         phase = max(phase, next.phase)
+        peakAudioDelayMs = worst(peakAudioDelayMs, next.peakAudioDelayMs, max)
+        audioStarvedMs = sum(audioStarvedMs, next.audioStarvedMs)
+        audioTrimmedMs = sum(audioTrimmedMs, next.audioTrimmedMs)
+        audioLostPackets = sum(audioLostPackets, next.audioLostPackets)
+        audioDeviceRestarts = sum(audioDeviceRestarts, next.audioDeviceRestarts)
+        audioMissedRenderMs = sum(audioMissedRenderMs, next.audioMissedRenderMs)
     }
 }
 
@@ -569,6 +647,25 @@ struct SessionReopen: Equatable, Encodable {
     var deliveredResolution: String? = nil
 }
 
+/// The receiver's share of the audio delay over the session, from the native receiver. Network
+/// latency to the seat comes on top.
+struct SessionAudioPlayout: Equatable, Encodable {
+    /// The audio queued between the network and the device plus the output route's latency, at
+    /// each second's worst.
+    var averageDelayMs: Int
+    var peakDelayMs: Int
+    /// Time the device played silence because nothing had arrived: late audio, or lost audio.
+    var starvedMs: Int
+    /// Audio removed because it had queued up behind the device and was never needed.
+    var trimmedMs: Int
+    /// Times the audio output was torn down and rebuilt, each letting audio queue up meanwhile.
+    var deviceRestarts = 0
+    var lostPackets = 0
+    var interruptions = 0
+    var missedRenderMs = 0
+    var overflowDrops = 0
+}
+
 struct SessionReport: Identifiable, Equatable, Encodable {
     let id = UUID()
     let gameTitle: String
@@ -617,6 +714,7 @@ struct SessionReport: Identifiable, Equatable, Encodable {
     var frameDeliveryRaisedLatency: SessionFrameDelivery? = nil
     /// The session second by second, for a report that is sent rather than shown.
     var timeline = SessionTimeline()
+    var audio: SessionAudioPlayout? = nil
 
     /// The chart needs enough points to say something true. Four points is a lie.
     var showsTrendChart: Bool { trend.count >= 8 }
@@ -702,6 +800,10 @@ final class StreamSessionReportAccumulator {
     private var networkKindCounts: [SessionNetworkKind: Int] = [:]
     private var trendSamples: [SessionReportTrendPoint] = []
     private var timeline = SessionTimeline()
+    private var audioDelayCount = 0
+    private var audioDelayTotal = 0
+    /// Each reading's figures summed, with the worst delay in place of a sum.
+    private var audioTotals = StreamAudioSecond(delayMs: 0)
     private var recoveryReason: String?
     private var finalProfile: StreamVideoProfile
     private var finalCodec: String
@@ -744,6 +846,18 @@ final class StreamSessionReportAccumulator {
         if let decodedFps = sample.decodedFps, decodedFps > 0 {
             decodedFpsCount += 1
             decodedFpsTotal += decodedFps
+        }
+        if let audio = sample.audio {
+            audioDelayCount += 1
+            audioDelayTotal += audio.delayMs
+            audioTotals.delayMs = max(audioTotals.delayMs, audio.delayMs)
+            audioTotals.starvedMs += audio.starvedMs
+            audioTotals.trimmedMs += audio.trimmedMs
+            audioTotals.lostPackets += audio.lostPackets
+            audioTotals.deviceRestarts += audio.deviceRestarts
+            audioTotals.interruptions += audio.interruptions
+            audioTotals.missedRenderMs += audio.missedRenderMs
+            audioTotals.overflowDrops += audio.overflowDrops
         }
         if let decode = sample.decodeMs, decode >= 0 {
             decodeCount += 1
@@ -936,7 +1050,14 @@ final class StreamSessionReportAccumulator {
             reopens: reopens,
             transportDetail: transportDetail,
             frameDeliveryRaisedLatency: frameDeliveryRaisedLatency.hasReadings ? frameDeliveryRaisedLatency : nil,
-            timeline: timeline
+            timeline: timeline,
+            audio: audioDelayCount > 0
+                ? SessionAudioPlayout(averageDelayMs: Int((Double(audioDelayTotal) / Double(audioDelayCount)).rounded()),
+                                      peakDelayMs: audioTotals.delayMs, starvedMs: audioTotals.starvedMs,
+                                      trimmedMs: audioTotals.trimmedMs, deviceRestarts: audioTotals.deviceRestarts,
+                                      lostPackets: audioTotals.lostPackets, interruptions: audioTotals.interruptions,
+                                      missedRenderMs: audioTotals.missedRenderMs, overflowDrops: audioTotals.overflowDrops)
+                : nil
         )
     }
 

@@ -3429,6 +3429,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var lastStatsBytesReceived: Int?
     private var lastStatsTotalDecodeTime: Double?
     private var lastStatsPacketsLost: Int?
+    private var lastAudioTotals: StreamAudioSecond?
     private var lastStatsPacketsReceived: Int?
     private var lastStatsReceiverCounters = NativeStreamReceiverCounters()
     private var sceneHasBeenAway = false
@@ -3803,6 +3804,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         updateWiFiPauseSmoothing(longestSilenceMilliseconds: sample.networkSilences.longestMilliseconds)
         let cadence = renderer?.drainFrameCadence()
         let late = renderer?.drainLateFrames()
+        let audioTotals = sample.audio.map(StreamAudioSecond.totals(of:))
         onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
             bitrateKbps: bitrate, jitterMs: sample.jitterMilliseconds, fps: decodedFPS, receivedFps: receivedFPS,
             decodedFps: decodedFPS, decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
@@ -3819,7 +3821,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             interfaces: drainInterfaceActivity(),
             smoothingDelayMs: appliedPlayoutDelayMs,
             lateFrames: late?.count, longestFrameLatenessMs: late?.longestMs,
+            audio: audioTotals?.since(lastAudioTotals),
             transportDetail: sample.detail + inputBridge.steamInputTiming))
+        lastAudioTotals = audioTotals
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }
@@ -4797,6 +4801,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         lastStatsFramesReceived = nil
         lastStatsFramesDecoded = nil
         lastStatsFramesRendered = nil
+        lastAudioTotals = nil
         lastStatsBytesReceived = nil
         lastStatsTotalDecodeTime = nil
         lastStatsPacketsLost = nil

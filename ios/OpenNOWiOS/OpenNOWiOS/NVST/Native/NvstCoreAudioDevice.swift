@@ -8,6 +8,18 @@ public struct NvstCaptureDeviceChange: Equatable, Sendable {
     public let isFallback: Bool
 }
 
+/// What happened to playout that the audio itself cannot show: the output unit being rebuilt,
+/// the session being interrupted, and render cycles the hardware skipped.
+public struct NvstPlayoutContinuity: Equatable, Sendable {
+    /// Rebuilds of the output unit after a route change, the end of an interruption, or a change
+    /// of microphone, and why: route-change reasons by name, `interruption`, `microphone`.
+    public var restarts = 0
+    public var restartReasons: [String: Int] = [:]
+    public var interruptions = 0
+    /// Frames of the hardware clock that passed without a render, outside rebuilds.
+    public var missedRenderFrames: Int64 = 0
+}
+
 public final class NvstCoreAudioDevice: @unchecked Sendable {
     public var fillPlayout: (@Sendable (UnsafeMutablePointer<Int16>, Int) -> Void)?
     public var onGameAudio: (@Sendable (UnsafeRawPointer?, UInt32, Double, UInt32) -> Void)?
@@ -16,6 +28,8 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
     public var isMicrophoneCaptureEnabled: (@Sendable () -> Bool)?
     public var onCaptureDeviceChange: (@Sendable (NvstCaptureDeviceChange) -> Void)?
     public var onInputDeviceListChange: (@Sendable () -> Void)?
+    /// While the output unit is being rebuilt, after it is configured and before its first render.
+    public var onPlayoutRestart: (@Sendable () -> Void)?
     private let muteLock = NSLock()
     private var playoutMuted = false
     public var isPlayoutMuted: Bool {
@@ -42,6 +56,10 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
     private var preferredInputDeviceUID: String?
     private var wantsRunning = false
     private var captureScratch = [Int16](repeating: 0, count: 16_384)
+    private let continuityLock = NSLock()
+    private var continuityState = NvstPlayoutContinuity()
+    private var expectedRenderSampleTime: Float64?
+    public var continuity: NvstPlayoutContinuity { continuityLock.withLock { continuityState } }
     private var lastLevelAt: UInt64 = 0
 
     public init(playoutChannelCount: Int = 2, capturesMicrophone: Bool = false,
@@ -51,13 +69,24 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
         if monitorsDefaultOutputDevice {
             routeObserver = NotificationCenter.default.addObserver(
                 forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil
-            ) { [weak self] _ in self?.restartAfterRouteChange() }
+            ) { [weak self] notification in
+                let reason = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
+                    .flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
+                self?.restartAfterRouteChange(reason: reason.map(Self.name(of:)) ?? "unknown")
+            }
             interruptionObserver = NotificationCenter.default.addObserver(
                 forName: AVAudioSession.interruptionNotification, object: nil, queue: nil
             ) { [weak self] notification in
-                guard let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                      type == AVAudioSession.InterruptionType.ended.rawValue else { return }
-                self?.restartAfterRouteChange()
+                guard let self,
+                      let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt else { return }
+                guard type == AVAudioSession.InterruptionType.ended.rawValue else {
+                    continuityLock.withLock {
+                        self.continuityState.interruptions += 1
+                        self.expectedRenderSampleTime = nil
+                    }
+                    return
+                }
+                restartAfterRouteChange(reason: "interruption")
             }
         }
     }
@@ -87,7 +116,7 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             preferredInputDeviceUID = uid
-            if wantsRunning { stopLocked(); startLocked() }
+            if wantsRunning { rebuildLocked(reason: "microphone") }
         }
     }
 
@@ -96,11 +125,11 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
         return (actual, preferredInputDeviceUID.map { $0 != actual } ?? false)
     }
 
-    private func restartAfterRouteChange() {
+    private func restartAfterRouteChange(reason: String) {
+        continuityLock.withLock { expectedRenderSampleTime = nil }
         queue.async { [weak self] in
             guard let self, wantsRunning else { return }
-            stopLocked()
-            startLocked()
+            rebuildLocked(reason: reason)
             onInputDeviceListChange?()
             let state = captureDeviceState
             onCaptureDeviceChange?(NvstCaptureDeviceChange(resolvedUniqueID: state.uniqueID,
@@ -108,7 +137,31 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
         }
     }
 
-    private func startLocked() {
+    /// Tears the unit down and builds it again, counting why. What queued while it was down is
+    /// discarded before the new unit's first render.
+    private func rebuildLocked(reason: String) {
+        stopLocked()
+        continuityLock.withLock {
+            continuityState.restarts += 1
+            continuityState.restartReasons[reason, default: 0] += 1
+        }
+        startLocked(isRebuild: true)
+    }
+
+    private static func name(of reason: AVAudioSession.RouteChangeReason) -> String {
+        switch reason {
+        case .newDeviceAvailable: "newDevice"
+        case .oldDeviceUnavailable: "oldDeviceGone"
+        case .categoryChange: "categoryChange"
+        case .override: "override"
+        case .wakeFromSleep: "wake"
+        case .noSuitableRouteForCategory: "noRoute"
+        case .routeConfigurationChange: "configuration"
+        default: "unknown"
+        }
+    }
+
+    private func startLocked(isRebuild: Bool = false) {
         guard unit == nil else { return }
         do {
             let session = AVAudioSession.sharedInstance()
@@ -156,6 +209,7 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
                     kAudioUnitScope_Global, 1, &capture, UInt32(MemoryLayout<AURenderCallbackStruct>.size)))
             }
             try check(AudioUnitInitialize(created))
+            if isRebuild { onPlayoutRestart?() }
             try check(AudioOutputUnitStart(created))
             isPlayoutRunning = true
             isCaptureRunning = capturesMicrophone
@@ -180,11 +234,14 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
             AudioComponentInstanceDispose(unit)
         }
         unit = nil
+        continuityLock.withLock { expectedRenderSampleTime = nil }
         isPlayoutRunning = false
         isCaptureRunning = false
     }
 
-    fileprivate func render(_ frames: UInt32, output: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+    fileprivate func render(_ frames: UInt32, time: UnsafePointer<AudioTimeStamp>,
+                            output: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+        noteRender(at: time.pointee, frames: frames)
         guard let output else { return noErr }
         let buffers = UnsafeMutableAudioBufferListPointer(output)
         guard let first = buffers.first, buffers.count == 1, let base = first.mData,
@@ -200,6 +257,21 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
         onGameAudio?(UnsafeRawPointer(output), frames, outputSampleRate, 2)
         if isPlayoutMuted { memset(base, 0, Int(frames) * 4) }
         return noErr
+    }
+
+    /// A render whose sample time is ahead of where the previous one ended means the hardware
+    /// clock ran on without asking for audio, and the queue grew by that much.
+    private func noteRender(at time: AudioTimeStamp, frames: UInt32) {
+        continuityLock.withLock {
+            guard time.mFlags.contains(.sampleTimeValid) else {
+                expectedRenderSampleTime = nil
+                return
+            }
+            if let expected = expectedRenderSampleTime, time.mSampleTime > expected + 1 {
+                continuityState.missedRenderFrames += Int64(time.mSampleTime - expected)
+            }
+            expectedRenderSampleTime = time.mSampleTime + Float64(frames)
+        }
     }
 
     fileprivate func capture(_ flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
@@ -223,9 +295,9 @@ public final class NvstCoreAudioDevice: @unchecked Sendable {
     }
 }
 
-private let nvstIOSPlayout: AURenderCallback = { context, _, _, _, frames, output in
+private let nvstIOSPlayout: AURenderCallback = { context, _, time, _, frames, output in
     let device = Unmanaged<NvstCoreAudioDevice>.fromOpaque(context).takeUnretainedValue()
-    return device.render(frames, output: output)
+    return device.render(frames, time: time, output: output)
 }
 
 private let nvstIOSCapture: AURenderCallback = { context, flags, time, _, frames, _ in

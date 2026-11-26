@@ -53,6 +53,39 @@ public final class NvstNativeBundle: @unchecked Sendable {
         public var discarded: UInt64 = 0
     }
 
+    /// The receiver's share of the audio delay, and what caused it. Network latency to the seat
+    /// comes on top and is not included.
+    public struct AudioPlayout: Equatable, Sendable {
+        /// Audio queued on this device between the network and the speaker: the most since the last
+        /// reading, and now.
+        public var peakQueuedMs: Double = 0
+        public var queuedMs: Double = 0
+        /// The output route's own latency on top of the queue.
+        public var outputLatencyMs: Double = 0
+        /// Running totals since the stream opened (see `NvstAudioReceivePipeline.Counters`).
+        public var starvedFrames: UInt64 = 0
+        public var trimmedFrames: UInt64 = 0
+        public var lostPacketsAlreadyPlayed: UInt64 = 0
+        /// Packets that never arrived, whether concealed or skipped.
+        public var lostPackets: UInt64 = 0
+        /// Packets dropped because nothing was playing them out.
+        public var overflowDrops = 0
+        public var continuity = NvstPlayoutContinuity()
+
+        public var peakDelayMs: Double { peakQueuedMs + outputLatencyMs }
+
+        public var summary: String {
+            func ms(_ frames: UInt64) -> Int { Int(frames / 48) } // 48 kHz
+            let reasons = continuity.restartReasons.isEmpty ? ""
+                : "(" + continuity.restartReasons.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",") + ")"
+            return "audio[delay=\(Int((queuedMs + outputLatencyMs).rounded()))ms peak=\(Int(peakDelayMs.rounded()))ms"
+                + " queued=\(Int(queuedMs.rounded()))ms output=\(Int(outputLatencyMs.rounded()))ms"
+                + " starved=\(ms(starvedFrames))ms trimmed=\(ms(trimmedFrames))ms lost=\(lostPackets) lostAlreadyPlayed=\(lostPacketsAlreadyPlayed)"
+                + " overflow=\(overflowDrops) restarts=\(continuity.restarts)\(reasons) interruptions=\(continuity.interruptions)"
+                + " missedRender=\(ms(UInt64(max(0, continuity.missedRenderFrames))))ms]"
+        }
+    }
+
     public enum BundleError: LocalizedError, Equatable {
         case socketUnavailable(String)
         case handshakeFailed(String)
@@ -112,6 +145,7 @@ public final class NvstNativeBundle: @unchecked Sendable {
     private static let microphoneChannels = 2
     /// The native audio decode is stereo regardless of the surround preference; see `startAudioDevice`.
     private static let decodedAudioChannels = 2
+    private static let decodedAudioSampleRate = 48_000
 
     public private(set) var audioChannelCount: Int
     public private(set) var inputProtocolVersion: UInt16?
@@ -332,6 +366,23 @@ public final class NvstNativeBundle: @unchecked Sendable {
         return reception
     }
 
+    /// Reads and resets the audio queue's peak, so each reading covers the time since the last.
+    public func audioPlayout() -> AudioPlayout? {
+        guard let receivePipeline else { return nil }
+        let queued = receivePipeline.drainQueuedFrames()
+        let counters = receivePipeline.snapshot
+        let frameMs = 1_000 / Double(Self.decodedAudioSampleRate)
+        return AudioPlayout(peakQueuedMs: Double(queued.peak) * frameMs,
+                            queuedMs: Double(queued.current) * frameMs,
+                            outputLatencyMs: (audioDevice?.outputPathLatencySeconds ?? 0) * 1_000,
+                            starvedFrames: counters.starvedFrames,
+                            trimmedFrames: counters.trimmedFrames,
+                            lostPacketsAlreadyPlayed: counters.lostPacketsAlreadyPlayed,
+                            lostPackets: counters.packetsLost,
+                            overflowDrops: receivePipeline.overflowDropCount,
+                            continuity: audioDevice?.continuity ?? NvstPlayoutContinuity())
+    }
+
     public func close() {
         guard !isClosed else { return }
         isClosed = true
@@ -425,6 +476,7 @@ public final class NvstNativeBundle: @unchecked Sendable {
             onMicrophoneDeviceFallback?(change)
         }
         device.onInputDeviceListChange = { [weak self] in self?.onMicrophoneDeviceListChange?() }
+        device.onPlayoutRestart = { [weak self] in self?.receivePipeline?.discardQueuedAudio() }
         device.isMicrophoneCaptureEnabled = { [weak self] in self?.sendPipeline?.isMuted == false }
         if startsAudioDevice {
             device.start()

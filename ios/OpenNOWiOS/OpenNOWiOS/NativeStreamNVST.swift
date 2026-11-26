@@ -53,6 +53,7 @@ struct NativeStreamNVSTSample: Sendable {
     let bitstream: String
     let detail: String
     var networkSilences = NvstSocketSilenceMeter.Window()
+    var audio: NvstNativeBundle.AudioPlayout? = nil
 }
 
 /// A protocol keeps the iOS 17 hardware API isolated from the app's iOS 16 deployment target.
@@ -422,6 +423,8 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         guard !stopped else { return }
         let state = pipeline.snapshot
         var detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) bitstream=\(decoder.bitstreamFormat?.summary ?? "pending") requestedColor=\(StreamSettingsResolver.colorQuality(for: settings).rawValue) requestedHDR=\(settings.hdrEnabled) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) recovery[requests=\(keyframeRequests) control=\(controlKeyframeRequests) udp=\(udpKeyframeRequests) keyframes=\(stats.keyframesEmitted) feedback=\(bundle?.isFeedbackChannelOpen == true)] buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) loss[events=\(stats.recoveries) packets=\(stats.finalizedLossPackets) burst=\(stats.maxLossBurst) reorderDepth=\(stats.maxReorderDepth) late=\(stats.latePackets)] \(receiver.silenceTotals.summary) \(receiver.fecFindings.summary) \(state.timingSummary)"
+        let audio = bundle?.audioPlayout()
+        if let audio { detail += " \(audio.summary)" }
         if gamepadSendTime.count > 0 || controlSendTime.count > 0 {
             detail += " localGamepadSend[\(gamepadSendTime.summary)] localControlSend[\(controlSendTime.summary)]"
         }
@@ -430,7 +433,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
             decodeMilliseconds: state.decodeP50Milliseconds, pingMilliseconds: ping >= 0 ? ping : nil,
             jitterMilliseconds: Double(stats.lastJitter) / 90, hardware: decoder.isHardwareAccelerated,
             pixelFormat: decoder.outputPixelFormatName, bitstream: decoder.bitstreamFormat?.summary ?? "pending", detail: detail,
-            networkSilences: receiver.drainSilences()))
+            networkSilences: receiver.drainSilences(), audio: audio))
     }
 
     private func fail(_ reason: String) {

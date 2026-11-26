@@ -25,8 +25,15 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
         public var datagramBytes: UInt64 = 0
         /// Interleaved samples the decoder actually produced.
         public var decodedSamples: UInt64 = 0
-        /// Decoded samples dropped because they arrived too late to play without adding delay.
-        public var lateSamplesDropped: UInt64 = 0
+        /// Frames the device had to play as silence because nothing was ready, once audio had
+        /// started: audio that arrived late, or never arrived.
+        public var starvedFrames: UInt64 = 0
+        /// Lost packets whose time the device had already filled with silence while waiting for
+        /// them, so they were not concealed a second time.
+        public var lostPacketsAlreadyPlayed: UInt64 = 0
+        /// Frames removed because they had queued up behind the device and were never needed to
+        /// cover a late arrival (see `NvstAudioPlayoutLevel`).
+        public var trimmedFrames: UInt64 = 0
         public var ssrc: UInt32?
     }
 
@@ -45,6 +52,14 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
     private var replayWindows: [UInt32: SrtpReplayWindow] = [:]
     private var bufferedSamples: [Float] = []
     private var sampleOffset = 0
+    private var level = NvstAudioPlayoutLevel()
+    /// Frames the device has played as silence since the last real audio. A packet declared lost
+    /// inside that stretch has already had its time played out, so it is skipped rather than
+    /// concealed a second time. Real audio ends the stretch: anything it brings late is the playout
+    /// level's to win back, not a credit against later losses.
+    private var silencePlayedFrames = 0
+    private var hasPlayedAudio = false
+    private var peakQueuedFrames = 0
 
     public init(srtp: NvstAudioSrtp,
                 framesPerPacket: Int = 240,
@@ -62,6 +77,22 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
     /// divides one by the other for its A/V reading, exactly as it did over libwebrtc's counters.
     public var jitterBufferDwellSeconds: TimeInterval { lock.withLock { jitter.jitterBufferDelaySeconds } }
     public var jitterBufferEmittedCount: UInt64 { lock.withLock { jitter.jitterBufferEmittedCount } }
+    /// Packets the jitter buffer dropped because nothing was playing them out.
+    public var overflowDropCount: Int { lock.withLock { jitter.overflowDropCount } }
+
+    /// Audio queued on this device between the network and the speaker, in frames: the most since
+    /// the last call, and right now. Both include what the jitter buffer is holding.
+    public func drainQueuedFrames() -> (peak: Int, current: Int) {
+        lock.withLock {
+            let current = queuedFrames
+            defer { peakQueuedFrames = current }
+            return (max(peakQueuedFrames, current), current)
+        }
+    }
+
+    private var queuedFrames: Int {
+        (bufferedSamples.count - sampleOffset) / channels + jitter.bufferedCount * framesPerPacket
+    }
 
     /// Verifies and queues one datagram. A packet that fails its tag is counted and discarded: it is
     /// indistinguishable from an attacker's, and either way it is not audio.
@@ -134,9 +165,21 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
             sampleOffset = 0
         }
         bufferedSamples.append(contentsOf: drain(jitter.advance()))
-        dropLateBacklog(beyond: sampleCount)
+        if bufferedSamples.count < sampleCount {
+            bufferedSamples.append(contentsOf: drain(jitter.releaseReady()))
+        }
         let count = min(sampleCount, bufferedSamples.count)
+        if hasPlayedAudio, count < sampleCount {
+            let silent = (sampleCount - count) / channels
+            silencePlayedFrames += silent
+            counters.starvedFrames &+= UInt64(silent)
+        }
+        let spareFrames = (bufferedSamples.count - count) / channels
+        if let excess = level.observe(renderedFrames: sampleCount / channels, spareFrames: spareFrames) {
+            removeFrames(excess, after: count)
+        }
         sampleOffset = count
+        peakQueuedFrames = max(peakQueuedFrames, queuedFrames)
         return Array(bufferedSamples.prefix(count))
     }
 
@@ -148,6 +191,20 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
         }
     }
 
+    /// Drops everything queued, when the device has been rebuilt: what arrived while nothing was
+    /// playing is behind the seat by however long that took, and playing it would keep it there.
+    public func discardQueuedAudio() {
+        lock.lock()
+        defer { lock.unlock() }
+        let frames = queuedFrames
+        bufferedSamples.removeAll(keepingCapacity: true)
+        sampleOffset = 0
+        jitter.discardPending()
+        level = NvstAudioPlayoutLevel()
+        silencePlayedFrames = 0
+        counters.trimmedFrames &+= UInt64(frames)
+    }
+
     public func reset() {
         lock.lock()
         defer { lock.unlock() }
@@ -155,6 +212,10 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
         replayWindows.removeAll()
         bufferedSamples.removeAll(keepingCapacity: true)
         sampleOffset = 0
+        level = NvstAudioPlayoutLevel()
+        silencePlayedFrames = 0
+        hasPlayedAudio = false
+        peakQueuedFrames = 0
     }
 
     private func drain(_ emissions: [NvstAudioJitterBuffer.Emission]) -> [Float] {
@@ -164,6 +225,8 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
             case .payload(let payload):
                 do {
                     if let decoded = try decoder.decode(payload) {
+                        hasPlayedAudio = true
+                        silencePlayedFrames = 0
                         output.append(contentsOf: decoded)
                         counters.packetsDecoded += 1
                         counters.decodedSamples &+= UInt64(decoded.count)
@@ -174,6 +237,11 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
                 }
             case .lost:
                 counters.packetsLost += 1
+                if silencePlayedFrames >= framesPerPacket {
+                    silencePlayedFrames -= framesPerPacket
+                    counters.lostPacketsAlreadyPlayed += 1
+                    continue
+                }
                 counters.concealedFrames += UInt64(framesPerPacket)
                 output.append(contentsOf: silence())
             }
@@ -181,28 +249,82 @@ public final class NvstAudioReceivePipeline: @unchecked Sendable {
         return output
     }
 
-    /// Nothing downstream plays faster than real time, so audio that arrives late would otherwise
-    /// play late for the rest of the session: a network pause renders as silence, the burst that
-    /// follows it is queued behind the device, and every later pause adds to the delay. Once more
-    /// than `maximumBacklogFrames` is queued beyond this render, the oldest is dropped back down to
-    /// `targetBacklogFrames` — one audible skip in place of a delay that never goes away.
-    private func dropLateBacklog(beyond sampleCount: Int) {
-        let backlog = bufferedSamples.count - sampleCount
-        guard backlog > Self.maximumBacklogFrames * channels else { return }
-        let excess = backlog - Self.targetBacklogFrames * channels
-        let dropped = excess - excess % channels
-        bufferedSamples.removeFirst(dropped)
-        counters.lateSamplesDropped &+= UInt64(dropped)
+    /// Removes `frames` from the queue just after the `start` samples about to be played,
+    /// crossfading across the cut so it does not click.
+    private func removeFrames(_ frames: Int, after start: Int) {
+        let fade = NvstAudioPlayoutLevel.crossfadeFrames
+        let cut = start + frames * channels
+        guard frames > 0, cut + fade * channels <= bufferedSamples.count else { return }
+        for frame in 0..<fade {
+            let incoming = Float(frame + 1) / Float(fade + 1)
+            for channel in 0..<channels {
+                let outgoing = start + frame * channels + channel
+                let kept = cut + frame * channels + channel
+                bufferedSamples[kept] = bufferedSamples[outgoing] * (1 - incoming) + bufferedSamples[kept] * incoming
+            }
+        }
+        bufferedSamples.removeSubrange(start..<cut)
+        counters.trimmedFrames &+= UInt64(frames)
     }
-
-    /// 60 ms at 48 kHz: well past ordinary arrival jitter and render quanta, short of a delay a
-    /// player hears against the picture.
-    static let maximumBacklogFrames = 2_880
-    /// 20 ms at 48 kHz, so one trim does not leave the device on the edge of running dry.
-    static let targetBacklogFrames = 960
 
     private func silence() -> [Float] {
         [Float](repeating: 0, count: framesPerPacket * channels)
     }
 
+}
+
+/// Keeps the audio's delay at what the network actually needs.
+///
+/// Nothing downstream plays faster than real time, so audio that arrives late plays late: a
+/// network pause renders as silence, and the burst that follows it waits behind the device. That
+/// queue is worth keeping only while it absorbs the pauses that follow. This records, for each
+/// one-second window, the least audio left over after any render. Whatever none of the last five
+/// windows needed is removed: pauses that keep coming keep their cushion, while one that does not
+/// recur, a device that stopped, or a seat clock running fast stops costing delay five seconds
+/// later, the same hold the video's Wi-Fi pause smoothing uses. Anything beyond 150 ms, that
+/// smoothing's ceiling, goes at the render it appears.
+struct NvstAudioPlayoutLevel: Sendable {
+    /// One second at 48 kHz.
+    static let windowFrames = 48_000
+    static let windowsRemembered = 5
+    /// What a trim leaves beyond the least spare the remembered windows saw: 5 ms.
+    static let marginFrames = 240
+    /// 150 ms.
+    static let maximumCushionFrames = 7_200
+    /// Excess smaller than one packet is left alone, so slow clock drift does not splice constantly.
+    static let minimumTrimFrames = 240
+    /// 2.5 ms crossfade across each cut.
+    static let crossfadeFrames = 120
+
+    private var renderedFrames = 0
+    private var leastSpareFrames = Int.max
+    /// Each completed window's least spare, oldest first.
+    private var recentLeastSpare: [Int] = []
+
+    /// Called after each render with what is still queued behind it. Returns how many frames to
+    /// remove: anything beyond the ceiling at once, and what no remembered window needed at the
+    /// end of each window.
+    mutating func observe(renderedFrames rendered: Int, spareFrames: Int) -> Int? {
+        var removed = 0
+        let beyondCeiling = spareFrames - Self.marginFrames - Self.maximumCushionFrames
+        if beyondCeiling >= Self.minimumTrimFrames { removed = shorten(by: beyondCeiling) }
+        leastSpareFrames = min(leastSpareFrames, spareFrames - removed)
+        renderedFrames += rendered
+        if renderedFrames >= Self.windowFrames {
+            recentLeastSpare.append(leastSpareFrames)
+            if recentLeastSpare.count > Self.windowsRemembered { recentLeastSpare.removeFirst() }
+            renderedFrames = 0
+            leastSpareFrames = Int.max
+            let unneeded = (recentLeastSpare.min() ?? 0) - Self.marginFrames
+            if unneeded >= Self.minimumTrimFrames { removed += shorten(by: unneeded) }
+        }
+        return removed > 0 ? removed : nil
+    }
+
+    /// The queue is shorter by `frames` from now on, in what each remembered window left over too.
+    private mutating func shorten(by frames: Int) -> Int {
+        recentLeastSpare = recentLeastSpare.map { max(0, $0 - frames) }
+        if leastSpareFrames != Int.max { leastSpareFrames = max(0, leastSpareFrames - frames) }
+        return frames
+    }
 }
